@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-The format follows Keep a Changelog conventions.
+The format loosely follows Keep a Changelog conventions.
 
 ## Unreleased
 

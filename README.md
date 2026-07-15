@@ -51,10 +51,10 @@ frontmatter. Install for your user account on shells with POSIX syntax:
 dest="${HOME}/.claude/skills/multi-agent-delegation"
 if [ -e "$dest" ]; then
   echo "Install target already exists: $dest"
-  exit 1
+else
+  mkdir -p "$dest"
+  cp SKILL.md "$dest/SKILL.md"
 fi
-mkdir -p "$dest"
-cp SKILL.md "$dest/SKILL.md"
 ```
 
 Install for your user account from PowerShell:
@@ -86,10 +86,10 @@ Manual Codex-style skill install on shells with POSIX syntax:
 dest="${HOME}/.agents/skills/multi-agent-delegation"
 if [ -e "$dest" ]; then
   echo "Install target already exists: $dest"
-  exit 1
+else
+  mkdir -p "$dest"
+  cp SKILL.md "$dest/SKILL.md"
 fi
-mkdir -p "$dest"
-cp SKILL.md "$dest/SKILL.md"
 ```
 
 Manual Codex-style skill install from PowerShell:
@@ -102,6 +102,11 @@ if (Test-Path -LiteralPath $dest) {
 New-Item -ItemType Directory -Path $dest | Out-Null
 Copy-Item -LiteralPath .\SKILL.md -Destination (Join-Path $dest 'SKILL.md')
 ```
+
+To scope the skill to a single project instead, copy `SKILL.md` to
+`.agents/skills/multi-agent-delegation/SKILL.md` inside that repository —
+Codex scans `.agents/skills` from the working directory up to the repository
+root (per the official skills documentation).
 
 If your agent reads skills from a different directory, check its
 documentation and copy `SKILL.md` into the matching
@@ -196,7 +201,15 @@ pwsh -NoProfile -File .\scripts\test-scan-private-markers.ps1
 pwsh -NoProfile -File .\scripts\scan-private-markers.ps1
 ```
 
-Also run Git whitespace checks before publishing:
+On macOS, Linux, or any POSIX shell with PowerShell 7 (`pwsh`) installed:
+
+```bash
+pwsh -NoProfile -File ./scripts/validate-oss-readiness.ps1
+pwsh -NoProfile -File ./scripts/test-scan-private-markers.ps1
+pwsh -NoProfile -File ./scripts/scan-private-markers.ps1
+```
+
+Also run Git whitespace checks on your working changes before publishing:
 
 ```bash
 git diff --check

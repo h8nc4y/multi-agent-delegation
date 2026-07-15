@@ -137,20 +137,31 @@ function Test-IsTextFile {
 $gitTrackedFiles = $null
 $gitExe = Get-Command git -ErrorAction SilentlyContinue
 if ($null -ne $gitExe) {
-    $insideWorkTree = (& $gitExe.Source -C $root rev-parse --is-inside-work-tree 2>$null)
-    if ($LASTEXITCODE -eq 0 -and "$insideWorkTree".Trim() -eq 'true') {
-        # Read tracked files relative to the repo root and split the NUL list safely.
-        $rawList = (& $gitExe.Source -C $root ls-files -z 2>$null)
-        if ($LASTEXITCODE -eq 0) {
-            $gitTrackedFiles = New-Object System.Collections.Generic.List[object]
-            foreach ($entry in ($rawList -split "`0")) {
-                if ([string]::IsNullOrEmpty($entry)) { continue }
-                $fullPath = Join-Path $root ($entry -replace '/', [string][char]92)
-                if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
-                    $gitTrackedFiles.Add((Get-Item -LiteralPath $fullPath)) | Out-Null
+    # Windows PowerShell 5.1 converts native stderr into terminating errors when
+    # the stream is redirected while $ErrorActionPreference is 'Stop' (for
+    # example "fatal: not a git repository" on non-git scan paths). Scope the
+    # probe to 'Continue' and rely on exit codes instead.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $insideWorkTree = (& $gitExe.Source -C $root rev-parse --is-inside-work-tree 2>$null)
+        if ($LASTEXITCODE -eq 0 -and "$insideWorkTree".Trim() -eq 'true') {
+            # Read tracked files relative to the repo root and split the NUL list safely.
+            $rawList = (& $gitExe.Source -C $root ls-files -z 2>$null)
+            if ($LASTEXITCODE -eq 0) {
+                $gitTrackedFiles = New-Object System.Collections.Generic.List[object]
+                foreach ($entry in ($rawList -split "`0")) {
+                    if ([string]::IsNullOrEmpty($entry)) { continue }
+                    $fullPath = Join-Path $root ($entry -replace '/', [string][char]92)
+                    if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
+                        $gitTrackedFiles.Add((Get-Item -LiteralPath $fullPath)) | Out-Null
+                    }
                 }
             }
         }
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
     }
 }
 

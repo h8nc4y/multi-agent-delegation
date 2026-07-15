@@ -43,9 +43,20 @@ function Invoke-Scanner {
     }
     $arguments += @('-File', $scanner, '-Path', $ScanPath)
 
-    $output = & $powerShellCommand.Source @arguments 2>&1
+    # Windows PowerShell 5.1 converts native stderr into terminating errors
+    # when the stream is redirected while $ErrorActionPreference is 'Stop', so
+    # scope the child invocation to 'Continue' and rely on the exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $powerShellCommand.Source @arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     return [pscustomobject]@{
-        ExitCode = $LASTEXITCODE
+        ExitCode = $exitCode
         Output = ($output | Out-String)
     }
 }

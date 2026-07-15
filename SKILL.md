@@ -91,7 +91,8 @@ the idle parent and once by the orphaned child.
 In multi-agent setups, "sent successfully" does not mean "executed where you
 think." Pin down the executing environment first:
 
-- Run `uname -a` and `command -v <tool>` in the executing environment to
+- Run `uname -a` and `command -v <tool>` (POSIX shells) or `$PSVersionTable`
+  and `Get-Command <tool>` (PowerShell) in the executing environment to
   confirm the shell flavor (WSL2 / Git Bash / PowerShell) and the presence of
   required CLIs. Observed failure: a dependency CLI (for example `sqlite3`)
   missing in the executing environment produced a silent fake success.
@@ -138,9 +139,14 @@ Delegation rules for the fan-out:
   1. Do not merge. Stop at the commit / branch / pull-request stage.
   2. Leave the worktree in place (no cleanup), so the orchestrator can
      inspect it.
-  3. Tick the ledger entries you completed (`[ ]` to `[x]`).
+  3. Tick the ledger entries you completed (`[ ]` to `[x]`) in the ledger
+     that belongs to your repository.
   4. Report measured results only (test output you actually ran), never
      assumptions.
+- One writer per ledger file: keep one ledger per repository (each agent
+  ticks only its own), or keep a central ledger that only the orchestrator
+  ticks based on agent reports. Two agents must never write the same ledger
+  file.
 - For a repository without a remote, "leave the branch in place, orchestrator
   fast-forward merges" is the safe and fast pattern.
 
@@ -157,8 +163,10 @@ rule it was adding, and fixed that unprompted.
   task touches no secrets, tokens, or real user data and transmits nothing
   externally, and (c) no destructive commands (bulk deletion, force push) are
   involved. Otherwise the orchestrator does the work directly.
-- Recovery re-instruction at most twice. Set a hard stop rule: after three
-  attempts at the same failure class, stop and report instead of retrying.
+- Recovery re-instruction at most once in the normal path (section 3); if
+  the resumed attempt also no-ops, the orchestrator takes over. Set a hard
+  stop rule: after three attempts at the same failure class, stop and report
+  instead of retrying.
 - Treat "I executed X" claims in subagent reports as verified or unverified,
   and label them accordingly.
 

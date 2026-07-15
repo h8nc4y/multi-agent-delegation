@@ -58,7 +58,8 @@ yourself with your file-edit and shell tools.
 Rules for this fan-out:
 1. Do NOT merge. Stop at commit / branch / pull-request stage.
 2. Leave your worktree in place (no cleanup) so the orchestrator can inspect.
-3. Tick the ledger entries you completed ([ ] -> [x]) in <ledger-path>.
+3. Tick the ledger entries you completed ([ ] -> [x]) in <ledger-path>
+   (this repository's own ledger; no other agent writes it).
 4. Report measured results only: paste the actual output of each verify
    command you ran. No assumptions.
 
@@ -74,6 +75,9 @@ Ledger entries assigned to you:
 ## Orchestrator-side rules
 
 - One repository = one agent; parallel agents never share a repository.
+- One writer per ledger file: keep one ledger per repository (each agent
+  ticks only its own), or have agents report completed entries and tick a
+  central ledger yourself. Two agents must never write the same ledger file.
 - Merge only after independent verification (re-run tests or inspect the
   diff yourself).
 - For a repository without a remote: have the agent leave the branch in
