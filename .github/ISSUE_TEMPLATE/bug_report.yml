@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a sanitized problem with the skill or examples.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Do not paste tokens, credentials, raw agent transcripts with private data, private repository names, or internal absolute paths.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Describe the observable problem without private data.
+      placeholder: Following the skill, the orchestrator still accepted a no-op completion notice because...
+    validations:
+      required: true
+  - type: dropdown
+    id: symptom
+    attributes:
+      label: Symptom class
+      options:
+        - No-op completion notice (zero artifacts)
+        - Subagent re-delegated and idled
+        - Silent environment-difference failure
+        - Verification step gap or false pass
+        - Resume/recovery step failed
+        - Ledger fan-out issue
+        - Documentation error or unclear guidance
+        - Other sanitized symptom
+    validations:
+      required: true
+  - type: textarea
+    id: sanitized-checks
+    attributes:
+      label: Sanitized checks performed
+      description: Summarize safe facts only. Use placeholder repo and path names.
+      placeholder: |
+        Delegation prompt included the mandatory clauses: yes
+        Porcelain check after completion notice: empty output
+        Resume re-instruction attempted: once
+        Executing environment: Git Bash (confirmed via uname)
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: The checklist should have caught the no-op before reporting done.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: The orchestrator reported success based on the notice text.
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed tokens, credentials, customer data, private repository names, and internal absolute paths.
+          required: true
