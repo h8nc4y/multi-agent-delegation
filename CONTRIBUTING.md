@@ -55,6 +55,16 @@ pwsh -NoProfile -File ./scripts/test-scan-private-markers.ps1
 pwsh -NoProfile -File ./scripts/scan-private-markers.ps1
 ```
 
+The self-test deliberately reuses the host that launched it: a
+`powershell.exe` run validates Windows PowerShell 5.1, while a `pwsh` run
+validates PowerShell 7. Every scanner and Git child process has a finite
+timeout and bounded termination path. Git fixture commands use a sanitized
+child environment; do not replace that boundary with parent-process
+environment mutation. Repository scans are defined by regular stage-0 index
+blobs with lazy fetches and replacement refs disabled; do not replace them
+with working-tree path reads. Non-Git fixture scans must reject links/reparse
+points before traversal and keep content reads in a bounded child.
+
 ## Pull Request Expectations
 
 - Explain the problem and the chosen fix.

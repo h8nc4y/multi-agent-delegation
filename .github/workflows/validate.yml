@@ -12,20 +12,25 @@ permissions:
 jobs:
   validate:
     name: Validate skill repository
+    timeout-minutes: 10
     # windows-latest is intentional and left unpinned: this job only needs
     # pwsh + git, so runner image migrations do not affect it. Pin to a dated
     # label only if a future step depends on image-specific tooling.
     runs-on: windows-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
       - name: Validate OSS readiness
         shell: pwsh
         run: ./scripts/validate-oss-readiness.ps1
 
-      - name: Test private marker scan
+      - name: Test private marker scan (PowerShell 7)
         shell: pwsh
+        run: ./scripts/test-scan-private-markers.ps1
+
+      - name: Test private marker scan (Windows PowerShell 5.1)
+        shell: powershell
         run: ./scripts/test-scan-private-markers.ps1
 
       - name: Scan for private markers
