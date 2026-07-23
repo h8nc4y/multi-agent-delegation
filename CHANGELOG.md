@@ -6,6 +6,30 @@ The format loosely follows Keep a Changelog conventions.
 
 ## Unreleased
 
+### Changed
+
+- Hardened git-tracked private-marker enumeration against ambient `GIT_*`
+  repository, worktree, index, object, config, execution, prompt, and trace
+  overrides by running each Git command in a sanitized child environment.
+- Changed repository scans to bounded regular stage-0 index blobs, with
+  fail-closed root/probe, malformed/unmerged entry, symlink/gitlink, missing
+  object, replacement-ref, lazy-fetch, metadata/entry, and size-limit handling.
+  Non-Git scans now reject links and reparse points before traversal and use a
+  bounded child for every content read.
+- Added incremental NUL and line parsing plus explicit local-marker, line, and
+  redacted-finding limits so bounded child output cannot expand into unbounded
+  in-process arrays or reports.
+- Made a staged `.private-markers.local` an explicit untracked-only contract
+  violation instead of silently excluding it from the index scan.
+- Added adversarial staged/worktree divergence, missing-file, external-link,
+  dangling-control, replacement-ref, synthetic-promisor, parent-environment,
+  present-empty removal/preservation, outside-artifact, descendant-pipe, and
+  bounded-timeout regressions. The self-test uses the current PowerShell host
+  explicitly, and CI runs it separately on PowerShell 7 and Windows PowerShell
+  5.1 with structurally validated job and step ownership.
+- Pinned the checkout action to the v5.0.1 commit instead of a mutable major
+  tag.
+
 ## 0.1.0 - 2026-07-16
 
 ### Added

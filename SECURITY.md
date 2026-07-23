@@ -52,6 +52,27 @@ and is no substitute for keeping real credentials out of the repository in
 the first place. Treat a passing scan as "no known marker found," not
 "definitely safe."
 
+Git-tracked scanning reads bounded regular stage-0 index blobs, not
+working-tree targets. It rejects root/probe mismatches, unmerged or malformed
+entries, symlink/gitlink modes, missing objects, replacement refs, lazy
+promisor fetches, and metadata/content size-limit violations. NUL-delimited
+metadata, text lines, configured local markers, and redacted finding output are
+processed incrementally with explicit count limits to prevent secondary memory
+amplification after the child-process byte caps. The local marker file is
+untracked-only; a staged copy is rejected rather than silently excluded.
+Explicit non-Git scans enumerate one directory level at a time and reject
+links or reparse points before traversal. Content reads use a bounded child so
+special files and replacement races fail without blocking the parent scanner.
+
+Git runs in a bounded child process with ambient `GIT_*` values removed and
+machine/global/system config, hooks, attributes, excludes, templates, prompts,
+and trace output isolated. The adversarial self-test checks staged/worktree
+divergence, missing files, external-link rejection, repository/index/object
+redirection, replacement-ref bypass, synthetic promisor/no-remote-helper
+behavior, config injection, present-empty removal and preservation, redaction,
+descendant pipe termination, and outside-artifact prevention on both
+PowerShell 7 and Windows PowerShell 5.1.
+
 ## Response Expectations
 
 Maintainers should acknowledge actionable security reports when available,

@@ -175,6 +175,8 @@ repository paths you cannot publish, or customer data in public issues.
 - Tool names (`Agent` tool, `SendMessage`) are Claude Code specifics; the
   mapping for other environments is described in SKILL.md, but exact resume
   semantics differ per tool.
+- CI currently measures PowerShell 7 and Windows PowerShell 5.1 on Windows.
+  The documented POSIX `pwsh` commands remain unverified in CI.
 
 ## Non-Goals
 
@@ -209,15 +211,55 @@ pwsh -NoProfile -File ./scripts/test-scan-private-markers.ps1
 pwsh -NoProfile -File ./scripts/scan-private-markers.ps1
 ```
 
+The scan self-test uses the exact PowerShell host that launched it instead of
+silently preferring `pwsh`. It exercises clean and failing scans, synthetic
+secret prefixes, staged/worktree divergence, a missing working-tree file,
+tracked symlink rejection, repository-root/probe failures, a hostile Git
+environment, present-empty removal and preservation, redaction,
+outside-artifact prevention, and bounded child-tree/output-pipe termination.
+Every scanner and Git child process has a finite timeout.
+
+For a repository-root scan, the scanner reads regular stage-0 index blobs
+instead of following working-tree paths. It rejects unmerged, symlink, gitlink,
+malformed, missing-object, oversized, and aggregate-size-invalid index input.
+It also fails closed when Git probing does not resolve exactly to the requested
+root, including a dangling Git control entry; it does not silently downgrade
+that case to a working-tree scan. Index metadata is capped at 8 MiB and 4,096
+entries before per-blob processes begin. NUL-delimited metadata is parsed
+incrementally so delimiter-heavy output cannot multiply into an unbounded
+array.
+
+Each Git command receives a child environment cloned from — but isolated from
+— the scanner process. The scanner removes all ambient `GIT_*` values before
+adding only non-interactive, read-only settings and empty global/system config,
+hooks, attributes, excludes, and template paths. This prevents repository,
+index, object, config, execution, prompt, or trace overrides from changing the
+tracked scan or writing outside its temporary isolation directory.
+Lazy promisor fetches and replacement refs are disabled, and protocol and
+credential-helper use is denied, so a missing blob fails locally instead of
+starting a remote helper or substituting different content.
+
+Explicit non-Git fixture directories use a one-level-at-a-time working-tree
+walk. Links and reparse points are rejected before traversal or content reads.
+Each content read runs in a bounded child, so a FIFO, device, or replacement
+race cannot stop the parent scanner indefinitely. Working-tree enumeration is
+also capped at 4,096 entries. Text input is capped at 4 MiB per file and
+64 MiB per scan in either mode. A text file is capped at 100,000 lines,
+all text at 200,000 lines per scan, detailed findings at 1,024 plus one
+aggregate notice, and configured local markers at 256 entries of at most 1,024
+characters each. Regex match enumeration is capped at 4,096 matches per line.
+A tracked `.private-markers.local` violates its untracked-only contract and
+fails the scan without printing its contents.
+
 Also run Git whitespace checks on your working changes before publishing:
 
 ```bash
 git diff --check
 ```
 
-The GitHub Actions workflow runs the same validation, scan self-test,
-private-marker scan, and whitespace check on pull requests and pushes to
-`main`.
+The GitHub Actions workflow runs the same validation, separate PowerShell 7
+and Windows PowerShell 5.1 scan self-tests, private-marker scan, and whitespace
+check on pull requests and pushes to `main`. The job has a 10-minute timeout.
 
 ## Contributing
 
