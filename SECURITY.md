@@ -52,12 +52,24 @@ and is no substitute for keeping real credentials out of the repository in
 the first place. Treat a passing scan as "no known marker found," not
 "definitely safe."
 
-Git-tracked scanning reads bounded regular stage-0 index blobs, not
-working-tree targets. It rejects root/probe mismatches, unmerged or malformed
-entries, symlink/gitlink modes, missing objects, replacement refs, lazy
-promisor fetches, and metadata/content size-limit violations. NUL-delimited
-metadata, text lines, configured local markers, and redacted finding output are
-processed incrementally with explicit count limits to prevent secondary memory
+Git-tracked scanning uses the union of bounded regular stage-0 index blobs and
+safe current-worktree content, including intent-to-add files. Unique blobs are
+read through one strictly framed `git cat-file --batch` process. Byte-exact
+stage and debug snapshots must remain unchanged from scan start to finish. The
+scanner rejects root/probe mismatches, broken/dangling/reparse or mismatched
+root/ancestor `.git` entries, unmerged or malformed entries,
+symlink/gitlink/reparse paths,
+missing objects, replacement refs, lazy promisor fetches, and metadata/content
+size-limit violations. Root/ancestor Git-control failures return exit code 2
+with the fixed diagnostic `Private marker scan failed closed (integrity:
+git-probe).` A regular non-reparse linked-worktree/submodule gitfile is accepted
+only when the bounded Git probe establishes the exact requested root. Nested
+exact-case `.git` directories and leaf files below a true non-Git root are
+excluded without being read; `.GIT` remains ordinary content on POSIX.
+Sensitive names such as `.env*`, `.npmrc`, `*.pem`, `*.key`, and extensionless
+files are treated as text candidates. NUL-delimited metadata, text lines,
+configured local markers, and redacted finding output are processed
+incrementally with explicit count limits to prevent secondary memory
 amplification after the child-process byte caps. The local marker file is
 untracked-only; a staged copy is rejected rather than silently excluded.
 Explicit non-Git scans enumerate one directory level at a time and reject
@@ -66,12 +78,43 @@ special files and replacement races fail without blocking the parent scanner.
 
 Git runs in a bounded child process with ambient `GIT_*` values removed and
 machine/global/system config, hooks, attributes, excludes, templates, prompts,
-and trace output isolated. The adversarial self-test checks staged/worktree
-divergence, missing files, external-link rejection, repository/index/object
-redirection, replacement-ref bypass, synthetic promisor/no-remote-helper
-behavior, config injection, present-empty removal and preservation, redaction,
-descendant pipe termination, and outside-artifact prevention on both
-PowerShell 7 and Windows PowerShell 5.1.
+and trace output isolated. Windows assigns a suspended process to a
+kill-on-close Job Object before resuming it; Linux uses trusted `setsid` and
+checked process-group termination and re-wait. Windows launch cleanup also
+checks termination, wait, and every owned pipe/thread/process/Job handle-close
+result. Raw stdin/stdout/stderr, child-output caps, the final 64 KiB UTF-8
+report, and the lower-only two-minute scan deadline are enforced without
+line-ending assumptions. The child-operation budget begins before environment
+preparation and process launch, while termination and cleanup retain a separate
+bounded kill-wait allowance. The exported process runner accepts only
+canonical integers for numeric arguments and rejects fractional, exponential,
+aggregate, overflow, and out-of-range values with `process-limit-invalid`.
+Invalid public scan-deadline values are normalized inside the scanner
+entrypoint to fixed stdout, empty stderr, and exit 2. The only accepted
+non-empty Git batch stderr is the
+exact locale-fixed Git 2.43 warning produced when disabled lazy fetching
+returns a missing promisor object; extra bytes fail closed. The adversarial
+self-test covers these boundaries on PowerShell 7 and Windows PowerShell 5.1
+on Windows, and PowerShell 7 on Ubuntu 24.04. Windows uses direct raw C# pipe
+handles rather than PowerShell's text stdin writer; the first eager runner
+call is AST-validated through direct/transitive and scope-qualified function
+calls, in-source aliases, static function references, and later direct or
+function-indirect stored-scriptblock references. Target-name shadowing, risky
+class construction/method calls/casts/static initialization, Alias:/Function:
+provider mutation through `Set-Item`, `Set-Content`, or `New-Item`, dynamic
+bootstrap dot-sourcing, command-argument scriptblocks, composite receiver
+invocation, runtime expressions, and dynamic calls/lookups
+fail closed while a literal application lookup remains accepted. Job cleanup
+retains a handle until close succeeds, retries once, and keeps a direct-process
+fallback when Job termination fails. Entry/helper/isolation exceptions are
+reduced to fixed redacted exit-2 diagnostics. A native Git batch response proves
+BOM-less byte transport, and the caller's console input encoding must remain
+unchanged. Completed stream-pump tasks, streams, and buffers are explicitly
+disposed on Windows and POSIX; 40-run no-GC handle and file-descriptor
+regressions prevent deferred resource collection from masking leaks. CI
+workflow validation also rejects expanded triggers, writable or
+job-local permission overrides, duplicate/extra jobs, extra step keys, and
+mutable third-party action references.
 
 ## Response Expectations
 

@@ -56,6 +56,220 @@ function Assert-FileContains {
     }
 }
 
+function Test-StringSequenceEqual {
+    param(
+        [AllowEmptyCollection()]
+        [string[]]$Left,
+        [AllowEmptyCollection()]
+        [string[]]$Right
+    )
+
+    if ($Left.Count -ne $Right.Count) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Left.Count; $index++) {
+        if ($Left[$index] -cne $Right[$index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-WorkflowBoundaryContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source
+    )
+
+    $lines = @($Source -split '\r?\n')
+    $activeLines = @(
+        $lines |
+            Where-Object { $_ -notmatch '^[ \t]*(?:#.*)?$' }
+    )
+
+    # trigger/permission の追加や duplicate top-level key を黙認しない。
+    # jobs 配下の詳細は既存の job/step exact validator が別途固定する。
+    $topLevelLines = @(
+        $activeLines |
+            Where-Object { $_ -match '^\S' }
+    )
+    if (
+        -not (
+            Test-StringSequenceEqual `
+                -Left $topLevelLines `
+                -Right @('name: Validate', 'on:', 'permissions:', 'jobs:')
+        )
+    ) {
+        return $false
+    }
+
+    $jobsIndexes = @()
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -ceq 'jobs:') {
+            $jobsIndexes += $index
+        }
+    }
+    if ($jobsIndexes.Count -ne 1) {
+        return $false
+    }
+    $jobsIndex = $jobsIndexes[0]
+    $envelopeLines = @(
+        $lines[0..$jobsIndex] |
+            Where-Object { $_ -notmatch '^[ \t]*(?:#.*)?$' }
+    )
+    $expectedEnvelope = @(
+        'name: Validate',
+        'on:',
+        '  pull_request:',
+        '  push:',
+        '    branches:',
+        '      - main',
+        'permissions:',
+        '  contents: read',
+        'jobs:'
+    )
+    if (
+        -not (
+            Test-StringSequenceEqual `
+                -Left $envelopeLines `
+                -Right $expectedEnvelope
+        )
+    ) {
+        return $false
+    }
+
+    $jobNames = New-Object System.Collections.Generic.List[string]
+    for ($index = $jobsIndex + 1; $index -lt $lines.Count; $index++) {
+        $jobMatch = [regex]::Match(
+            $lines[$index],
+            '^  (?<name>[A-Za-z0-9_-]+):\s*$'
+        )
+        if ($jobMatch.Success) {
+            $jobNames.Add($jobMatch.Groups['name'].Value) | Out-Null
+        }
+    }
+    if (
+        -not (
+            Test-StringSequenceEqual `
+                -Left @($jobNames.ToArray()) `
+                -Right @('validate', 'validate_ubuntu')
+        )
+    ) {
+        return $false
+    }
+    if (@($lines | Where-Object { $_ -match '^    permissions:\s*' }).Count -ne 0) {
+        return $false
+    }
+
+    # third-party action は immutable full commit SHA だけを許可する。
+    # 現 workflow は Windows/Ubuntu 各 1 回の checkout 以外を持たない。
+    $expectedCheckout = (
+        'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+    )
+    $usesValues = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+        $usesMatch = [regex]::Match(
+            $line,
+            '^[ \t]+uses:[ \t]*(?<value>[^#\r\n]+?)[ \t]*(?:#.*)?$'
+        )
+        if ($usesMatch.Success) {
+            $usesValues.Add(
+                $usesMatch.Groups['value'].Value.Trim()
+            ) | Out-Null
+        }
+    }
+    if ($usesValues.Count -ne 2) {
+        return $false
+    }
+    foreach ($usesValue in $usesValues) {
+        if (
+            $usesValue -cne $expectedCheckout -or
+            $usesValue -cnotmatch
+                '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$'
+        ) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-WorkflowBoundaryContract {
+    param([string]$RelativePath)
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return
+    }
+    try {
+        $source = [System.IO.File]::ReadAllText(
+            $filePath,
+            (New-Object System.Text.UTF8Encoding($false, $true))
+        )
+    }
+    catch {
+        return
+    }
+    if (-not (Test-WorkflowBoundaryContract -Source $source)) {
+        Add-Failure (
+            "$RelativePath must keep its exact top-level trigger, " +
+            'permission, job-ID, and immutable-action contract'
+        )
+        return
+    }
+
+    # validator 自体が代表的な権限拡張・mutable action・duplicate job を
+    # 拒否することを pure mutation で固定し、regex の誤合格を防ぐ。
+    $mutations = @(
+        [pscustomobject]@{
+            Name = 'pull-request-target'
+            Source = [regex]::Replace(
+                $source,
+                '(?m)^  pull_request:\s*$',
+                '  pull_request_target:'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'extra-trigger'
+            Source = [regex]::Replace(
+                $source,
+                '(?m)^  pull_request:\s*$',
+                "  pull_request:`n  workflow_dispatch:"
+            )
+        },
+        [pscustomobject]@{
+            Name = 'duplicate-job'
+            Source = [regex]::Replace(
+                $source,
+                '(?m)^  validate_ubuntu:\s*$',
+                "  validate:`n  validate_ubuntu:"
+            )
+        },
+        [pscustomobject]@{
+            Name = 'job-permission-override'
+            Source = [regex]::Replace(
+                $source,
+                '(?m)^  validate:\s*$',
+                "  validate:`n    permissions:`n      contents: write"
+            )
+        },
+        [pscustomobject]@{
+            Name = 'mutable-action-ref'
+            Source = $source.Replace(
+                'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd',
+                'actions/checkout@v5'
+            )
+        }
+    )
+    foreach ($mutation in $mutations) {
+        if (Test-WorkflowBoundaryContract -Source $mutation.Source) {
+            Add-Failure (
+                "$RelativePath workflow validator accepted mutation: " +
+                $mutation.Name
+            )
+        }
+    }
+}
+
 function Get-WorkflowJobLines {
     param(
         [string]$RelativePath,
@@ -68,25 +282,41 @@ function Get-WorkflowJobLines {
         return @()
     }
 
-    $lines = @(Get-Content -LiteralPath $filePath)
-    $jobsStart = -1
+    # Windows PowerShell 5.1 の locale 既定へ依存せず、workflow を strict
+    # UTF-8 として読み、top-level jobs mapping 内だけを解析する。
+    try {
+        $workflowSource = [System.IO.File]::ReadAllText(
+            $filePath,
+            (New-Object System.Text.UTF8Encoding($false, $true))
+        )
+    }
+    catch {
+        Add-Failure "$RelativePath must be valid UTF-8"
+        return @()
+    }
+    $lines = @($workflowSource -split '\r?\n')
+    $jobsIndexes = @()
     for ($index = 0; $index -lt $lines.Count; $index++) {
         if ($lines[$index] -match '^jobs:\s*$') {
-            $jobsStart = $index
-            break
+            $jobsIndexes += $index
         }
     }
-    if ($jobsStart -lt 0) {
-        Add-Failure "$RelativePath must contain a top-level jobs mapping"
+    if ($jobsIndexes.Count -ne 1) {
+        Add-Failure "$RelativePath must contain exactly one top-level jobs mapping"
         return @()
+    }
+    $jobsStart = $jobsIndexes[0]
+    $jobsEnd = $lines.Count
+    for ($index = $jobsStart + 1; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -match '^\S') {
+            $jobsEnd = $index
+            break
+        }
     }
 
     $jobStart = -1
     $jobPattern = '^  ' + [regex]::Escape($JobName) + ':\s*$'
-    for ($index = $jobsStart + 1; $index -lt $lines.Count; $index++) {
-        if ($lines[$index] -match '^\S') {
-            break
-        }
+    for ($index = $jobsStart + 1; $index -lt $jobsEnd; $index++) {
         if ($lines[$index] -match $jobPattern) {
             $jobStart = $index
             break
@@ -97,10 +327,9 @@ function Get-WorkflowJobLines {
         return @()
     }
 
-    $jobEnd = $lines.Count
-    for ($index = $jobStart + 1; $index -lt $lines.Count; $index++) {
+    $jobEnd = $jobsEnd
+    for ($index = $jobStart + 1; $index -lt $jobsEnd; $index++) {
         if (
-            $lines[$index] -match '^\S' -or
             $lines[$index] -match '^  [A-Za-z0-9_-]+:\s*$'
         ) {
             $jobEnd = $index
@@ -108,6 +337,86 @@ function Get-WorkflowJobLines {
         }
     }
     return @($lines[$jobStart..($jobEnd - 1)])
+}
+
+function Assert-WorkflowJobSet {
+    param(
+        [string]$RelativePath,
+        [string[]]$ExpectedJobs
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return
+    }
+    try {
+        $source = [System.IO.File]::ReadAllText(
+            $filePath,
+            (New-Object System.Text.UTF8Encoding($false, $true))
+        )
+    }
+    catch {
+        return
+    }
+    $lines = @($source -split '\r?\n')
+    $jobsIndexes = @()
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -match '^jobs:\s*$') {
+            $jobsIndexes += $index
+        }
+    }
+    if ($jobsIndexes.Count -ne 1) {
+        return
+    }
+
+    $jobsEnd = $lines.Count
+    for (
+        $index = $jobsIndexes[0] + 1;
+        $index -lt $lines.Count;
+        $index++
+    ) {
+        if ($lines[$index] -match '^\S') {
+            $jobsEnd = $index
+            break
+        }
+    }
+    $jobNames = New-Object System.Collections.Generic.List[string]
+    $unexpectedDirectEntries = 0
+    for (
+        $index = $jobsIndexes[0] + 1;
+        $index -lt $jobsEnd;
+        $index++
+    ) {
+        $jobMatch = [regex]::Match(
+            $lines[$index],
+            '^  (?<name>[A-Za-z0-9_-]+):\s*$'
+        )
+        if ($jobMatch.Success) {
+            $jobNames.Add($jobMatch.Groups['name'].Value) | Out-Null
+        } elseif ($lines[$index] -match '^  (?![ #\r\n]).+$') {
+            $unexpectedDirectEntries++
+        }
+    }
+
+    $actualJobs = @($jobNames.ToArray())
+    $expectedSequenceMatches = (
+        $actualJobs.Count -eq $ExpectedJobs.Count
+    )
+    if ($expectedSequenceMatches) {
+        for ($index = 0; $index -lt $ExpectedJobs.Count; $index++) {
+            if ($actualJobs[$index] -cne $ExpectedJobs[$index]) {
+                $expectedSequenceMatches = $false
+                break
+            }
+        }
+    }
+    if (-not $expectedSequenceMatches -or
+        $unexpectedDirectEntries -ne 0) {
+        Add-Failure (
+            "$RelativePath jobs mapping must contain exactly: " +
+            ($ExpectedJobs -join ', ')
+        )
+    }
 }
 
 function Assert-WorkflowJobTimeout {
@@ -135,6 +444,34 @@ function Assert-WorkflowJobTimeout {
     )
     if ([int]$timeoutMatch.Groups['minutes'].Value -ne $Minutes) {
         Add-Failure "Workflow jobs.$JobName timeout-minutes must be $Minutes"
+    }
+}
+
+function Assert-WorkflowJobDirectValue {
+    param(
+        [string]$RelativePath,
+        [string]$JobName,
+        [string]$Key,
+        [string]$Value
+    )
+
+    # 別jobの値で誤合格しないよう、対象job直下のexact scalarだけを数える。
+    $jobLines = @(
+        Get-WorkflowJobLines -RelativePath $RelativePath -JobName $JobName
+    )
+    if ($jobLines.Count -eq 0) {
+        return
+    }
+    $pattern = (
+        '^    ' + [regex]::Escape($Key) + ':\s*' +
+        [regex]::Escape($Value) + '\s*$'
+    )
+    $matches = @($jobLines | Where-Object { $_ -match $pattern })
+    if ($matches.Count -ne 1) {
+        Add-Failure (
+            "Workflow jobs.$JobName must contain exactly one " +
+            "$Key value '$Value'"
+        )
     }
 }
 
@@ -174,7 +511,21 @@ function Get-WorkflowSteps {
         Add-Failure "Workflow jobs.$JobName.steps must not be empty"
         return @()
     }
-    foreach ($line in $jobLines[$stepsStart..($stepsEnd - 1)]) {
+    $stepLines = @($jobLines[$stepsStart..($stepsEnd - 1)])
+    $allStepCount = @(
+        $stepLines | Where-Object { $_ -match '^      -[ \t]+' }
+    ).Count
+    $namedStepCount = @(
+        $stepLines |
+            Where-Object { $_ -match '^      -[ \t]+name:[ \t]+' }
+    ).Count
+    if ($allStepCount -ne $namedStepCount) {
+        Add-Failure (
+            "Workflow jobs.$JobName must give every active step " +
+            'an explicit name'
+        )
+    }
+    foreach ($line in $stepLines) {
         $isStepStart = $line -match '^      -[ \t]+'
         if ($isStepStart -and $null -ne $currentStep) {
             $steps.Add($currentStep) | Out-Null
@@ -190,6 +541,9 @@ function Get-WorkflowSteps {
                 Shell = ''
                 Run = ''
                 Uses = ''
+                ShellCount = 0
+                RunCount = 0
+                UsesCount = 0
             }
             continue
         }
@@ -206,6 +560,7 @@ function Get-WorkflowSteps {
         )
         if ($shellMatch.Success) {
             $currentStep.Shell = $shellMatch.Groups['value'].Value.Trim("'`"")
+            $currentStep.ShellCount++
             continue
         }
         $usesMatch = [regex]::Match(
@@ -214,6 +569,7 @@ function Get-WorkflowSteps {
         )
         if ($usesMatch.Success) {
             $currentStep.Uses = $usesMatch.Groups['value'].Value.Trim("'`" ")
+            $currentStep.UsesCount++
             continue
         }
         $runMatch = [regex]::Match(
@@ -222,6 +578,7 @@ function Get-WorkflowSteps {
         )
         if ($runMatch.Success) {
             $currentStep.Run = $runMatch.Groups['value'].Value.Trim("'`"")
+            $currentStep.RunCount++
         }
     }
 
@@ -229,6 +586,101 @@ function Get-WorkflowSteps {
         $steps.Add($currentStep) | Out-Null
     }
     return $steps.ToArray()
+}
+
+function Assert-WorkflowStepCount {
+    param(
+        [object[]]$Steps,
+        [string]$JobName,
+        [int]$ExpectedCount
+    )
+
+    if ($Steps.Count -ne $ExpectedCount) {
+        Add-Failure (
+            "Workflow jobs.$JobName must contain exactly " +
+            "$ExpectedCount named steps (found $($Steps.Count))"
+        )
+    }
+}
+
+function Assert-WorkflowJobShape {
+    param(
+        [string[]]$Lines,
+        [string]$JobName,
+        [int]$ExpectedStepCount,
+        [int]$ExpectedShellCount,
+        [int]$ExpectedRunCount
+    )
+
+    # expected keyを残したまま if / env / continue-on-error / extra actionを
+    # 足して gate を無効化できないよう、全 active entry をindent別に数える。
+    $jobEntryCount = @(
+        $Lines | Where-Object { $_ -match '^    (?![ #\r\n]).+$' }
+    ).Count
+    $nameKeyCount = @(
+        $Lines | Where-Object { $_ -match '^    name:[ \t]*' }
+    ).Count
+    $runsOnKeyCount = @(
+        $Lines | Where-Object { $_ -match '^    runs-on:[ \t]*' }
+    ).Count
+    $timeoutKeyCount = @(
+        $Lines | Where-Object { $_ -match '^    timeout-minutes:[ \t]*' }
+    ).Count
+    $stepsKeyCount = @(
+        $Lines | Where-Object { $_ -match '^    steps:[ \t]*' }
+    ).Count
+    $stepItemCount = @(
+        $Lines | Where-Object { $_ -match '^      -[ \t]+' }
+    ).Count
+    $stepPropertyCount = @(
+        $Lines | Where-Object { $_ -match '^        (?![ #\r\n]).+$' }
+    ).Count
+    $shellKeyCount = @(
+        $Lines | Where-Object { $_ -match '^        shell:[ \t]*' }
+    ).Count
+    $runKeyCount = @(
+        $Lines | Where-Object { $_ -match '^        run:[ \t]*' }
+    ).Count
+    $usesKeyCount = @(
+        $Lines | Where-Object { $_ -match '^        uses:[ \t]*' }
+    ).Count
+    $deepActiveEntryCount = @(
+        $Lines | Where-Object {
+            $_ -match '^ {10,}(?![ #\r\n]).+$'
+        }
+    ).Count
+    $expectedStepPropertyCount = (
+        1 +
+        $ExpectedShellCount +
+        $ExpectedRunCount
+    )
+
+    if ($jobEntryCount -ne 4 -or
+        $nameKeyCount -ne 1 -or
+        $runsOnKeyCount -ne 1 -or
+        $timeoutKeyCount -ne 1 -or
+        $stepsKeyCount -ne 1) {
+        Add-Failure (
+            "Workflow jobs.$JobName must contain only one " +
+            'name/runs-on/timeout-minutes/steps mapping'
+        )
+    }
+    if ($stepItemCount -ne $ExpectedStepCount) {
+        Add-Failure (
+            "Workflow jobs.$JobName must contain exactly " +
+            "$ExpectedStepCount step items (found $stepItemCount)"
+        )
+    }
+    if ($stepPropertyCount -ne $expectedStepPropertyCount -or
+        $shellKeyCount -ne $ExpectedShellCount -or
+        $runKeyCount -ne $ExpectedRunCount -or
+        $usesKeyCount -ne 1 -or
+        $deepActiveEntryCount -ne 0) {
+        Add-Failure (
+            "Workflow jobs.$JobName contains an unexpected, " +
+            'missing, duplicate, or nested step-level key'
+        )
+    }
 }
 
 function Assert-WorkflowUsesStep {
@@ -245,6 +697,14 @@ function Assert-WorkflowUsesStep {
     }
     if ($matches[0].Uses -cne $Uses) {
         Add-Failure "Workflow step '$Name' must use '$Uses' (found '$($matches[0].Uses)')"
+    }
+    if ($matches[0].UsesCount -ne 1 -or
+        $matches[0].ShellCount -ne 0 -or
+        $matches[0].RunCount -ne 0) {
+        Add-Failure (
+            "Workflow step '$Name' must contain exactly one uses " +
+            'and no shell/run key'
+        )
     }
 }
 
@@ -263,6 +723,14 @@ function Assert-WorkflowStep {
     }
 
     $step = $matches[0]
+    if ($step.ShellCount -ne 1 -or
+        $step.RunCount -ne 1 -or
+        $step.UsesCount -ne 0) {
+        Add-Failure (
+            "Workflow step '$Name' must contain exactly one shell/run " +
+            'and no uses key'
+        )
+    }
     if (-not $step.Shell.Equals($Shell, [System.StringComparison]::OrdinalIgnoreCase)) {
         Add-Failure "Workflow step '$Name' must use shell '$Shell' (found '$($step.Shell)')"
     }
@@ -352,10 +820,13 @@ $requiredFiles = @(
     'SECURITY.md',
     'SKILL.md',
     'docs/SKILL.ja.md',
+    'docs/scanner-hardening-v2.md',
     'examples/delegation-prompt-template.md',
     'examples/verification-checklist.md',
     'examples/ledger-template.md',
+    'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
+    'scripts/scan-private-markers-v2.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
 )
@@ -374,14 +845,243 @@ Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/SKILL\.ja\.md' -Des
 Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.local' -Description 'ignore local private marker files'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?im)do not.*public|private|security' -Description 'private vulnerability reporting guidance'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers.ps1' `
+    -Pattern '(?s)\[object\]\$ScanDeadlineMilliseconds.*?\[int\]::TryParse\(.*?\[ref\]\$parsedScanDeadline.*?\$ScanDeadlineMilliseconds\s*=\s*\$parsedScanDeadline.*?\$ScanDeadlineMilliseconds\s*-lt\s*1.*?\$ScanDeadlineMilliseconds\s*-gt\s*120000' `
+    -Description 'raw integer and range validated public scan deadline seam'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers-v2.ps1' `
+    -Pattern '(?s)\[object\]\$ScanDeadlineMilliseconds.*?\[int\]::TryParse\(.*?\[ref\]\$parsedScanDeadline.*?\$ScanDeadlineMilliseconds\s*=\s*\$parsedScanDeadline.*?throw\s+''scan-deadline-invalid''.*?Write-FixedStartupFailure\s+-Code\s+''scan-deadline-invalid''' `
+    -Description 'raw integer and range validated implementation scan deadline seam'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers-v2.ps1' `
+    -Pattern '(?s)\$destination\s*=\s*\[Console\]::OpenStandardOutput\(\).*?Test-ScanDeadline\s*\$destination\.Write\(' `
+    -Description 'deadline check immediately before final finding/failure/success write'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers-v2.ps1' `
+    -Pattern '(?s)function\s+Write-FixedRuntimeFailure.*?\$stream\s*=\s*\[Console\]::OpenStandardOutput\(\)\s*#.*?Test-ScanDeadline\s*\$stream\.Write\(' `
+    -Description 'deadline check immediately before runtime diagnostic write'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern 'if\s*\(\s*!TerminateJobObject\(' `
+    -Description 'checked Windows Job termination result'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern 'launchCleanupWait\s*!=\s*WaitObject0' `
+    -Description 'checked Windows launch cleanup wait result'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern 'windows-thread-handle-close-failed' `
+    -Description 'checked Windows thread handle close result'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern 'windows-process-handle-close-failed' `
+    -Description 'checked Windows process handle close result'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern 'windows-job-handle-close-failed' `
+    -Description 'checked Windows Job handle close result'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern 'if\s*\(\s*!CloseHandle\(handle\)\s*\)' `
+    -Description 'checked Windows raw handle close result'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern 'if\s*\(\s*!process\.WaitForExit\(' `
+    -Description 'checked POSIX direct rewait result'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)posix-process-cleanup-failed.*?cleanupFailure' `
+    -Description 'aggregated POSIX termination and dispose cleanup failures'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern 'LastSyntheticFailureProcessId' `
+    -Description 'Windows launch failure PID regression'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern 'windows-launch-failure-\$launchFailureMode\.sentinel' `
+    -Description 'Windows suspended launch sentinel regression'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)job-close.*?windows-launch-process-fallback-termination-failed.*?forceFirstJobCloseFailure.*?LastSyntheticJobCloseRetrySucceeded' `
+    -Description 'Windows Job cleanup fallback and retained-handle retry'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)LastSyntheticTerminateProcessFallbackUsed.*?LastSyntheticJobCloseRetrySucceeded' `
+    -Description 'Windows Job cleanup fault-injection evidence'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)DisposeStream\(ref stdoutStream\).*?stdout\.Dispose\(\).*?stderr\.Dispose\(\).*?stdin\.Dispose\(\)' `
+    -Description 'explicit Windows success pump and stream disposal'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)RunPosix\(.*?PrivateMarkerReadPump stdout = null.*?finally.*?DisposePumps\(stdout, stderr, stdin\).*?WaitPumpsBounded\(.*?DisposePumps\(stdout, stderr, stdin\).*?process\.Dispose\(\)' `
+    -Description 'explicit POSIX pump, task, stream, and buffer disposal'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)Stopwatch operationStopwatch = Stopwatch\.StartNew\(\).*?RunWindows\(.*?operationStopwatch.*?RunPosix\(.*?operationStopwatch' `
+    -Description 'operation deadline established before OS process launch'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)ThrowIfOperationTimedOut\(\s*operationStopwatch,\s*timeoutMilliseconds\s*\).*?CreateProcessW\(.*?ThrowIfOperationTimedOut\(\s*operationStopwatch,\s*timeoutMilliseconds\s*\).*?ResumeThread' `
+    -Description 'Windows deadline checks before create and resume'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)RunPosix\(.*?ApplyProcessEnvironment\(startInfo, environment\).*?ThrowIfOperationTimedOut\(\s*operationStopwatch,\s*timeoutMilliseconds\s*\).*?process\.Start\(\)' `
+    -Description 'POSIX deadline check before process start'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)ConvertTo-PrivateMarkerBoundedInteger.*?\^\[0-9\]\+\$.*?\[object\]\$TimeoutMilliseconds.*?\[object\]\$KillWaitMilliseconds.*?\[object\]\$MaxStandardOutputBytes.*?\[object\]\$MaxStandardErrorBytes' `
+    -Description 'raw integer validation for exported runner numeric arguments'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)\$handleAttempt\s*=\s*0.*?\$handleAttempt\s*-lt\s*40.*?HandleCount' `
+    -Description 'forty-run Windows handle stability regression without GC'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)/proc/\$PID/fd.*?\$fdAttempt\s*=\s*0.*?\$fdAttempt\s*-lt\s*40' `
+    -Description 'forty-run POSIX file descriptor stability regression without GC'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)DelayedEnvironmentDictionary.*?pre-start-deadline\.sentinel.*?TimeoutMilliseconds 300.*?process-timeout' `
+    -Description 'pre-start operation deadline regression'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)\$operationStopwatch\s*=\s*\[System\.Diagnostics\.Stopwatch\]::StartNew\(\).*?\$process\.Start\(\).*?-OperationStopwatch\s+\$operationStopwatch' `
+    -Description 'self-test process deadline starts before Process.Start'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)invalidRunnerNumericCases.*?TimeoutMilliseconds.*?KillWaitMilliseconds.*?MaxStandardOutputBytes.*?MaxStandardErrorBytes.*?process-limit-invalid' `
+    -Description 'exported runner raw numeric argument regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern "(?s)Name\s*=\s*'root-directory'.*?Name\s*=\s*'root-file'.*?Name\s*=\s*'ancestor-directory'.*?Name\s*=\s*'ancestor-file'" `
+    -Description 'root/ancestor Git control file/directory regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers-v2.ps1' `
+    -Pattern '(?s)function\s+Find-NearestGitControlEntry.*?Get-ChildItem\s+-LiteralPath\s+\$current\.FullName\s+-Force.*?\.Name\.Equals\(' `
+    -Description 'non-following parent enumeration for Git control metadata'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern 'dangling-git-control' `
+    -Description 'dangling Git control junction regression'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)linked-worktree.*?git-index-worktree-union' `
+    -Description 'valid linked-worktree gitfile root regression'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)uppercase-git-fallback.*?github-classic-token-prefix' `
+    -Description 'case-sensitive POSIX uppercase .GIT regression'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)scanner-entrypoint-failed.*?invalid public scan deadline' `
+    -Description 'fixed public invalid deadline diagnostic'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern "(?s)'1\.5'.*?'1e3'.*?'not-an-integer'.*?'2147483648'.*?invalid public scan deadline" `
+    -Description 'non-integer and overflowing public deadline regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern 'Test-FirstBoundedInvocationIsRawTransport' `
+    -Description 'AST-validated first raw process invocation'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern 'invoked-scriptblock-return-as-is' `
+    -Description 'InvokeReturnAsIs eager-scriptblock AST regression'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)invoked-function-before.*?scope-qualified-function-before.*?alias-function-before.*?get-command-function-before.*?get-item-function-before.*?dynamic-get-command-function-before.*?safe-get-command-application.*?transitive-function-before.*?dynamic-function-call-operator.*?function-scriptblock-member.*?function-inside-raw-argument' `
+    -Description 'direct, scoped, aliased, referenced, transitive, dynamic, and nested deferred-function invocation regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)shadow-target-function.*?retarget-target-alias.*?builtin-gcm-wrapper.*?module-qualified-get-command.*?function-scriptblock-member.*?invoke-command-function-ref' `
+    -Description 'target-shadow, built-in/module lookup, and function-reference regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)invoke-command-function-ref.*?foreach-function-ref.*?class-constructor-before.*?class-method-before.*?invoke-expression-helper' `
+    -Description 'command-wrapper, type-construction, and runtime-expression regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)typeDefinition\.BaseTypes.*?derived-class-base-constructor-before.*?transitive-derived-base-constructor-before.*?safe-derived-base-constructor-before' `
+    -Description 'derived class base-constructor risk propagation regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)stored-scriptblock-invoke.*?stored-scriptblock-return-as-is.*?stored-scriptblock-call-operator.*?stored-scriptblock-dot-operator.*?stored-scriptblock-inside-raw-argument.*?stored-risky-function-invoke' `
+    -Description 'direct and function-indirect variable-backed scriptblock invocation regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)set-item-alias-target.*?set-item-function-target.*?stored-scriptblock-foreach-argument.*?stored-scriptblock-where-argument.*?unknown-invoke-composite-receiver' `
+    -Description 'provider shadow, command-argument scriptblock, and composite receiver regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)set-content-alias-function.*?new-item-dynamic-function-provider.*?bootstrap-variable-overwrite.*?bootstrap-scope-wrapper-overwrite.*?class-as-conversion-before.*?class-static-instance-before' `
+    -Description 'content/item provider, bootstrap overwrite, and class conversion/static initializer regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)\$rawGitBatchResult\s*=\s*Invoke-PrivateMarkerBoundedProcess.*?cat-file.*?--batch' `
+    -Description 'native Git byte-exact batch transport regression'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)\$inputCodePageBefore\s*=\s*\[Console\]::InputEncoding\.CodePage.*?\$inputPreambleBefore.*?\[Console\]::InputEncoding\.GetPreamble\(\)' `
+    -Description 'caller console input-encoding restoration regression'
+Assert-FileContains `
+    -RelativePath 'docs/scanner-hardening-v2.md' `
+    -Pattern 'Private marker scan failed closed \(integrity: git-probe\)\.' `
+    -Description 'fixed Git probe diagnostic contract'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers.ps1' `
+    -Pattern 'Private marker scan failed: scanner-entrypoint-failed' `
+    -Description 'fixed redacted scanner entrypoint diagnostic'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers-v2.ps1' `
+    -Pattern '(?s)\$fixedRuntimeFailure\s*=\s*''scanner-runtime-failed''.*?Write-FixedRuntimeFailure\s+-Code\s+\$fixedRuntimeFailure' `
+    -Description 'fixed redacted process-boundary runtime diagnostic'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)missing-implementation.*?missing-runner.*?throwing-runner.*?isolation-create-failure.*?isolation-remove-failure' `
+    -Description 'missing implementation/helper, helper exception, and isolation failure redaction regressions'
+
+$workflowPath = '.github/workflows/validate.yml'
+Assert-WorkflowBoundaryContract -RelativePath $workflowPath
+Assert-WorkflowJobSet `
+    -RelativePath $workflowPath `
+    -ExpectedJobs @('validate', 'validate_ubuntu')
 Assert-WorkflowJobTimeout `
-    -RelativePath '.github/workflows/validate.yml' `
+    -RelativePath $workflowPath `
     -JobName 'validate' `
-    -Minutes 10
+    -Minutes 25
+Assert-WorkflowJobTimeout `
+    -RelativePath $workflowPath `
+    -JobName 'validate_ubuntu' `
+    -Minutes 25
+Assert-WorkflowJobDirectValue `
+    -RelativePath $workflowPath `
+    -JobName 'validate' `
+    -Key 'runs-on' `
+    -Value 'windows-latest'
+Assert-WorkflowJobDirectValue `
+    -RelativePath $workflowPath `
+    -JobName 'validate_ubuntu' `
+    -Key 'runs-on' `
+    -Value 'ubuntu-24.04'
 
 $workflowSteps = Get-WorkflowSteps `
-    -RelativePath '.github/workflows/validate.yml' `
+    -RelativePath $workflowPath `
     -JobName 'validate'
+Assert-WorkflowStepCount `
+    -Steps $workflowSteps `
+    -JobName 'validate' `
+    -ExpectedCount 6
+$workflowJobLines = Get-WorkflowJobLines `
+    -RelativePath $workflowPath `
+    -JobName 'validate'
+Assert-WorkflowJobShape `
+    -Lines $workflowJobLines `
+    -JobName 'validate' `
+    -ExpectedStepCount 6 `
+    -ExpectedShellCount 5 `
+    -ExpectedRunCount 5
 Assert-WorkflowUsesStep -Steps $workflowSteps -Name 'Check out repository' `
     -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
 Assert-WorkflowStep -Steps $workflowSteps -Name 'Validate OSS readiness' `
@@ -392,9 +1092,44 @@ Assert-WorkflowStep -Steps $workflowSteps -Name 'Test private marker scan (Windo
     -Shell 'powershell' -Run './scripts/test-scan-private-markers.ps1'
 Assert-WorkflowStep -Steps $workflowSteps -Name 'Scan for private markers' `
     -Shell 'pwsh' -Run './scripts/scan-private-markers.ps1'
+$whitespaceCommand = (
+    'git diff-tree --check ' +
+    '4b825dc642cb6eb9a060e54bf8d69288fbee4904 HEAD'
+)
+Assert-WorkflowStep -Steps $workflowSteps -Name 'Check whitespace' `
+    -Shell 'pwsh' -Run $whitespaceCommand
+
+$ubuntuWorkflowSteps = Get-WorkflowSteps `
+    -RelativePath $workflowPath `
+    -JobName 'validate_ubuntu'
+Assert-WorkflowStepCount `
+    -Steps $ubuntuWorkflowSteps `
+    -JobName 'validate_ubuntu' `
+    -ExpectedCount 5
+$ubuntuWorkflowJobLines = Get-WorkflowJobLines `
+    -RelativePath $workflowPath `
+    -JobName 'validate_ubuntu'
+Assert-WorkflowJobShape `
+    -Lines $ubuntuWorkflowJobLines `
+    -JobName 'validate_ubuntu' `
+    -ExpectedStepCount 5 `
+    -ExpectedShellCount 4 `
+    -ExpectedRunCount 4
+Assert-WorkflowUsesStep -Steps $ubuntuWorkflowSteps -Name 'Check out repository' `
+    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Validate OSS readiness' `
+    -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
+Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Test private marker scan (PowerShell 7)' `
+    -Shell 'pwsh' -Run './scripts/test-scan-private-markers.ps1'
+Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Scan for private markers' `
+    -Shell 'pwsh' -Run './scripts/scan-private-markers.ps1'
+Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Check whitespace' `
+    -Shell 'pwsh' -Run $whitespaceCommand
 
 foreach ($powerShellScript in @(
+    'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
+    'scripts/scan-private-markers-v2.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
 )) {

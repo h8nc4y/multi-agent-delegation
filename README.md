@@ -175,8 +175,8 @@ repository paths you cannot publish, or customer data in public issues.
 - Tool names (`Agent` tool, `SendMessage`) are Claude Code specifics; the
   mapping for other environments is described in SKILL.md, but exact resume
   semantics differ per tool.
-- CI currently measures PowerShell 7 and Windows PowerShell 5.1 on Windows.
-  The documented POSIX `pwsh` commands remain unverified in CI.
+- CI measures PowerShell 7 and Windows PowerShell 5.1 on Windows, plus
+  PowerShell 7 on Ubuntu 24.04.
 
 ## Non-Goals
 
@@ -203,7 +203,8 @@ pwsh -NoProfile -File .\scripts\test-scan-private-markers.ps1
 pwsh -NoProfile -File .\scripts\scan-private-markers.ps1
 ```
 
-On macOS, Linux, or any POSIX shell with PowerShell 7 (`pwsh`) installed:
+On Linux with PowerShell 7 (`pwsh`) and trusted `setsid` at
+`/usr/bin/setsid` or `/bin/setsid`:
 
 ```bash
 pwsh -NoProfile -File ./scripts/validate-oss-readiness.ps1
@@ -213,21 +214,57 @@ pwsh -NoProfile -File ./scripts/scan-private-markers.ps1
 
 The scan self-test uses the exact PowerShell host that launched it instead of
 silently preferring `pwsh`. It exercises clean and failing scans, synthetic
-secret prefixes, staged/worktree divergence, a missing working-tree file,
-tracked symlink rejection, repository-root/probe failures, a hostile Git
-environment, present-empty removal and preservation, redaction,
+secret prefixes, index/worktree divergence, intent-to-add files, sensitive
+file names, a missing working-tree file, symlink/reparse rejection,
+repository-root/probe failures, snapshot mutation, a hostile Git environment,
+present-empty removal and preservation, redaction, exact byte transport,
+native Git batch bytes without a BOM, caller input-encoding preservation,
 outside-artifact prevention, and bounded child-tree/output-pipe termination.
-Every scanner and Git child process has a finite timeout.
+An AST regression requires the raw binary fixture to remain the first eager
+production-runner call, including against deferred scriptblocks and
+`ScriptBlock.Invoke*()` cases. Function call graphs, scope-qualified calls,
+in-source aliases, static function-provider/`Get-Command` references, and later
+references to direct or function-indirect stored scriptblocks are followed
+before that fixture. Target-name function/alias shadowing, invoked risky class
+constructors/methods, derived classes with a risky direct or transitive base
+constructor, `Invoke-Expression`, and unresolved dynamic calls/lookups fail
+conservatively. A literal application lookup such as
+`Get-Command git -CommandType Application` remains allowed. Scanner
+entry/helper/isolation failures return one fixed redacted stdout line, empty
+stderr, and exit code 2. Workflow validation fixes the top-level triggers,
+read-only permission, two job IDs, job-local permission absence, exact steps,
+and full-SHA action pins.
+Every scanner and Git child process has a finite timeout, and each scan has a
+two-minute monotonic deadline. A child operation's budget begins before
+environment preparation and process launch; termination and resource cleanup
+use a separate bounded kill-wait allowance. The public deadline parameter is
+lower-only (`1..120000` milliseconds), so a test can shorten the budget but no
+caller can extend production execution. The exported process runner accepts
+only canonical integer values for its numeric arguments; fractional,
+exponential, aggregate, and overflow inputs are rejected with
+`process-limit-invalid` instead of PowerShell's numeric coercion. Invalid
+public scan-deadline values are validated inside the scanner entrypoint and
+return one fixed stdout line, empty stderr, and exit 2.
 
-For a repository-root scan, the scanner reads regular stage-0 index blobs
-instead of following working-tree paths. It rejects unmerged, symlink, gitlink,
-malformed, missing-object, oversized, and aggregate-size-invalid index input.
-It also fails closed when Git probing does not resolve exactly to the requested
-root, including a dangling Git control entry; it does not silently downgrade
-that case to a working-tree scan. Index metadata is capped at 8 MiB and 4,096
-entries before per-blob processes begin. NUL-delimited metadata is parsed
-incrementally so delimiter-heavy output cannot multiply into an unbounded
-array.
+For a repository-root scan, the scanner takes a byte-exact index/debug
+snapshot, reads every unique regular stage-0 blob through one
+`git cat-file --batch` process, and scans a safe current-worktree copy when it
+differs or represents an intent-to-add file. This index/worktree union catches
+both committed/staged content and unstaged edits. It rejects unmerged,
+symlink, gitlink, reparse, malformed, missing-object, oversized, and
+aggregate-size-invalid input. It also fails closed when Git probing does not
+resolve exactly to the requested root, when a root or ancestor `.git` entry
+cannot establish that exact root, or when either raw snapshot changes during
+the scan. A non-reparse regular `.git` gitfile for a linked worktree or
+submodule is accepted only after the same bounded probe establishes the exact
+requested root. Broken, dangling, reparse, and mismatched control metadata return
+exit code 2 and exactly `Private marker scan failed closed (integrity:
+git-probe).` Nested `.git` directories and leaf files below a true non-Git scan
+root are control metadata excluded from fallback traversal; they are not opened
+or scanned. On a case-sensitive POSIX filesystem, `.GIT` is an ordinary name
+and remains in the fallback scan. Index metadata is capped at 8 MiB and 4,096 entries. NUL-delimited
+metadata and batch responses are parsed incrementally and validated against the
+exact request order.
 
 Each Git command receives a child environment cloned from — but isolated from
 — the scanner process. The scanner removes all ambient `GIT_*` values before
@@ -237,7 +274,32 @@ index, object, config, execution, prompt, or trace overrides from changing the
 tracked scan or writing outside its temporary isolation directory.
 Lazy promisor fetches and replacement refs are disabled, and protocol and
 credential-helper use is denied, so a missing blob fails locally instead of
-starting a remote helper or substituting different content.
+starting a remote helper or substituting different content. Git 2.43 emits
+one observed English warning when `GIT_NO_LAZY_FETCH=1` returns a missing
+promisor object; the batch boundary fixes the child locale to `C` and accepts
+only that exact LF/CRLF byte sequence. Any additional stderr still fails the
+scan.
+
+Child-process byte streams preserve arbitrary stdin/stdout/stderr bytes and
+enforce output caps. Windows starts each process suspended, attaches it to a
+kill-on-close Job Object with an explicit inherited-handle list, then resumes
+it. Launch-failure cleanup checks Job/process termination, bounded waits, and
+every owned pipe/thread/process/Job handle close. Linux starts a new session
+through trusted `setsid` and terminates the whole process group with checked
+`kill(2)` and direct re-wait results. Other POSIX environments without one of
+the trusted `setsid` paths fail closed instead of silently falling back to
+parent-only termination. The Windows path writes raw pipe handles from C#
+after direct `CreateProcessW`; it does not pass bytes through PowerShell's
+text `StandardInput` writer or require a PowerShell proxy. The self-test sends
+an arbitrary binary fixture first, then compares a native
+`git cat-file --batch` response byte-for-byte and confirms that the caller's
+`Console.InputEncoding` code page and preamble are unchanged on return.
+Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
+buffers. Forty-run no-GC regressions bound Windows process-handle growth and
+POSIX file-descriptor growth.
+The first-call AST gate also rejects Alias:/Function: mutations through
+`Set-Item`, `Set-Content`, or `New-Item`, dynamic bootstrap dot-sourcing,
+composite `.Invoke()` receivers, and risky class casts/static initialization.
 
 Explicit non-Git fixture directories use a one-level-at-a-time working-tree
 walk. Links and reparse points are rejected before traversal or content reads.
@@ -257,9 +319,10 @@ Also run Git whitespace checks on your working changes before publishing:
 git diff --check
 ```
 
-The GitHub Actions workflow runs the same validation, separate PowerShell 7
-and Windows PowerShell 5.1 scan self-tests, private-marker scan, and whitespace
-check on pull requests and pushes to `main`. The job has a 10-minute timeout.
+The GitHub Actions workflow runs validation, the private-marker self-test and
+repository scan, and whitespace checks on Windows and Ubuntu 24.04. Windows
+tests both PowerShell 7 and Windows PowerShell 5.1; Ubuntu tests PowerShell 7.
+Each job has a 25-minute timeout.
 
 ## Contributing
 
