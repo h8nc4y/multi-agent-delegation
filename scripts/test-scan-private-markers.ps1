@@ -4431,6 +4431,52 @@ function Invoke-Scanner {
         -TimeoutMilliseconds 120000
 }
 
+function Get-SafeScannerDiagnostic {
+    param([object]$Result)
+
+    # CI へ absolute path や finding value を流さず、scanner が既に公開用へ
+    # 固定・redact 済みの failure code / rule 名だけを抽出する。
+    $output = [string]$Result.StandardOutput
+    $fixedFailure = [regex]::Match(
+        $output,
+        '(?m)^Private marker scan failed: (?<code>[a-z0-9-]+)\r?$'
+    )
+    if ($fixedFailure.Success) {
+        return $fixedFailure.Groups['code'].Value
+    }
+    $integrityFailure = [regex]::Match(
+        $output,
+        '(?m)^Private marker scan failed closed \(integrity: ' +
+            '(?<code>[a-z0-9-]+)\)\.\r?$'
+    )
+    if ($integrityFailure.Success) {
+        return ('integrity-' + $integrityFailure.Groups['code'].Value)
+    }
+
+    $safeRules = @(
+        $output -split "`r?`n" |
+            ForEach-Object {
+                $columns = @($_ -split "`t")
+                if (
+                    $columns.Count -eq 4 -and
+                    $columns[2] -cmatch '^[a-z0-9-]+$' -and
+                    $columns[3] -ceq '<redacted>'
+                ) {
+                    $columns[2]
+                }
+            } |
+            Sort-Object -Unique |
+            Select-Object -First 3
+    )
+    if ($safeRules.Count -gt 0) {
+        return ('rules-' + ($safeRules -join ','))
+    }
+    if ([string]::IsNullOrEmpty($output)) {
+        return 'empty-output'
+    }
+    return 'unclassified-redacted-output'
+}
+
 function Assert-FixedScannerBoundaryFailure {
     param(
         [object]$Result,
@@ -5667,7 +5713,11 @@ Export-ModuleMember -Function @(
 
     $cleanResult = Invoke-Scanner -ScanPath $cleanRoot
     if ($cleanResult.ExitCode -ne 0) {
-        Add-Failure "Expected clean fixture to pass, but scanner exited $($cleanResult.ExitCode)."
+        $cleanDiagnostic = Get-SafeScannerDiagnostic -Result $cleanResult
+        Add-Failure (
+            "Expected clean fixture to pass, but scanner exited " +
+            "$($cleanResult.ExitCode) (safe diagnostic: $cleanDiagnostic)."
+        )
     }
 
     # parameter binding前のValidateRangeに依存するとPowerShell framingと入力値
