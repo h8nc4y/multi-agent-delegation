@@ -335,12 +335,17 @@ an arbitrary binary fixture first, then compares a native
 `git cat-file --batch` response byte-for-byte and confirms that the caller's
 `Console.InputEncoding` code page and preamble are unchanged on return.
 Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
-buffers. Windows measures a forty-invocation startup window with a bounded
+buffers. After the main self-test proves raw byte transport, Windows launches
+a dedicated handle-probe script in a fresh instance of the same PowerShell
+executable. That host measures a forty-invocation startup window with a bounded
 aggregate handle-growth allowance, then applies tighter final and peak limits
 to a separate forty-run steady-state window. Both windows run without forcing
-GC; the split avoids attributing startup-only runtime growth to a per-call leak
-while still bounding it. POSIX keeps its forty-run no-GC file-descriptor
-regression.
+GC; isolating earlier self-test tasks avoids attributing unrelated host cleanup
+to a per-call leak while still bounding startup and steady-state growth. POSIX
+keeps its forty-run no-GC file-descriptor regression.
+OSS readiness seals the dedicated Windows probe's canonical UTF-8 source with
+SHA-256 and separately checks its loop headers, direct child-runner statements,
+result guards, handle updates, and thresholds through the PowerShell AST.
 The first-call AST gate also rejects Alias:/Function: mutations through
 `Set-Item`, `Set-Content`, `New-Item`, provider copy/move/rename/remove/clear,
 alias import/remove, unapproved module loading,

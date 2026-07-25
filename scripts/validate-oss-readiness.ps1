@@ -75,7 +75,143 @@ function Assert-FileDoesNotContain {
     }
 }
 
-function Test-WindowsHandleProbeContract {
+function Test-WindowsHandleProbeLoopContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.Language.ForStatementAst]$Loop,
+        [Parameter(Mandatory = $true)]
+        [string]$CounterName,
+        [Parameter(Mandatory = $true)]
+        [string]$LimitName,
+        [Parameter(Mandatory = $true)]
+        [string]$ResultName,
+        [Parameter(Mandatory = $true)]
+        [string]$FinalName,
+        [Parameter(Mandatory = $true)]
+        [string]$MaximumName,
+        [Parameter(Mandatory = $true)]
+        [string]$ChildFailureCode
+    )
+
+    # 反復回数の変数名だけでなく、0初期化とpostfix incrementをASTで固定する。
+    # これにより、header文字列を保ったまま0回実行へ変える退行を拒否する。
+    $initializer = $Loop.Initializer
+    if (
+        $initializer -isnot
+            [System.Management.Automation.Language.AssignmentStatementAst] -or
+        $initializer.Operator -ne
+            [System.Management.Automation.Language.TokenKind]::Equals -or
+        $initializer.Left -isnot
+            [System.Management.Automation.Language.VariableExpressionAst] -or
+        -not $initializer.Left.VariablePath.IsUnqualified -or
+        $initializer.Left.VariablePath.UserPath -cne $CounterName -or
+        $initializer.Right -isnot
+            [System.Management.Automation.Language.CommandExpressionAst] -or
+        $initializer.Right.Expression -isnot
+            [System.Management.Automation.Language.ConstantExpressionAst] -or
+        $initializer.Right.Expression.Value -ne 0
+    ) {
+        return $false
+    }
+
+    $conditionContract = (
+        '^\s*\$' +
+        [regex]::Escape($CounterName) +
+        '\s*-lt\s*\$' +
+        [regex]::Escape($LimitName) +
+        '\s*$'
+    )
+    if ($Loop.Condition.Extent.Text -notmatch $conditionContract) {
+        return $false
+    }
+
+    $iterator = $Loop.Iterator
+    if (
+        $iterator -isnot
+            [System.Management.Automation.Language.PipelineAst] -or
+        $iterator.PipelineElements.Count -ne 1 -or
+        $iterator.PipelineElements[0] -isnot
+            [System.Management.Automation.Language.CommandExpressionAst] -or
+        $iterator.PipelineElements[0].Expression -isnot
+            [System.Management.Automation.Language.UnaryExpressionAst] -or
+        $iterator.PipelineElements[0].Expression.TokenKind -ne
+            [System.Management.Automation.Language.TokenKind]::PostfixPlusPlus -or
+        $iterator.PipelineElements[0].Expression.Child -isnot
+            [System.Management.Automation.Language.VariableExpressionAst] -or
+        -not (
+            $iterator.PipelineElements[0].
+                Expression.Child.VariablePath.IsUnqualified
+        ) -or
+        $iterator.PipelineElements[0].
+            Expression.Child.VariablePath.UserPath -cne $CounterName
+    ) {
+        return $false
+    }
+
+    # bodyは5個の直下statementに限定する。runnerやhandle更新がif/try等の
+    # 到達不能な子scopeへ包まれても、descendant検索ではpositiveにしない。
+    $statements = @($Loop.Body.Statements)
+    if (
+        $statements.Count -ne 5 -or
+        $statements[0] -isnot
+            [System.Management.Automation.Language.AssignmentStatementAst] -or
+        $statements[1] -isnot
+            [System.Management.Automation.Language.IfStatementAst] -or
+        $statements[2] -isnot
+            [System.Management.Automation.Language.PipelineAst] -or
+        $statements[3] -isnot
+            [System.Management.Automation.Language.AssignmentStatementAst] -or
+        $statements[4] -isnot
+            [System.Management.Automation.Language.AssignmentStatementAst]
+    ) {
+        return $false
+    }
+
+    # 各statementを全体一致させ、子process検証を飛ばすcontinue/returnや、
+    # handle取得順の入替えも契約違反として検出する。
+    $runnerContract = (
+        '(?s)^\s*\$' +
+        [regex]::Escape($ResultName) +
+        '\s*=\s*private-marker-process-runner\\' +
+        'Invoke-PrivateMarkerBoundedProcess\b.*$'
+    )
+    $childGuardContract = (
+        '(?s)^\s*if\s*\(\s*' +
+        '\$' + [regex]::Escape($ResultName) +
+        '\.ExitCode\s*-ne\s*0\s*-or\s*' +
+        '\$' + [regex]::Escape($ResultName) +
+        '\.StandardOutputBytes\.Length\s*-ne\s*0\s*-or\s*' +
+        '\$' + [regex]::Escape($ResultName) +
+        '\.StandardErrorBytes\.Length\s*-ne\s*0\s*' +
+        '\)\s*\{\s*throw\s+''' +
+        [regex]::Escape($ChildFailureCode) +
+        '''\s*\}\s*$'
+    )
+    $refreshContract = '^\s*\$handleProbeProcess\.Refresh\(\)\s*$'
+    $finalContract = (
+        '^\s*\$' +
+        [regex]::Escape($FinalName) +
+        '\s*=\s*\$handleProbeProcess\.HandleCount\s*$'
+    )
+    $maximumContract = (
+        '(?s)^\s*\$' +
+        [regex]::Escape($MaximumName) +
+        '\s*=\s*\[Math\]::Max\(\s*\$' +
+        [regex]::Escape($MaximumName) +
+        '\s*,\s*\$' +
+        [regex]::Escape($FinalName) +
+        '\s*\)\s*$'
+    )
+    return (
+        $statements[0].Extent.Text -match $runnerContract -and
+        $statements[1].Extent.Text -match $childGuardContract -and
+        $statements[2].Extent.Text -match $refreshContract -and
+        $statements[3].Extent.Text -match $finalContract -and
+        $statements[4].Extent.Text -match $maximumContract
+    )
+}
+
+function Test-WindowsHandleProbeAstContract {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Source
@@ -83,7 +219,7 @@ function Test-WindowsHandleProbeContract {
 
     # loop headerだけの正規表現では、runner呼出しをbody外へ移動または削除した
     # no-op実装を見抜けない。ASTで2つのfor bodyを特定し、各windowが実際に
-    # process実行とhandle更新を所有することをextent内で検査する。
+    # process実行とhandle更新を直下statementとして所有することを検査する。
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput(
@@ -92,6 +228,22 @@ function Test-WindowsHandleProbeContract {
         [ref]$parseErrors
     )
     if ($parseErrors.Count -ne 0) {
+        return $false
+    }
+
+    # 専用probeはfunctionを定義しない。import後の同名local functionで
+    # unqualified command resolutionをshadowする変異をsource全体で拒否する。
+    $functionDefinitions = @(
+        $ast.FindAll(
+            {
+                param($node)
+                $node -is
+                    [System.Management.Automation.Language.FunctionDefinitionAst]
+            },
+            $true
+        )
+    )
+    if ($functionDefinitions.Count -ne 0) {
         return $false
     }
 
@@ -134,6 +286,109 @@ function Test-WindowsHandleProbeContract {
     ) {
         return $false
     }
+    if (
+        -not [object]::ReferenceEquals(
+            $warmupLoop.Parent,
+            $measuredLoop.Parent
+        ) -or
+        $warmupLoop.Parent -isnot
+            [System.Management.Automation.Language.StatementBlockAst] -or
+        $warmupLoop.Parent.Parent -isnot
+            [System.Management.Automation.Language.TryStatementAst]
+    ) {
+        return $false
+    }
+
+    # run数とgrowth上限は、同じTry直下で各1回だけ定数代入し、最初のloopより
+    # 前に確定させる。loop直前の0再代入や、evidence直前の40復元を拒否する。
+    $constantAssignments = @(
+        [pscustomobject]@{ Name = 'handleWarmupRuns'; Value = 40 },
+        [pscustomobject]@{ Name = 'handleMeasuredRuns'; Value = 40 },
+        [pscustomobject]@{ Name = 'handleStartupGrowthLimit'; Value = 16 },
+        [pscustomobject]@{
+            Name = 'handleMeasuredFinalGrowthLimit'
+            Value = 4
+        },
+        [pscustomobject]@{
+            Name = 'handleMeasuredPeakGrowthLimit'
+            Value = 8
+        }
+    )
+    $assignmentStatements = @(
+        $ast.FindAll(
+            {
+                param($node)
+                $node -is
+                    [System.Management.Automation.Language.AssignmentStatementAst]
+            },
+            $true
+        )
+    )
+    foreach ($constantAssignment in $constantAssignments) {
+        $matchingAssignments = @(
+            $assignmentStatements |
+                Where-Object {
+                    $_.Left -is
+                        [System.Management.Automation.Language.VariableExpressionAst] -and
+                    $_.Left.VariablePath.UserPath -match (
+                        '(?i)(?:^|:)' +
+                        [regex]::Escape($constantAssignment.Name) +
+                        '$'
+                    )
+                }
+        )
+        if ($matchingAssignments.Count -ne 1) {
+            return $false
+        }
+
+        $matchingAssignment = $matchingAssignments[0]
+        if (
+            -not $matchingAssignment.Left.VariablePath.IsUnqualified -or
+            $matchingAssignment.Left.VariablePath.UserPath -cne
+                $constantAssignment.Name -or
+            $matchingAssignment.Operator -ne
+                [System.Management.Automation.Language.TokenKind]::Equals -or
+            $matchingAssignment.Right -isnot
+                [System.Management.Automation.Language.CommandExpressionAst] -or
+            $matchingAssignment.Right.Expression -isnot
+                [System.Management.Automation.Language.ConstantExpressionAst] -or
+            $matchingAssignment.Right.Expression.Value -ne
+                $constantAssignment.Value -or
+            -not [object]::ReferenceEquals(
+                $matchingAssignment.Parent,
+                $warmupLoop.Parent
+            ) -or
+            $matchingAssignment.Extent.StartOffset -ge
+                $warmupLoop.Extent.StartOffset
+        ) {
+            return $false
+        }
+    }
+
+    if (
+        -not (
+            Test-WindowsHandleProbeLoopContract `
+                -Loop $warmupLoop `
+                -CounterName 'handleWarmupAttempt' `
+                -LimitName 'handleWarmupRuns' `
+                -ResultName 'handleWarmupResult' `
+                -FinalName 'handleWarmupFinal' `
+                -MaximumName 'handleWarmupMaximum' `
+                -ChildFailureCode 'windows-handle-probe-startup-child-failed'
+        ) -or
+        -not (
+            Test-WindowsHandleProbeLoopContract `
+                -Loop $measuredLoop `
+                -CounterName 'handleAttempt' `
+                -LimitName 'handleMeasuredRuns' `
+                -ResultName 'handleProbeResult' `
+                -FinalName 'handleFinal' `
+                -MaximumName 'handleMaximum' `
+                -ChildFailureCode 'windows-handle-probe-steady-child-failed'
+        )
+    ) {
+        return $false
+    }
 
     # sourceをASTの境界で分割し、startup baseline → warm-up body →
     # startup上限 → steady-state body → steady-state上限の順序も固定する。
@@ -160,7 +415,9 @@ function Test-WindowsHandleProbeContract {
     )
     $warmupBodyContract = (
         '(?s)' +
-        '\$handleWarmupResult\s*=\s*Invoke-PrivateMarkerBoundedProcess.*?' +
+        '\$handleWarmupResult\s*=\s*' +
+        'private-marker-process-runner\\' +
+        'Invoke-PrivateMarkerBoundedProcess.*?' +
         '\$handleProbeProcess\.Refresh\(\).*?' +
         '\$handleWarmupFinal\s*=\s*\$handleProbeProcess\.HandleCount.*?' +
         '\$handleWarmupMaximum\s*=\s*\[Math\]::Max\('
@@ -175,7 +432,9 @@ function Test-WindowsHandleProbeContract {
     )
     $measuredBodyContract = (
         '(?s)' +
-        '\$handleProbeResult\s*=\s*Invoke-PrivateMarkerBoundedProcess.*?' +
+        '\$handleProbeResult\s*=\s*' +
+        'private-marker-process-runner\\' +
+        'Invoke-PrivateMarkerBoundedProcess.*?' +
         '\$handleProbeProcess\.Refresh\(\).*?' +
         '\$handleFinal\s*=\s*\$handleProbeProcess\.HandleCount.*?' +
         '\$handleMaximum\s*=\s*\[Math\]::Max\('
@@ -195,6 +454,36 @@ function Test-WindowsHandleProbeContract {
         $measuredBody -match $measuredBodyContract -and
         $suffix -match $suffixContract
     )
+}
+
+function Test-WindowsHandleProbeContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source
+    )
+
+    # 専用probeは小さく閉じたregression fixtureなので、AST契約に加えてcanonical
+    # source全体をSHA-256で封印する。Set-Variable、outer wrapper、偽evidence等の
+    # AST上は合法な追記も、個別deny-listへ依存せず必ずreview対象に戻す。
+    $expectedSourceSha256 = (
+        'dcad83706cd800b7d52a0d7f2d83b81f85aee752256dc45dcec6c78a83444e7c'
+    )
+    $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $actualSourceSha256 = (
+            $sha256.ComputeHash($sourceBytes) |
+                ForEach-Object { $_.ToString('x2') }
+        ) -join ''
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    if ($actualSourceSha256 -cne $expectedSourceSha256) {
+        return $false
+    }
+
+    return Test-WindowsHandleProbeAstContract -Source $Source
 }
 
 function Test-StringSequenceEqual {
@@ -968,6 +1257,7 @@ $requiredFiles = @(
     'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
     'scripts/scan-private-markers-v2.ps1',
+    'scripts/test-private-marker-handle-stability.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
 )
@@ -1116,7 +1406,7 @@ Assert-FileContains `
     -Pattern '(?s)ConvertTo-PrivateMarkerBoundedInteger.*?\^\[0-9\]\+\$.*?\[object\]\$TimeoutMilliseconds.*?\[object\]\$KillWaitMilliseconds.*?\[object\]\$MaxStandardOutputBytes.*?\[object\]\$MaxStandardErrorBytes' `
     -Description 'raw integer validation for exported runner numeric arguments'
 $windowsHandleProbePath = Get-RepoFilePath `
-    -RelativePath 'scripts/test-scan-private-markers.ps1'
+    -RelativePath 'scripts/test-private-marker-handle-stability.ps1'
 if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
     Add-Failure 'Cannot inspect missing Windows handle stability regression.'
 } else {
@@ -1130,9 +1420,367 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
         )
     ) {
         Add-Failure (
-            'scripts/test-scan-private-markers.ps1 is missing: ' +
+            'scripts/test-private-marker-handle-stability.ps1 is missing: ' +
             'bounded startup and steady-state Windows handle regressions without GC'
         )
+    }
+
+    # 片方だけ0回へ変えても必ずrejectされることを別々に検証する。両方を同時に
+    # 変えるfixtureでは、一方のheader検査が欠けてもnegativeになり得るため分離する。
+    $windowsHandleZeroRunCases = @(
+        [pscustomobject]@{
+            Name = 'startup'
+            Before = '$handleWarmupAttempt = 0;'
+            After = '$handleWarmupAttempt = $handleWarmupRuns;'
+        },
+        [pscustomobject]@{
+            Name = 'steady-state'
+            Before = '$handleAttempt = 0;'
+            After = '$handleAttempt = $handleMeasuredRuns;'
+        }
+    )
+    foreach ($zeroRunCase in $windowsHandleZeroRunCases) {
+        $zeroRunFixture = $windowsHandleProbeSource.Replace(
+            $zeroRunCase.Before,
+            $zeroRunCase.After
+        )
+        if ($zeroRunFixture -ceq $windowsHandleProbeSource) {
+            Add-Failure (
+                'Windows handle readiness zero-run fixture setup failed: ' +
+                $zeroRunCase.Name
+            )
+        } elseif (
+            Test-WindowsHandleProbeAstContract -Source $zeroRunFixture
+        ) {
+            Add-Failure (
+                'Windows handle readiness AST contract accepts a zero-run ' +
+                $zeroRunCase.Name +
+                ' window.'
+            )
+        }
+    }
+
+    # headerを変えずlimitだけ0へ再代入する変異も各windowでrejectする。
+    # evidence直前に40へ戻して表示値だけ正規化しても、代入数検査で失敗する。
+    $windowsHandleLimitReassignmentCases = @(
+        [pscustomobject]@{
+            Name = 'startup'
+            Before = '$handleWarmupRuns = 40'
+            After = (
+                '$handleWarmupRuns = 40' +
+                "`n    " +
+                '$handleWarmupRuns = 0'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'steady-state'
+            Before = '$handleMeasuredRuns = 40'
+            After = (
+                '$handleMeasuredRuns = 40' +
+                "`n    " +
+                '$handleMeasuredRuns = 0'
+            )
+        }
+    )
+    foreach (
+        $limitReassignmentCase in $windowsHandleLimitReassignmentCases
+    ) {
+        $limitReassignmentFixture = $windowsHandleProbeSource.Replace(
+            $limitReassignmentCase.Before,
+            $limitReassignmentCase.After
+        )
+        $limitFixtureTokens = $null
+        $limitFixtureParseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseInput(
+            $limitReassignmentFixture,
+            [ref]$limitFixtureTokens,
+            [ref]$limitFixtureParseErrors
+        ) | Out-Null
+        if (
+            $limitReassignmentFixture -ceq $windowsHandleProbeSource -or
+            $limitFixtureParseErrors.Count -ne 0
+        ) {
+            Add-Failure (
+                'Windows handle readiness limit-reassignment fixture setup ' +
+                'failed: ' +
+                $limitReassignmentCase.Name
+            )
+        } elseif (
+            Test-WindowsHandleProbeAstContract `
+                -Source $limitReassignmentFixture
+        ) {
+            Add-Failure (
+                'Windows handle readiness AST contract accepts a reassigned ' +
+                $limitReassignmentCase.Name +
+                ' limit.'
+            )
+        }
+    }
+
+    # 同じresult変数へdummy commandの返り値を入れるだけの置換もrejectする。
+    # 出力shapeだけを模倣して実runnerを一度も呼ばない退行をpositiveにしない。
+    $windowsHandleRunnerSubstitutionCases = @(
+        [pscustomobject]@{
+            Name = 'startup'
+            Before = (
+                '$handleWarmupResult = ' +
+                'private-marker-process-runner\' +
+                'Invoke-PrivateMarkerBoundedProcess'
+            )
+            After = '$handleWarmupResult = New-PrivateMarkerDummyResult'
+        },
+        [pscustomobject]@{
+            Name = 'steady-state'
+            Before = (
+                '$handleProbeResult = ' +
+                'private-marker-process-runner\' +
+                'Invoke-PrivateMarkerBoundedProcess'
+            )
+            After = '$handleProbeResult = New-PrivateMarkerDummyResult'
+        }
+    )
+    foreach (
+        $runnerSubstitutionCase in $windowsHandleRunnerSubstitutionCases
+    ) {
+        $runnerSubstitutionFixture = $windowsHandleProbeSource.Replace(
+            $runnerSubstitutionCase.Before,
+            $runnerSubstitutionCase.After
+        )
+        $runnerFixtureTokens = $null
+        $runnerFixtureParseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseInput(
+            $runnerSubstitutionFixture,
+            [ref]$runnerFixtureTokens,
+            [ref]$runnerFixtureParseErrors
+        ) | Out-Null
+        if (
+            $runnerSubstitutionFixture -ceq $windowsHandleProbeSource -or
+            $runnerFixtureParseErrors.Count -ne 0
+        ) {
+            Add-Failure (
+                'Windows handle readiness runner-substitution fixture setup ' +
+                'failed: ' +
+                $runnerSubstitutionCase.Name
+            )
+        } elseif (
+            Test-WindowsHandleProbeAstContract `
+                -Source $runnerSubstitutionFixture
+        ) {
+            Add-Failure (
+                'Windows handle readiness AST contract accepts a dummy ' +
+                $runnerSubstitutionCase.Name +
+                ' runner.'
+            )
+        }
+    }
+
+    # import後に同名local functionを置くcommand-resolution shadowもrejectする。
+    # production call自体もmodule-qualifiedに固定し、静的契約とruntime双方で守る。
+    $handleProbeImportStatement = (
+        'Microsoft.PowerShell.Core\Import-Module ' +
+        '$processRunnerModule -Force'
+    )
+    $providerShadowMutation = @'
+Microsoft.PowerShell.Management\Set-Item `
+    -LiteralPath Function:New-PrivateMarkerDummyResult `
+    -Value {
+        [pscustomobject]@{
+            ExitCode = 0
+            StandardOutputBytes = [byte[]]@()
+            StandardErrorBytes = [byte[]]@()
+        }
+    }
+Microsoft.PowerShell.Utility\Set-Alias `
+    -Name 'private-marker-process-runner\Invoke-PrivateMarkerBoundedProcess' `
+    -Value 'New-PrivateMarkerDummyResult'
+'@
+    $canonicalSealMutationCases = @(
+        [pscustomobject]@{
+            Name = 'runtime limit mutation'
+            Before = '$handleWarmupRuns = 40'
+            After = (
+                '$handleWarmupRuns = 40' +
+                "`n    " +
+                'Set-Variable -Name handleWarmupRuns -Value 0'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'runner argument control flow'
+            Before = '-FilePath $handleProbeTarget'
+            After = '-FilePath $(continue)'
+        },
+        [pscustomobject]@{
+            Name = 'provider command shadow'
+            Before = $handleProbeImportStatement
+            After = (
+                $handleProbeImportStatement +
+                "`n`n" +
+                $providerShadowMutation
+            )
+        }
+    )
+    foreach ($canonicalSealMutationCase in $canonicalSealMutationCases) {
+        $canonicalSealFixture = $windowsHandleProbeSource.Replace(
+            $canonicalSealMutationCase.Before,
+            $canonicalSealMutationCase.After
+        )
+        $canonicalSealTokens = $null
+        $canonicalSealParseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseInput(
+            $canonicalSealFixture,
+            [ref]$canonicalSealTokens,
+            [ref]$canonicalSealParseErrors
+        ) | Out-Null
+        if (
+            $canonicalSealFixture -ceq $windowsHandleProbeSource -or
+            $canonicalSealParseErrors.Count -ne 0
+        ) {
+            Add-Failure (
+                'Windows handle readiness canonical-seal fixture setup ' +
+                'failed: ' +
+                $canonicalSealMutationCase.Name
+            )
+        } elseif (
+            Test-WindowsHandleProbeContract -Source $canonicalSealFixture
+        ) {
+            Add-Failure (
+                'Windows handle readiness canonical source seal accepts: ' +
+                $canonicalSealMutationCase.Name
+            )
+        }
+    }
+
+    $handleProbeShadowFunction = @'
+function Invoke-PrivateMarkerBoundedProcess {
+    [pscustomobject]@{
+        ExitCode = 0
+        StandardOutputBytes = [byte[]]@()
+        StandardErrorBytes = [byte[]]@()
+    }
+}
+'@
+    $shadowFixtureReplacement = (
+        $handleProbeImportStatement +
+        "`n`n" +
+        $handleProbeShadowFunction
+    )
+    $shadowFunctionFixture = $windowsHandleProbeSource.Replace(
+        $handleProbeImportStatement,
+        $shadowFixtureReplacement
+    )
+    $shadowFixtureTokens = $null
+    $shadowFixtureParseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseInput(
+        $shadowFunctionFixture,
+        [ref]$shadowFixtureTokens,
+        [ref]$shadowFixtureParseErrors
+    ) | Out-Null
+    if (
+        $shadowFunctionFixture -ceq $windowsHandleProbeSource -or
+        $shadowFixtureParseErrors.Count -ne 0
+    ) {
+        Add-Failure (
+            'Windows handle readiness command-shadow fixture setup failed.'
+        )
+    } elseif (
+        Test-WindowsHandleProbeAstContract -Source $shadowFunctionFixture
+    ) {
+        Add-Failure (
+            'Windows handle readiness AST contract accepts a local runner ' +
+            'function shadow.'
+        )
+    }
+
+    # body全体を到達不能なifへ包む変異も、startup/steady-stateごとに拒否する。
+    # ASTのbody offsetから組み立てることで、runner文字列を残した実際的なbypassを
+    # validator自身へのnegative controlとして維持する。
+    $fixtureTokens = $null
+    $fixtureParseErrors = $null
+    $fixtureAst = [System.Management.Automation.Language.Parser]::ParseInput(
+        $windowsHandleProbeSource,
+        [ref]$fixtureTokens,
+        [ref]$fixtureParseErrors
+    )
+    $fixtureForStatements = @(
+        $fixtureAst.FindAll(
+            {
+                param($node)
+                $node -is [System.Management.Automation.Language.ForStatementAst]
+            },
+            $true
+        )
+    )
+    $conditionalBodyCases = @(
+        [pscustomobject]@{
+            Name = 'startup'
+            Loops = @(
+                $fixtureForStatements |
+                    Where-Object {
+                        $_.Condition.Extent.Text -match (
+                            '^\s*\$handleWarmupAttempt\s*-lt\s*' +
+                            '\$handleWarmupRuns\s*$'
+                        )
+                    }
+            )
+        },
+        [pscustomobject]@{
+            Name = 'steady-state'
+            Loops = @(
+                $fixtureForStatements |
+                    Where-Object {
+                        $_.Condition.Extent.Text -match (
+                            '^\s*\$handleAttempt\s*-lt\s*' +
+                            '\$handleMeasuredRuns\s*$'
+                        )
+                    }
+            )
+        }
+    )
+    foreach ($conditionalBodyCase in $conditionalBodyCases) {
+        if (
+            $fixtureParseErrors.Count -ne 0 -or
+            $conditionalBodyCase.Loops.Count -ne 1
+        ) {
+            Add-Failure (
+                'Windows handle readiness conditional-body fixture setup ' +
+                'failed: ' +
+                $conditionalBodyCase.Name
+            )
+            continue
+        }
+
+        $fixtureBodyExtent = $conditionalBodyCase.Loops[0].Body.Extent
+        $conditionalBodyFixture = $windowsHandleProbeSource.Insert(
+            $fixtureBodyExtent.EndOffset - 1,
+            "`n        }`n    "
+        )
+        $conditionalBodyFixture = $conditionalBodyFixture.Insert(
+            $fixtureBodyExtent.StartOffset + 1,
+            "`n        if (`$false) {"
+        )
+        $conditionalTokens = $null
+        $conditionalParseErrors = $null
+        [System.Management.Automation.Language.Parser]::ParseInput(
+            $conditionalBodyFixture,
+            [ref]$conditionalTokens,
+            [ref]$conditionalParseErrors
+        ) | Out-Null
+        if ($conditionalParseErrors.Count -ne 0) {
+            Add-Failure (
+                'Windows handle readiness conditional-body fixture parse ' +
+                'failed: ' +
+                $conditionalBodyCase.Name
+            )
+        } elseif (
+            Test-WindowsHandleProbeAstContract `
+                -Source $conditionalBodyFixture
+        ) {
+            Add-Failure (
+                'Windows handle readiness AST contract accepts a conditional ' +
+                $conditionalBodyCase.Name +
+                ' body.'
+            )
+        }
     }
 }
 
@@ -1160,7 +1808,7 @@ if (($handleFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
 }
 '@
 if (
-    Test-WindowsHandleProbeContract `
+    Test-WindowsHandleProbeAstContract `
         -Source $windowsHandleProbeNoOpFixture
 ) {
     Add-Failure 'Windows handle readiness AST contract accepts a no-op probe.'
@@ -1198,13 +1846,25 @@ if (($handleFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
 }
 '@
 if (
-    Test-WindowsHandleProbeContract `
+    Test-WindowsHandleProbeAstContract `
         -Source $windowsHandleProbeScopeEscapeFixture
 ) {
     Add-Failure (
         'Windows handle readiness AST contract accepts loop-body scope escape.'
     )
 }
+Assert-FileContains `
+    -RelativePath 'scripts/test-private-marker-handle-stability.ps1' `
+    -Pattern '(?s)Microsoft\.PowerShell\.Core\\Import-Module\s+\$processRunnerModule\s+-Force.*?\$handleProbeTarget\s*=\s*Join-Path\s*\(\s*\[Environment\]::SystemDirectory\s*\)\s*''cmd\.exe''.*?\$handleProbeEnvironment\s*=\s*New-PrivateMarkerChildEnvironment.*?Windows handle stability:' `
+    -Description 'fresh handle probe uses the reviewed runner and fixed minimal child environment'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)\$handleProbeScript\s*=\s*Join-Path.*?''test-private-marker-handle-stability\.ps1''.*?\$handleProbeArguments\s*=\s*Get-PowerShellArguments.*?\$handleProbeHostResult\s*=\s*Invoke-BoundedProcess.*?-FilePath\s+\$powerShellPath.*?-TimeoutMilliseconds\s+120000.*?\$handleEvidenceMatch' `
+    -Description 'bounded same-host Windows handle probe isolation'
+Assert-FileContains `
+    -RelativePath 'scripts/test-private-marker-handle-stability.ps1' `
+    -Pattern '(?s)catch\s*\{.*?\^windows-handle-probe-\[a-z-\]\+.*?windows-handle-probe-unexpected-error.*?Windows handle stability probe failed:' `
+    -Description 'fixed redacted Windows handle probe failure diagnostics'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
     -Pattern '(?s)/proc/\$PID/fd.*?\$fdAttempt\s*=\s*0.*?\$fdAttempt\s*-lt\s*40' `
@@ -1418,6 +2078,7 @@ foreach ($powerShellScript in @(
     'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
     'scripts/scan-private-markers-v2.ps1',
+    'scripts/test-private-marker-handle-stability.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
 )) {

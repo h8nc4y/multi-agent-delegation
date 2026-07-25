@@ -5326,112 +5326,62 @@ exit 0
     }
 
     if ($isWindowsPlatform) {
-        # GCへpipe/FileStream/Task handle回収を委ねる実装は成功ごとにhandleが
-        # 単調増加する。Windows PowerShell 5.1では最初の継続負荷だけhandleが
-        # 増えることがあるため、startupとsteady-stateを別windowで測る。
-        # aggregate HandleCountだけでruntime threadとrunner漏れを断定しない。
-        # startupにも上限を設け、継続的なrunner所有handle漏れは最初の40回から
-        # 検出する。次の40回は従来のより厳しい閾値を維持する。
-        $handleProbeTarget = Join-Path (
-            [Environment]::SystemDirectory
-        ) 'cmd.exe'
-        $handleProbeArguments = @('/d', '/c', 'exit', '0')
-        $handleWarmupRuns = 40
-        $handleMeasuredRuns = 40
-        $handleStartupGrowthLimit = 16
-        $handleMeasuredFinalGrowthLimit = 4
-        $handleMeasuredPeakGrowthLimit = 8
-        $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
-        try {
-            $handleProbeProcess.Refresh()
-            $handleStartupBaseline = $handleProbeProcess.HandleCount
-            $handleWarmupFinal = $handleStartupBaseline
-            $handleWarmupMaximum = $handleStartupBaseline
-            for ($handleWarmupAttempt = 0; $handleWarmupAttempt -lt $handleWarmupRuns; $handleWarmupAttempt++) {
-                $handleWarmupResult = Invoke-PrivateMarkerBoundedProcess `
-                    -FilePath $handleProbeTarget `
-                    -Arguments $handleProbeArguments `
-                    -WorkingDirectory $root `
-                    -EnvironmentVariables (New-RunnerTestEnvironment) `
-                    -TimeoutMilliseconds 10000
-                if (
-                    $handleWarmupResult.ExitCode -ne 0 -or
-                    $handleWarmupResult.StandardOutputBytes.Length -ne 0 -or
-                    $handleWarmupResult.StandardErrorBytes.Length -ne 0
-                ) {
-                    Add-Failure 'Expected every Windows handle-stability warm-up child to exit cleanly.'
-                    break
-                }
-                $handleProbeProcess.Refresh()
-                $handleWarmupFinal = $handleProbeProcess.HandleCount
-                $handleWarmupMaximum = [Math]::Max(
-                    $handleWarmupMaximum,
-                    $handleWarmupFinal
-                )
-            }
-            if (
-                ($handleWarmupFinal - $handleStartupBaseline) -gt
-                    $handleStartupGrowthLimit -or
-                ($handleWarmupMaximum - $handleStartupBaseline) -gt
-                    $handleStartupGrowthLimit
-            ) {
-                Add-Failure (
-                    "Expected $handleWarmupRuns Windows startup runs without GC to keep process " +
-                    "handles bounded (baseline=$handleStartupBaseline, " +
-                    "final=$handleWarmupFinal, max=$handleWarmupMaximum, " +
-                    "limit=$handleStartupGrowthLimit)."
-                )
-            }
-
-            $handleBaseline = $handleWarmupFinal
-            $handleMaximum = $handleBaseline
-            $handleFinal = $handleBaseline
-            for ($handleAttempt = 0; $handleAttempt -lt $handleMeasuredRuns; $handleAttempt++) {
-                $handleProbeResult = Invoke-PrivateMarkerBoundedProcess `
-                    -FilePath $handleProbeTarget `
-                    -Arguments $handleProbeArguments `
-                    -WorkingDirectory $root `
-                    -EnvironmentVariables (New-RunnerTestEnvironment) `
-                    -TimeoutMilliseconds 10000
-                if (
-                    $handleProbeResult.ExitCode -ne 0 -or
-                    $handleProbeResult.StandardOutputBytes.Length -ne 0 -or
-                    $handleProbeResult.StandardErrorBytes.Length -ne 0
-                ) {
-                    Add-Failure 'Expected every Windows handle-stability child to exit cleanly.'
-                    break
-                }
-                $handleProbeProcess.Refresh()
-                $handleFinal = $handleProbeProcess.HandleCount
-                $handleMaximum = [Math]::Max(
-                    $handleMaximum,
-                    $handleFinal
-                )
-            }
-            if (
-                ($handleFinal - $handleBaseline) -gt
-                    $handleMeasuredFinalGrowthLimit -or
-                ($handleMaximum - $handleBaseline) -gt
-                    $handleMeasuredPeakGrowthLimit
-            ) {
-                Add-Failure (
-                    "Expected $handleMeasuredRuns Windows success runs without GC to keep process " +
-                    "handles bounded (baseline=$handleBaseline, " +
-                    "final=$handleFinal, max=$handleMaximum)."
-                )
-            }
-            $windowsHandleProbeEvidence = (
-                "startup-baseline=$handleStartupBaseline, " +
-                "startup-final=$handleWarmupFinal, " +
-                "startup-max=$handleWarmupMaximum, " +
-                "startup-limit=$handleStartupGrowthLimit, " +
-                "warmup=$handleWarmupRuns, baseline=$handleBaseline, " +
-                "final=$handleFinal, max=$handleMaximum, " +
-                "runs=$handleMeasuredRuns, gc=not-invoked"
+        # 先行fixtureの遅延Task／host handleを測定対象へ混在させないよう、
+        # 同じPowerShell executableのfresh専用hostで、handle probe専用scriptだけを
+        # 実行する。child出力は固定ASCII evidence 1行に限定する。
+        $handleProbeScript = Join-Path `
+            $scriptRoot `
+            'test-private-marker-handle-stability.ps1'
+        $handleProbeArguments = Get-PowerShellArguments -AdditionalArguments @(
+            '-File', $handleProbeScript,
+            '-Path', $root
+        )
+        $handleProbeHostResult = Invoke-BoundedProcess `
+            -FilePath $powerShellPath `
+            -Arguments $handleProbeArguments `
+            -WorkingDirectory $root `
+            -EnvironmentOverrides @{} `
+            -TimeoutMilliseconds 120000 `
+            -MaxStandardOutputBytes 4096 `
+            -MaxStandardErrorBytes 4096
+        $handleEvidenceMatch = [regex]::Match(
+            $handleProbeHostResult.StandardOutput.Trim(),
+            (
+                '^Windows handle stability: ' +
+                '(?<Evidence>startup-baseline=[0-9]+, ' +
+                'startup-final=[0-9]+, startup-max=[0-9]+, ' +
+                'startup-limit=16, warmup=40, baseline=[0-9]+, ' +
+                'final=[0-9]+, max=[0-9]+, runs=40, ' +
+                'gc=not-invoked)$'
+            ),
+            [System.Text.RegularExpressions.RegexOptions]::CultureInvariant,
+            [TimeSpan]::FromMilliseconds(250)
+        )
+        if (
+            $handleProbeHostResult.ExitCode -ne 0 -or
+            -not [string]::IsNullOrEmpty(
+                $handleProbeHostResult.StandardError
+            ) -or
+            -not $handleEvidenceMatch.Success
+        ) {
+            $handleProbeDiagnostic = (
+                $handleProbeHostResult.StandardOutput.Trim()
             )
-        }
-        finally {
-            $handleProbeProcess.Dispose()
+            if (
+                $handleProbeDiagnostic -notmatch
+                    '^Windows handle stability probe failed: [a-z0-9 =-]+$'
+            ) {
+                $handleProbeDiagnostic = 'unexpected-output'
+            }
+            Add-Failure (
+                'Dedicated Windows handle stability probe failed ' +
+                "(exit=$($handleProbeHostResult.ExitCode), " +
+                "diagnostic=$handleProbeDiagnostic)."
+            )
+        } else {
+            $windowsHandleProbeEvidence = (
+                $handleEvidenceMatch.Groups['Evidence'].Value
+            )
         }
     } elseif (Test-Path -LiteralPath "/proc/$PID/fd" -PathType Container) {
         # POSIX success pathもProcess.Disposeだけへ依存せず、pumpのpipe/Task/

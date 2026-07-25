@@ -84,12 +84,18 @@ The format loosely follows Keep a Changelog conventions.
   exceptions, and Git isolation create/remove failures now emit one fixed
   redacted stdout line with empty stderr and exit code 2.
 - Explicitly dispose Windows and POSIX success-path pump Tasks, pipe streams,
-  and buffers instead of relying on GC. The Windows regression now
-  bounds aggregate handle growth across a 40-invocation startup window before
-  applying tighter final and peak limits to a separate 40-run steady-state
-  window. Both run without forced GC, so startup-only runtime growth is not
-  misreported as a per-call leak or absorbed without a limit; the POSIX 40-run
-  no-GC file-descriptor regression remains unchanged.
+  and buffers instead of relying on GC. The Windows regression now runs in a
+  dedicated script in a fresh instance of the same PowerShell executable,
+  after the main self-test has proved raw transport. It bounds aggregate handle
+  growth across a 40-invocation startup window before applying tighter final
+  and peak limits to a separate 40-run steady-state window. Both run without
+  forced GC, so earlier self-test cleanup is excluded and startup-only growth
+  is not absorbed without a limit; the POSIX 40-run no-GC file-descriptor
+  regression remains unchanged.
+- Seal the dedicated Windows handle probe's canonical UTF-8 source with
+  SHA-256, while retaining a separate AST contract and parse-valid negative
+  fixtures for zero-run loops, runtime limit mutation, control-flow arguments,
+  provider command shadowing, and conditional loop bodies.
   Exported runner numeric
   arguments, including fractional and overflow inputs, are body-validated into
   a fixed `process-limit-invalid` exception instead of coercion or
