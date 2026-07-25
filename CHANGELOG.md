@@ -84,8 +84,12 @@ The format loosely follows Keep a Changelog conventions.
   exceptions, and Git isolation create/remove failures now emit one fixed
   redacted stdout line with empty stderr and exit code 2.
 - Explicitly dispose Windows and POSIX success-path pump Tasks, pipe streams,
-  and buffers instead of relying on GC; 40-run no-GC handle-count and
-  file-descriptor regressions guard the boundary. Exported runner numeric
+  and buffers instead of relying on GC. The Windows regression now
+  preconditions the Windows PowerShell 5.1 ThreadPool for 40 invocations before
+  measuring a separate 40-run no-GC handle-count window, avoiding runtime
+  hill-climbing false positives without widening the owned-handle threshold;
+  the POSIX 40-run no-GC file-descriptor regression remains unchanged.
+  Exported runner numeric
   arguments, including fractional and overflow inputs, are body-validated into
   a fixed `process-limit-invalid` exception instead of coercion or
   parameter-binding errors. Invalid public scanner deadlines retain the

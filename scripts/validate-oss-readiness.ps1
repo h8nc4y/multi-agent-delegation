@@ -995,8 +995,8 @@ Assert-FileContains `
     -Description 'raw integer validation for exported runner numeric arguments'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
-    -Pattern '(?s)\$handleAttempt\s*=\s*0.*?\$handleAttempt\s*-lt\s*40.*?HandleCount' `
-    -Description 'forty-run Windows handle stability regression without GC'
+    -Pattern '(?s)\$handleWarmupRuns\s*=\s*40.*?\$handleMeasuredRuns\s*=\s*40.*?\$handleWarmupAttempt\s*=\s*0.*?\$handleWarmupAttempt\s*-lt\s*\$handleWarmupRuns.*?HandleCount.*?\$handleAttempt\s*=\s*0.*?\$handleAttempt\s*-lt\s*\$handleMeasuredRuns.*?\(\$handleFinal\s*-\s*\$handleBaseline\)\s*-gt\s*4.*?\(\$handleMaximum\s*-\s*\$handleBaseline\)\s*-gt\s*8' `
+    -Description 'preconditioned forty-run Windows handle stability regression without GC'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
     -Pattern '(?s)/proc/\$PID/fd.*?\$fdAttempt\s*=\s*0.*?\$fdAttempt\s*-lt\s*40' `

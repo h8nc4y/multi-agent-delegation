@@ -5327,25 +5327,40 @@ exit 0
 
     if ($isWindowsPlatform) {
         # GCへpipe/FileStream/Task handle回収を委ねる実装は成功ごとにhandleが
-        # 単調増加する。warm-up後はGCを呼ばず40回成功させ、boundedな揺れだけ
-        # を許可して明示Dispose契約を実測する。
+        # 単調増加する。.NET FrameworkのThreadPoolは同期anonymous-pipe読取を
+        # 最初の継続負荷で段階的に増員するため、1回だけのwarm-upではruntimeが
+        # 所有するworker-thread handleをproduction runnerの漏れと誤認し得る。
+        # 測定と同じ40回でThreadPoolを事前調整した後、別の40回をGCなしで測り、
+        # runner所有handleが反復ごとに増える回帰は従来の閾値で検出し続ける。
         $handleProbeTarget = Join-Path (
             [Environment]::SystemDirectory
         ) 'cmd.exe'
         $handleProbeArguments = @('/d', '/c', 'exit', '0')
-        [void](Invoke-PrivateMarkerBoundedProcess `
-            -FilePath $handleProbeTarget `
-            -Arguments $handleProbeArguments `
-            -WorkingDirectory $root `
-            -EnvironmentVariables (New-RunnerTestEnvironment) `
-            -TimeoutMilliseconds 10000)
+        $handleWarmupRuns = 40
+        $handleMeasuredRuns = 40
+        for ($handleWarmupAttempt = 0; $handleWarmupAttempt -lt $handleWarmupRuns; $handleWarmupAttempt++) {
+            $handleWarmupResult = Invoke-PrivateMarkerBoundedProcess `
+                -FilePath $handleProbeTarget `
+                -Arguments $handleProbeArguments `
+                -WorkingDirectory $root `
+                -EnvironmentVariables (New-RunnerTestEnvironment) `
+                -TimeoutMilliseconds 10000
+            if (
+                $handleWarmupResult.ExitCode -ne 0 -or
+                $handleWarmupResult.StandardOutputBytes.Length -ne 0 -or
+                $handleWarmupResult.StandardErrorBytes.Length -ne 0
+            ) {
+                Add-Failure 'Expected every Windows handle-stability warm-up child to exit cleanly.'
+                break
+            }
+        }
         $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
         try {
             $handleProbeProcess.Refresh()
             $handleBaseline = $handleProbeProcess.HandleCount
             $handleMaximum = $handleBaseline
             $handleFinal = $handleBaseline
-            for ($handleAttempt = 0; $handleAttempt -lt 40; $handleAttempt++) {
+            for ($handleAttempt = 0; $handleAttempt -lt $handleMeasuredRuns; $handleAttempt++) {
                 $handleProbeResult = Invoke-PrivateMarkerBoundedProcess `
                     -FilePath $handleProbeTarget `
                     -Arguments $handleProbeArguments `
@@ -5372,14 +5387,15 @@ exit 0
                 ($handleMaximum - $handleBaseline) -gt 8
             ) {
                 Add-Failure (
-                    'Expected 40 Windows success runs without GC to keep process ' +
+                    "Expected $handleMeasuredRuns Windows success runs without GC to keep process " +
                     "handles bounded (baseline=$handleBaseline, " +
                     "final=$handleFinal, max=$handleMaximum)."
                 )
             }
             $windowsHandleProbeEvidence = (
                 "baseline=$handleBaseline, final=$handleFinal, " +
-                "max=$handleMaximum, runs=40, gc=not-invoked"
+                "max=$handleMaximum, warmup=$handleWarmupRuns, " +
+                "runs=$handleMeasuredRuns, gc=not-invoked"
             )
         }
         finally {
