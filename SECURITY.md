@@ -80,12 +80,15 @@ Git and file-reader children start from a fixed minimal environment rather than
 inheriting the scanner process. Windows receives only an OS-derived
 `SystemRoot`; POSIX receives no ambient values. Git adds explicit `GIT_*`,
 `GCM_INTERACTIVE=Never`, and locale controls, while the reader adds fixed
-PowerShell telemetry/update opt-outs and one input path. `PATH`, temp,
-home/profile, loader/profiler, credential/token, and SSH-agent variables are not
-inherited. Git machine/global/system config, hooks, attributes, excludes,
-templates, prompts, and trace output remain isolated. Git resolution fixes the
-first native-application PATH candidate and requires a rooted regular
-non-reparse file; ordinary Windows hard links are allowed, while aliases,
+PowerShell module-search/cache null-device controls, telemetry/update opt-outs,
+and one input path. `PATH`, temp, home/profile, loader/profiler,
+credential/token, and SSH-agent variables are not inherited. PowerShell 7
+prepends default module paths during startup, so the reader reasserts the
+null-device module path before its first unqualified command. Git machine,
+global, and system config, hooks, attributes, excludes, templates, prompts, and
+trace output remain isolated. Git resolution fixes the first native-application
+PATH candidate and requires a rooted regular non-reparse file; ordinary Windows
+hard links are allowed, while aliases,
 functions, scripts, symbolic links, and reparse targets fail closed. Windows
 assigns a suspended process to a kill-on-close Job Object before resuming it;
 Linux uses

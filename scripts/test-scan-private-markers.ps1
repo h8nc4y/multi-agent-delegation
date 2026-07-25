@@ -4939,9 +4939,35 @@ try {
         $rawTransportScript,
         @'
 $inputStream = [Console]::OpenStandardInput()
+$powerShellNullDevice = if (
+    [Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+) {
+    'NUL'
+} else {
+    '/dev/null'
+}
+[Environment]::SetEnvironmentVariable(
+    'PSModulePath',
+    $powerShellNullDevice,
+    [System.EnvironmentVariableTarget]::Process
+)
+if (
+    [Environment]::GetEnvironmentVariable('PSModulePath') -cne
+        $powerShellNullDevice -or
+    [Environment]::GetEnvironmentVariable('PSModuleAnalysisCachePath') -cne
+        $powerShellNullDevice -or
+    [Environment]::GetEnvironmentVariable(
+        'PSDisableModuleAnalysisCacheCleanup'
+    ) -cne '1' -or
+    [Environment]::GetEnvironmentVariable('POWERSHELL_TELEMETRY_OPTOUT') -cne
+        '1' -or
+    [Environment]::GetEnvironmentVariable('POWERSHELL_UPDATECHECK') -cne 'Off'
+) {
+    throw 'powershell-runtime-environment-invalid'
+}
 $outputStream = [Console]::OpenStandardOutput()
 $errorStream = [Console]::OpenStandardError()
-$readBuffer = New-Object byte[] 3
+$readBuffer = [byte[]]::new(3)
 while (($count = $inputStream.Read($readBuffer, 0, $readBuffer.Length)) -gt 0) {
     $outputStream.Write($readBuffer, 0, $count)
     $outputStream.Flush()
@@ -4959,6 +4985,15 @@ exit 37
         0x00, 0x80, 0xFF, 0x01, 0x0A, 0x0D,
         0x7F, 0xFE, 0x02, 0x81, 0xFD, 0x03
     )
+    # production readerと同じく、PowerShellがCurrentUser / AllUsers module
+    # pathやLOCALAPPDATA cacheを再構築しない固定null-device環境で起動する。
+    $rawTransportEnvironment = New-PrivateMarkerChildEnvironment
+    $powerShellNullDevice = if ($isWindowsPlatform) { 'NUL' } else { '/dev/null' }
+    $rawTransportEnvironment['PSModulePath'] = $powerShellNullDevice
+    $rawTransportEnvironment['PSModuleAnalysisCachePath'] = $powerShellNullDevice
+    $rawTransportEnvironment['PSDisableModuleAnalysisCacheCleanup'] = '1'
+    $rawTransportEnvironment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+    $rawTransportEnvironment['POWERSHELL_UPDATECHECK'] = 'Off'
     $rawTransportResult = Invoke-PrivateMarkerBoundedProcess `
         -FilePath $powerShellPath `
         -Arguments (
@@ -4967,7 +5002,7 @@ exit 37
             )
         ) `
         -WorkingDirectory $root `
-        -EnvironmentVariables (New-RunnerTestEnvironment) `
+        -EnvironmentVariables $rawTransportEnvironment `
         -StandardInput $rawTransportInput `
         -TimeoutMilliseconds 10000 `
         -MaxStandardOutputBytes 64KB `

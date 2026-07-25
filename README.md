@@ -294,12 +294,14 @@ scanner process. Windows receives only an OS-derived `SystemRoot`; POSIX
 receives no ambient values. Git then receives only explicit non-interactive,
 read-only `GIT_*` settings, `GCM_INTERACTIVE=Never`, locale `C`, and empty
 global/system config, hooks, attributes, excludes, and template paths. The file
-reader receives only fixed PowerShell telemetry/update opt-outs and the
-selected input path. `PATH`, temp, home/profile, loader/profiler, cloud
-credential, token, and SSH-agent variables are not inherited. This prevents
-external helpers and repository, index, object, config, execution, prompt, or
-trace overrides from changing the tracked scan or writing outside its
-temporary isolation directory.
+reader receives only fixed PowerShell module-search/cache null-device controls,
+telemetry/update opt-outs, and the selected input path. `PATH`, temp,
+home/profile, loader/profiler, cloud credential, token, and SSH-agent variables
+are not inherited. Because PowerShell 7 prepends default module paths during
+startup, the reader reasserts the null-device module path before its first
+unqualified command. This prevents external helpers and repository, index,
+object, config, execution, prompt, or trace overrides from changing the tracked
+scan or writing outside its temporary isolation directory.
 The scanner resolves `git` only as a native application, fixes the first PATH
 candidate, and requires a rooted regular non-reparse file. A normal Windows
 hard link remains a regular file; aliases, functions, scripts, symbolic links,

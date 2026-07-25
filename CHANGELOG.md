@@ -11,9 +11,11 @@ The format loosely follows Keep a Changelog conventions.
 - Replaced ambient child-environment cloning with an exact minimal boundary:
   OS-derived `SystemRoot` on Windows and no ambient values on POSIX. Git adds
   only fixed `GIT_*`, `GCM_INTERACTIVE=Never`, and locale `C` controls; the
-  file reader adds only fixed PowerShell telemetry/update opt-outs and its
-  selected input path. Runtime convenience, loader/profiler, credential/token,
-  and SSH-agent variables are not inherited.
+  file reader adds only fixed PowerShell module-search/cache null-device
+  controls, telemetry/update opt-outs, and its selected input path. The reader
+  reasserts the effective module path before its first unqualified command.
+  Runtime convenience, loader/profiler, credential/token, and SSH-agent
+  variables are not inherited.
 - Hardened git-tracked private-marker enumeration against repository, worktree,
   index, object, config, execution, prompt, and trace overrides by running each
   Git command in that hermetic child environment.

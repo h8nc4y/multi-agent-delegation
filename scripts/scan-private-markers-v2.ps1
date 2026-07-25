@@ -758,6 +758,31 @@ function Invoke-BoundedTextFileRead {
     $beforeWriteTicks = $Item.LastWriteTimeUtc.Ticks
     $readerCommand = @'
 $ErrorActionPreference = 'Stop'
+$powerShellNullDevice = if (
+    [Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
+) {
+    'NUL'
+} else {
+    '/dev/null'
+}
+# PowerShell 7 は起動時に既定 module paths を前置するため、未修飾commandを
+# 一度も解決する前にprocess実効値を固定し直す。
+[Environment]::SetEnvironmentVariable(
+    'PSModulePath',
+    $powerShellNullDevice,
+    [System.EnvironmentVariableTarget]::Process
+)
+if (
+    [Environment]::GetEnvironmentVariable('PSModulePath') -cne
+        $powerShellNullDevice -or
+    [Environment]::GetEnvironmentVariable('PSModuleAnalysisCachePath') -cne
+        $powerShellNullDevice -or
+    [Environment]::GetEnvironmentVariable(
+        'PSDisableModuleAnalysisCacheCleanup'
+    ) -cne '1'
+) {
+    throw 'powershell-runtime-environment-invalid'
+}
 $source = [System.IO.File]::Open(
     $env:MULTI_AGENT_DELEGATION_SCAN_INPUT,
     [System.IO.FileMode]::Open,
@@ -766,7 +791,8 @@ $source = [System.IO.File]::Open(
 )
 try {
     $destination = [Console]::OpenStandardOutput()
-    $buffer = New-Object byte[] 8192
+    # module command discoveryを起動せず、最小環境のままraw byte bufferを作る。
+    $buffer = [byte[]]::new(8192)
     while (($count = $source.Read($buffer, 0, $buffer.Length)) -gt 0) {
         $destination.Write($buffer, 0, $count)
     }
@@ -782,8 +808,15 @@ finally {
     }
     $arguments += @('-Command', $readerCommand)
     $readerEnvironment = New-ChildEnvironment
+    # PSModulePathを未指定にするとWindows PowerShell 5.1がCurrentUser /
+    # AllUsers pathを再構築し、巨大なCI imageでは5秒上限を超え得る。null
+    # deviceをpreseedし、reader冒頭でも実効値を固定し直す。
+    $powerShellNullDevice = if ($isWindowsPlatform) { 'NUL' } else { '/dev/null' }
+    $readerEnvironment['PSModulePath'] = $powerShellNullDevice
+    $readerEnvironment['PSModuleAnalysisCachePath'] = $powerShellNullDevice
+    $readerEnvironment['PSDisableModuleAnalysisCacheCleanup'] = '1'
     # reader childはprofile/update/telemetryを起動せず、scannerが選んだ単一
-    # input pathだけを受け取る。dotnet CLIや親のPSModulePath等は不要。
+    # input pathだけを受け取る。ambient runtime/credential値は継承しない。
     $readerEnvironment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
     $readerEnvironment['POWERSHELL_UPDATECHECK'] = 'Off'
     $readerEnvironment['MULTI_AGENT_DELEGATION_SCAN_INPUT'] = $Item.FullName
