@@ -522,24 +522,43 @@ function Find-NearestGitControlEntry {
 }
 
 function New-ChildEnvironment {
-    $comparer = if ($isWindowsPlatform) {
-        [System.StringComparer]::OrdinalIgnoreCase
-    } else {
-        [System.StringComparer]::Ordinal
-    }
-    $environment = [System.Collections.Generic.Dictionary[string,string]]::new(
-        $comparer
+    # runner moduleが構築する固定allowlistだけを共通基底にする。Git / reader
+    # 固有値は各呼び出し直前に明示し、ambient stateを暗黙に再導入しない。
+    return New-PrivateMarkerChildEnvironment
+}
+
+function Get-NativeGitApplicationPath {
+    # PowerShell script/function/alias解決をnative process境界へ渡さない。
+    # PATH解決順の先頭ApplicationInfoだけを固定する。複数Gitの共存は通常状態
+    # だが、先頭が不適格なら後順位へfallbackせずfail closedにする。
+    $commands = @(
+        Get-Command `
+            git `
+            -CommandType Application `
+            -ErrorAction SilentlyContinue
     )
-    foreach (
-        $entry in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()
-    ) {
-        $name = [string]$entry.Key
-        if ($name -match '^GIT_') {
-            continue
-        }
-        $environment[$name] = [string]$entry.Value
+    if ($commands.Count -eq 0) {
+        return ''
     }
-    return $environment
+    $candidate = [string]$commands[0].Path
+    if (
+        [string]::IsNullOrWhiteSpace($candidate) -or
+        -not [System.IO.Path]::IsPathRooted($candidate) -or
+        -not (Test-Path -LiteralPath $candidate -PathType Leaf)
+    ) {
+        return ''
+    }
+    $item = Get-Item -LiteralPath $candidate -Force
+    if (
+        $item -isnot [System.IO.FileInfo] -or
+        (
+            $item.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint
+        ) -ne 0
+    ) {
+        return ''
+    }
+    return $item.FullName
 }
 
 function ConvertFrom-StrictUtf8 {
@@ -763,6 +782,10 @@ finally {
     }
     $arguments += @('-Command', $readerCommand)
     $readerEnvironment = New-ChildEnvironment
+    # reader childはprofile/update/telemetryを起動せず、scannerが選んだ単一
+    # input pathだけを受け取る。dotnet CLIや親のPSModulePath等は不要。
+    $readerEnvironment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+    $readerEnvironment['POWERSHELL_UPDATECHECK'] = 'Off'
     $readerEnvironment['MULTI_AGENT_DELEGATION_SCAN_INPUT'] = $Item.FullName
     $result = Invoke-PrivateMarkerBoundedProcess `
         -FilePath (Get-CurrentPowerShellPath) `
@@ -1399,8 +1422,8 @@ try {
         ) {
             $fixedIntegrityFailure = 'git-probe'
         } else {
-            $gitCommand = Get-Command git -ErrorAction SilentlyContinue
-            if ($null -eq $gitCommand) {
+            $gitPath = Get-NativeGitApplicationPath
+            if ([string]::IsNullOrEmpty($gitPath)) {
                 $fixedIntegrityFailure = 'git-probe'
             } else {
                 $gitIsolation = New-GitIsolationRoot
@@ -1408,7 +1431,7 @@ try {
                 # ambiguous control metadata を generic finding へdowngradeしない。
                 $resolvedTop = try {
                     $topLevel = Invoke-BoundedGitProcess `
-                        -GitPath $gitCommand.Source `
+                        -GitPath $gitPath `
                         -Arguments @(
                             '-C',
                             $root,
@@ -1435,7 +1458,7 @@ try {
                     $fixedIntegrityFailure = 'git-probe'
                 } else {
                     $initialSnapshot = Get-GitSnapshot `
-                        -GitPath $gitCommand.Source `
+                        -GitPath $gitPath `
                         -IsolationRoot $gitIsolation.Root
                     $records = ConvertFrom-GitStageRecords `
                         -Bytes $initialSnapshot.Stage
@@ -1498,7 +1521,7 @@ try {
                     }
 
                     $blobBatch = Invoke-GitBlobBatch `
-                        -GitPath $gitCommand.Source `
+                        -GitPath $gitPath `
                         -IsolationRoot $gitIsolation.Root `
                         -ObjectIds @($regularTextRecords | ForEach-Object {
                             $_.ObjectId
@@ -1569,7 +1592,7 @@ try {
                     }
 
                     $finalSnapshot = Get-GitSnapshot `
-                        -GitPath $gitCommand.Source `
+                        -GitPath $gitPath `
                         -IsolationRoot $gitIsolation.Root
                     if (
                         -not (

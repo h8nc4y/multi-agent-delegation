@@ -56,6 +56,25 @@ function Assert-FileContains {
     }
 }
 
+function Assert-FileDoesNotContain {
+    param(
+        [string]$RelativePath,
+        [string]$Pattern,
+        [string]$Description
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath ($Description)"
+        return
+    }
+
+    $content = Get-Content -LiteralPath $filePath -Raw
+    if ($content -match $Pattern) {
+        Add-Failure "$RelativePath contains forbidden content: $Description"
+    }
+}
+
 function Test-StringSequenceEqual {
     param(
         [AllowEmptyCollection()]
@@ -861,6 +880,31 @@ Assert-FileContains `
     -RelativePath 'scripts/scan-private-markers-v2.ps1' `
     -Pattern '(?s)function\s+Write-FixedRuntimeFailure.*?\$stream\s*=\s*\[Console\]::OpenStandardOutput\(\)\s*#.*?Test-ScanDeadline\s*\$stream\.Write\(' `
     -Description 'deadline check immediately before runtime diagnostic write'
+# 親environmentの将来の再複製と、Git/reader固有値の混線を静的契約でも止める。
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)function\s+New-PrivateMarkerChildEnvironment.*?\[Environment\]::SystemDirectory.*?\$environment\[''SystemRoot''\]\s*=\s*\$windowsRoot\.FullName.*?return\s+\$environment' `
+    -Description 'OS-derived fixed minimal child environment'
+Assert-FileDoesNotContain `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern 'GetEnvironmentVariables' `
+    -Description 'ambient process-environment enumeration'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers-v2.ps1' `
+    -Pattern '(?s)function\s+New-ChildEnvironment\s*\{.*?return\s+New-PrivateMarkerChildEnvironment.*?function\s+ConvertFrom-StrictUtf8' `
+    -Description 'scanner child environment delegates to the fixed allowlist'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers-v2.ps1' `
+    -Pattern '(?s)\$readerEnvironment\s*=\s*New-ChildEnvironment.*?POWERSHELL_TELEMETRY_OPTOUT.*?POWERSHELL_UPDATECHECK.*?MULTI_AGENT_DELEGATION_SCAN_INPUT' `
+    -Description 'file reader receives only explicit offline and input values'
+Assert-FileContains `
+    -RelativePath 'scripts/scan-private-markers-v2.ps1' `
+    -Pattern '(?s)function\s+Get-NativeGitApplicationPath.*?Get-Command\s+`\s*git\s+`\s*-CommandType\s+Application.*?\$commands\.Count\s+-eq\s+0.*?\$commands\[0\]\.Path.*?\[System\.IO\.Path\]::IsPathRooted.*?Test-Path\s+-LiteralPath\s+\$candidate\s+-PathType\s+Leaf.*?\$item\s+-isnot\s+\[System\.IO\.FileInfo\].*?\[System\.IO\.FileAttributes\]::ReparsePoint.*?return\s+\$item\.FullName' `
+    -Description 'rooted regular native Git application resolution'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)Assert-ProductionChildEnvironmentAllowlist.*?SYNTHETIC_UNKNOWN_NON_GIT_AMBIENT.*?LD_PRELOAD.*?GITHUB_TOKEN.*?New-PrivateMarkerChildEnvironment' `
+    -Description 'ambient loader and credential child-environment regression'
 Assert-FileContains `
     -RelativePath 'scripts/private-marker-process-runner.psm1' `
     -Pattern 'if\s*\(\s*!TerminateJobObject\(' `
@@ -891,8 +935,24 @@ Assert-FileContains `
     -Description 'checked POSIX direct rewait result'
 Assert-FileContains `
     -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)CreatePosixLaunchGate\(\).*?mkdir\(root,\s*PosixOwnerOnlyDirectoryMode\).*?WaitForVerifiedPosixGroup\(.*?GetPosixProcessGroupId\(.*?processGroupId\s*==\s*readyProcessId' `
+    -Description 'owner-only POSIX gate and verified process-group leader'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)ThrowIfOperationTimedOut\(\s*operationStopwatch,\s*timeoutMilliseconds\s*\).*?CreatePosixRelease\(launchGate\.Release\)' `
+    -Description 'POSIX release occurs only after the final operation deadline check'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
+    -Pattern '(?s)TerminateUnreleasedPosixLaunch\(.*?TryReadPosixReadyPid\(.*?TerminatePosixGroup\(.*?CleanupPosixLaunchGate' `
+    -Description 'bounded late-ready termination and private gate cleanup'
+Assert-FileContains `
+    -RelativePath 'scripts/private-marker-process-runner.psm1' `
     -Pattern '(?s)posix-process-cleanup-failed.*?cleanupFailure' `
     -Description 'aggregated POSIX termination and dispose cleanup failures'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)fake-setsid-direct-delay\.sh.*?fake-setsid-fork-delay\.sh.*?PRIVATE_MARKER_TEST_GATE_CAPTURE.*?process-timeout.*?capturedGateRoot' `
+    -Description 'POSIX direct-delay and fork-delay launch-gate regressions'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
     -Pattern 'LastSyntheticFailureProcessId' `
@@ -995,11 +1055,11 @@ Assert-FileContains `
     -Description 'direct, scoped, aliased, referenced, transitive, dynamic, and nested deferred-function invocation regressions'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
-    -Pattern '(?s)shadow-target-function.*?retarget-target-alias.*?builtin-gcm-wrapper.*?module-qualified-get-command.*?function-scriptblock-member.*?invoke-command-function-ref' `
-    -Description 'target-shadow, built-in/module lookup, and function-reference regressions'
+    -Pattern '(?s)shadow-target-function.*?retarget-target-alias.*?risk-sensitive-set-item-alias.*?risk-sensitive-get-command-alias.*?risk-sensitive-new-object-alias.*?copy-item-invoke-expression-alias.*?copy-item-get-variable-alias.*?copy-item-function-provider.*?move-item-invoke-expression-alias.*?rename-item-invoke-expression-alias.*?wrapper-copy-item-alias-provider.*?import-alias-before.*?import-module-before.*?import-module-alias-before.*?module-qualified-import-before.*?new-module-before.*?using-module-before.*?wrapper-import-module-before.*?class-import-module-before.*?alias-to-import-module-before.*?remove-alias-target.*?remove-item-alias-target.*?remove-item-function-target.*?wrapper-remove-item-function-target.*?wrapper-dynamic-remove-item-function-target.*?wrapper-fixed-env-remove-item.*?dot-sourced-script-before.*?call-script-before.*?direct-script-before.*?wrapper-dynamic-script-before.*?unused-dynamic-script-wrapper.*?bound-local-scriptblock-wrapper.*?bound-local-scriptblock-provider-mutation.*?reassigned-local-scriptblock-wrapper.*?set-item-alias-target.*?set-item-function-target.*?wrapper-set-item-function-target.*?class-set-item-function-target.*?builtin-gcm-wrapper.*?module-qualified-get-command.*?function-scriptblock-member.*?invoke-command-function-ref' `
+    -Description 'target-shadow, alias import/remove, provider removal, external-script execution, built-in/module lookup, and function-reference regressions'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
-    -Pattern '(?s)invoke-command-function-ref.*?foreach-function-ref.*?class-constructor-before.*?class-method-before.*?invoke-expression-helper' `
+    -Pattern '(?s)invoke-command-function-ref.*?foreach-function-ref.*?class-constructor-before.*?class-method-before.*?invoke-expression-helper.*?invoke-expression-alias-helper' `
     -Description 'command-wrapper, type-construction, and runtime-expression regressions'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
@@ -1011,11 +1071,23 @@ Assert-FileContains `
     -Description 'direct and function-indirect variable-backed scriptblock invocation regressions'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)stored-scriptblock-get-variable-foreach.*?stored-scriptblock-gv-value-only.*?stored-scriptblock-dynamic-get-variable.*?unbound-literal-get-variable.*?runtime-created-scriptblock-get-variable.*?reassigned-runtime-scriptblock-get-variable.*?compound-assignment-get-variable.*?alias-variable-mutation-get-variable.*?member-variable-mutation-get-variable.*?stored-scriptblock-invoke-expression-get-variable.*?stored-scriptblock-iex-get-variable.*?stored-scriptblock-unresolved-call-get-variable.*?stored-scriptblock-unbound-command-get-variable.*?stored-scriptblock-wildcard-get-variable.*?stored-scriptblock-name-omitted-get-variable.*?stored-scriptblock-get-variable-wrapper.*?stored-scriptblock-get-variable-alias.*?alias-of-set-alias-get-variable.*?wrapper-set-alias-get-variable.*?stored-scriptblock-get-variable-transitive-alias.*?stored-scriptblock-get-variable-wrapper-alias.*?safe-get-variable-wrapper-alias.*?safe-get-variable-wrapper-alias-before-assignment.*?safe-get-variable-wrapper-unknown-command.*?safe-get-variable-wrapper-dynamic-call.*?safe-get-variable-alias-target.*?shadowed-get-variable-command.*?unused-get-variable-wrapper.*?safe-stored-scriptblock-get-variable.*?global-safe-assignment-get-variable.*?script-scoped-safe-assignment-get-variable.*?parameter-global-safe-assignment-get-variable.*?qualified-current-item-scriptblock-get-variable' `
+    -Description 'positive-safe, scope-qualified, unbound, generated, IEX, unresolved, wildcard, alias, wrapper, ordering, and safe Get-Variable regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
     -Pattern '(?s)set-item-alias-target.*?set-item-function-target.*?stored-scriptblock-foreach-argument.*?stored-scriptblock-where-argument.*?unknown-invoke-composite-receiver' `
     -Description 'provider shadow, command-argument scriptblock, and composite receiver regressions'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
-    -Pattern '(?s)set-content-alias-function.*?new-item-dynamic-function-provider.*?bootstrap-variable-overwrite.*?bootstrap-scope-wrapper-overwrite.*?class-as-conversion-before.*?class-static-instance-before' `
+    -Pattern '(?s)testCommandIsExactBootstrapModuleImport.*?f29521a8724ec25d8611ea77e6bf8397cb0ff40cb9bff35aaa5d2b0c7b367ae8.*?testDynamicCallTargetIsBoundLocalScriptBlock' `
+    -Description 'exact bootstrap module-import and local-scriptblock call integrity'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)testCommandIsExactBoundedFixtureCleanup.*?SHA256.*?a70c391505cfa4c9bf783623e5178839fdefa270c3bbbadd7b88f3aec267ab5e.*?testRemoveOrClearItemCanChangeCommandIdentity' `
+    -Description 'exact bounded fixture-cleanup exception integrity'
+Assert-FileContains `
+    -RelativePath 'scripts/test-scan-private-markers.ps1' `
+    -Pattern '(?s)set-content-alias-function.*?new-item-dynamic-function-provider.*?module-qualified-join-path-provider.*?bootstrap-variable-overwrite.*?bootstrap-scope-wrapper-overwrite.*?class-as-conversion-before.*?class-static-instance-before' `
     -Description 'content/item provider, bootstrap overwrite, and class conversion/static initializer regressions'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
@@ -1029,6 +1101,14 @@ Assert-FileContains `
     -RelativePath 'docs/scanner-hardening-v2.md' `
     -Pattern 'Private marker scan failed closed \(integrity: git-probe\)\.' `
     -Description 'fixed Git probe diagnostic contract'
+Assert-FileContains `
+    -RelativePath 'docs/scanner-hardening-v2.md' `
+    -Pattern '(?s)private release gate.*?getpgid\(pid\) == pid.*?late-ready.*?non-recursive gate directory' `
+    -Description 'documented POSIX verified release-gate contract'
+Assert-FileContains `
+    -RelativePath 'docs/scanner-hardening-v2.md' `
+    -Pattern '(?s)Get-Command git -CommandType Application.*?hard link.*?reparse target.*?fallback' `
+    -Description 'documented PATH-first native Git executable contract'
 Assert-FileContains `
     -RelativePath 'scripts/scan-private-markers.ps1' `
     -Pattern 'Private marker scan failed: scanner-entrypoint-failed' `

@@ -240,9 +240,27 @@ namespace MultiAgentDelegation
         private const int SigKill = 9;
         private const int Esrch = 3;
         private const int Eperm = 1;
+        private const int Eexist = 17;
+        private const uint PosixOwnerOnlyDirectoryMode = 448;
+        private const string PosixGateScript =
+            "gate_root=$1; ready=$2; release=$3; sleeper=$4; max=$5; " +
+            "shift 5; " +
+            "(umask 077 && printf '%s\\n' \"$$\" > \"$ready\") || exit 125; " +
+            "i=0; while [ \"$i\" -lt \"$max\" ]; do " +
+            "[ -d \"$gate_root\" ] || exit 125; " +
+            "if [ -f \"$release\" ]; then exec \"$@\"; fi; " +
+            "\"$sleeper\" 0.01 || exit 125; " +
+            "i=$((i + 1)); done; exit 124";
 
         private static readonly IntPtr ProcThreadAttributeHandleList =
             new IntPtr(0x00020002);
+
+        private sealed class PosixLaunchGate
+        {
+            public string Root;
+            public string Ready;
+            public string Release;
+        }
 
         // Windows の suspended-launch fault injection は self-test 専用。
         // production path では 0 のままにし、実在 target の PID を公開しない。
@@ -456,6 +474,12 @@ namespace MultiAgentDelegation
 
         [DllImport("libc", SetLastError = true)]
         private static extern int kill(int processId, int signal);
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int getpgid(int processId);
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int mkdir(string path, uint mode);
 
         // Public entry point。OS 判定はprocess環境変数ではなくruntime値だけを使う。
         public static PrivateMarkerProcessResult Run(
@@ -1185,27 +1209,61 @@ namespace MultiAgentDelegation
             string setsidPath
         )
         {
-            ProcessStartInfo startInfo = new ProcessStartInfo();
-            startInfo.FileName = setsidPath;
-            startInfo.Arguments = BuildArgumentString(
-                PrependArguments(new string[] { "--wait", "--", fileName }, arguments)
-            );
-            startInfo.WorkingDirectory = workingDirectory;
-            startInfo.UseShellExecute = false;
-            startInfo.CreateNoWindow = true;
-            startInfo.RedirectStandardInput = true;
-            startInfo.RedirectStandardOutput = true;
-            startInfo.RedirectStandardError = true;
-            ApplyProcessEnvironment(startInfo, environment);
-
             Process process = new Process();
-            process.StartInfo = startInfo;
+            PosixLaunchGate launchGate = null;
             bool started = false;
+            int processGroupId = 0;
             PrivateMarkerReadPump stdout = null;
             PrivateMarkerReadPump stderr = null;
             PrivateMarkerWritePump stdin = null;
             try
             {
+                launchGate = CreatePosixLaunchGate();
+                string shellPath = GetTrustedPosixShellPath();
+                string sleepPath = GetTrustedPosixSleepPath();
+                long requestedGatePolls =
+                    ((long)timeoutMilliseconds + killWaitMilliseconds) / 10L +
+                    200L;
+                int gatePolls = (int)Math.Min(
+                    Int32.MaxValue,
+                    Math.Max(1L, requestedGatePolls)
+                );
+
+                // setsid配下のshellはready PIDを公開した後もreleaseまでtargetを
+                // execしない。親がPGID==ready PIDを検証できない限り、利用者の
+                // programは一命令も実行されない。
+                ProcessStartInfo startInfo = new ProcessStartInfo();
+                startInfo.FileName = setsidPath;
+                startInfo.Arguments = BuildArgumentString(
+                    PrependArguments(
+                        new string[] {
+                            "--wait",
+                            "--",
+                            shellPath,
+                            "-c",
+                            PosixGateScript,
+                            "private-marker-launch-gate",
+                            launchGate.Root,
+                            launchGate.Ready,
+                            launchGate.Release,
+                            sleepPath,
+                            gatePolls.ToString(
+                                System.Globalization.CultureInfo.InvariantCulture
+                            ),
+                            fileName
+                        },
+                        arguments
+                    )
+                );
+                startInfo.WorkingDirectory = workingDirectory;
+                startInfo.UseShellExecute = false;
+                startInfo.CreateNoWindow = true;
+                startInfo.RedirectStandardInput = true;
+                startInfo.RedirectStandardOutput = true;
+                startInfo.RedirectStandardError = true;
+                ApplyProcessEnvironment(startInfo, environment);
+                process.StartInfo = startInfo;
+
                 ThrowIfOperationTimedOut(
                     operationStopwatch,
                     timeoutMilliseconds
@@ -1215,7 +1273,11 @@ namespace MultiAgentDelegation
                     throw new InvalidOperationException("posix-process-create-failed");
                 }
                 started = true;
-                int processGroupId = process.Id;
+                processGroupId = WaitForVerifiedPosixGroup(
+                    launchGate,
+                    operationStopwatch,
+                    timeoutMilliseconds
+                );
                 stdout = new PrivateMarkerReadPump(
                     process.StandardOutput.BaseStream,
                     maxStandardOutputBytes,
@@ -1233,6 +1295,14 @@ namespace MultiAgentDelegation
                 stdout.Start();
                 stderr.Start();
                 stdin.Start();
+
+                // pumpを先に起動し、release直前にもoperation deadlineを確認する。
+                // setupがbudgetを使い切った場合はgateを開けずにfinallyへ渡す。
+                ThrowIfOperationTimedOut(
+                    operationStopwatch,
+                    timeoutMilliseconds
+                );
+                CreatePosixRelease(launchGate.Release);
                 string failure = null;
 
                 while (true)
@@ -1303,20 +1373,37 @@ namespace MultiAgentDelegation
             finally
             {
                 Exception cleanupFailure = null;
-                if (started)
+                if (processGroupId > 0)
                 {
                     try
                     {
-                        if (!process.HasExited)
-                        {
-                            // finally の tree termination failure も成功へ
-                            // downgradeせず、cleanup failureとして保持する。
-                            TerminatePosixGroup(
-                                process.Id,
-                                process,
-                                killWaitMilliseconds
-                            );
-                        }
+                        // launcher exit済みでもverified groupを必ずprobeする。
+                        // setsid --waitの親だけが先に終了した競合を見逃さない。
+                        TerminatePosixGroup(
+                            processGroupId,
+                            process,
+                            killWaitMilliseconds
+                        );
+                    }
+                    catch (Exception terminationFailure)
+                    {
+                        cleanupFailure = AppendCleanupFailure(
+                            cleanupFailure,
+                            terminationFailure
+                        );
+                    }
+                }
+                else if (started)
+                {
+                    try
+                    {
+                        // release前の失敗ではtargetを実行可能にせず、direct
+                        // launcher停止後もlate readyを独立budgetで回収する。
+                        TerminateUnreleasedPosixLaunch(
+                            process,
+                            launchGate,
+                            killWaitMilliseconds
+                        );
                     }
                     catch (Exception terminationFailure)
                     {
@@ -1351,6 +1438,17 @@ namespace MultiAgentDelegation
                         disposeFailure
                     );
                 }
+                try
+                {
+                    CleanupPosixLaunchGate(launchGate);
+                }
+                catch (Exception gateCleanupFailure)
+                {
+                    cleanupFailure = AppendCleanupFailure(
+                        cleanupFailure,
+                        gateCleanupFailure
+                    );
+                }
                 if (cleanupFailure != null)
                 {
                     throw new AggregateException(
@@ -1358,6 +1456,396 @@ namespace MultiAgentDelegation
                         cleanupFailure
                     );
                 }
+            }
+        }
+
+        private static PosixLaunchGate CreatePosixLaunchGate()
+        {
+            // ambient TMPDIRは攻撃者が差し替え得るため使わない。固定/tmp配下に
+            // owner-only directoryをmkdir(2)で原子的に確保する。
+            for (int attempt = 0; attempt < 32; attempt++)
+            {
+                string root =
+                    "/tmp/multi-agent-delegation-posix-gate-" +
+                    Guid.NewGuid().ToString("N");
+                if (mkdir(root, PosixOwnerOnlyDirectoryMode) == 0)
+                {
+                    return new PosixLaunchGate
+                    {
+                        Root = root,
+                        Ready = Path.Combine(root, "ready"),
+                        Release = Path.Combine(root, "release")
+                    };
+                }
+                int error = Marshal.GetLastWin32Error();
+                if (error != Eexist)
+                {
+                    throw new InvalidOperationException(
+                        "posix-launch-gate-create-failed"
+                    );
+                }
+            }
+            throw new InvalidOperationException(
+                "posix-launch-gate-name-exhausted"
+            );
+        }
+
+        private static string GetTrustedPosixShellPath()
+        {
+            const string shellPath = "/bin/sh";
+            if (!File.Exists(shellPath))
+            {
+                throw new InvalidOperationException(
+                    "trusted-posix-shell-missing"
+                );
+            }
+            return shellPath;
+        }
+
+        private static string GetTrustedPosixSleepPath()
+        {
+            string[] candidates = new string[] {
+                "/usr/bin/sleep",
+                "/bin/sleep"
+            };
+            for (int index = 0; index < candidates.Length; index++)
+            {
+                if (File.Exists(candidates[index]))
+                {
+                    return candidates[index];
+                }
+            }
+            throw new InvalidOperationException(
+                "trusted-posix-sleep-missing"
+            );
+        }
+
+        private static bool TryReadPosixReadyPid(
+            string readyPath,
+            out int readyProcessId
+        )
+        {
+            readyProcessId = 0;
+            byte[] payload;
+            try
+            {
+                payload = File.ReadAllBytes(readyPath);
+            }
+            catch (FileNotFoundException)
+            {
+                return false;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return false;
+            }
+
+            // shellのredirectとprintfの間に0-byte/partial readが見えても
+            // newline完了までは待つ。完了後の形式ずれはfail closedにする。
+            if (payload.Length == 0 || payload[payload.Length - 1] != 0x0A)
+            {
+                return false;
+            }
+            if (payload.Length < 2 || payload.Length > 32)
+            {
+                throw new InvalidOperationException(
+                    "posix-launch-gate-ready-invalid"
+                );
+            }
+            long parsed = 0;
+            for (int index = 0; index < payload.Length - 1; index++)
+            {
+                byte value = payload[index];
+                if (value < 0x30 || value > 0x39)
+                {
+                    throw new InvalidOperationException(
+                        "posix-launch-gate-ready-invalid"
+                    );
+                }
+                parsed = (parsed * 10L) + (value - 0x30);
+                if (parsed > Int32.MaxValue)
+                {
+                    throw new InvalidOperationException(
+                        "posix-launch-gate-ready-invalid"
+                    );
+                }
+            }
+            if (parsed <= 0)
+            {
+                throw new InvalidOperationException(
+                    "posix-launch-gate-ready-invalid"
+                );
+            }
+            readyProcessId = (int)parsed;
+            return true;
+        }
+
+        private static int GetPosixProcessGroupId(int processId)
+        {
+            int processGroupId = getpgid(processId);
+            if (processGroupId >= 0)
+            {
+                return processGroupId;
+            }
+            int error = Marshal.GetLastWin32Error();
+            if (error == Esrch)
+            {
+                return -1;
+            }
+            if (error == Eperm)
+            {
+                throw new InvalidOperationException(
+                    "posix-launch-gate-permission-denied"
+                );
+            }
+            throw new InvalidOperationException(
+                "posix-launch-gate-group-probe-failed"
+            );
+        }
+
+        private static int WaitForVerifiedPosixGroup(
+            PosixLaunchGate launchGate,
+            Stopwatch operationStopwatch,
+            int timeoutMilliseconds
+        )
+        {
+            while (true)
+            {
+                ThrowIfOperationTimedOut(
+                    operationStopwatch,
+                    timeoutMilliseconds
+                );
+                int readyProcessId;
+                if (
+                    TryReadPosixReadyPid(
+                        launchGate.Ready,
+                        out readyProcessId
+                    )
+                )
+                {
+                    int processGroupId = GetPosixProcessGroupId(
+                        readyProcessId
+                    );
+                    if (processGroupId == readyProcessId)
+                    {
+                        return readyProcessId;
+                    }
+                    if (processGroupId > 0)
+                    {
+                        throw new InvalidOperationException(
+                            "posix-launch-gate-group-invalid"
+                        );
+                    }
+                }
+                Thread.Sleep(5);
+            }
+        }
+
+        private static void CreatePosixRelease(string releasePath)
+        {
+            // FileMode.CreateNewによりreleaseを一度だけ作る。存在が認可bit
+            // なので、作成成功後にだけgate shellがtargetへexecできる。
+            using (
+                FileStream release = new FileStream(
+                    releasePath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    1,
+                    FileOptions.WriteThrough
+                )
+            )
+            {
+                release.WriteByte(0x31);
+                release.Flush(true);
+            }
+        }
+
+        private static void TerminateUnreleasedPosixLaunch(
+            Process process,
+            PosixLaunchGate launchGate,
+            int killWaitMilliseconds
+        )
+        {
+            Exception cleanupFailure = null;
+            Stopwatch cleanupStopwatch = Stopwatch.StartNew();
+
+            // gateはstdioを使わない。親pipeを先に閉じ、遅延launcherが
+            // inherited streamを保持してもcleanupを妨げないようにする。
+            try
+            {
+                process.StandardInput.Close();
+                process.StandardOutput.Close();
+                process.StandardError.Close();
+            }
+            catch (Exception streamFailure)
+            {
+                cleanupFailure = AppendCleanupFailure(
+                    cleanupFailure,
+                    streamFailure
+                );
+            }
+
+            try
+            {
+                if (!process.HasExited)
+                {
+                    process.Kill();
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // HasExited確認直後の自然終了はcleanup成功として扱う。
+            }
+            catch (Exception directKillFailure)
+            {
+                cleanupFailure = AppendCleanupFailure(
+                    cleanupFailure,
+                    directKillFailure
+                );
+            }
+
+            // fake/将来のsetsidがdirect launcher終了後にforkした場合でも、
+            // readyが遅れて現れる間は独立killWait内でverified groupを探す。
+            bool verifiedGroupHandled = false;
+            while (
+                cleanupStopwatch.ElapsedMilliseconds <
+                    killWaitMilliseconds
+            )
+            {
+                int readyProcessId;
+                try
+                {
+                    if (
+                        TryReadPosixReadyPid(
+                            launchGate.Ready,
+                            out readyProcessId
+                        )
+                    )
+                    {
+                        int processGroupId = GetPosixProcessGroupId(
+                            readyProcessId
+                        );
+                        if (processGroupId == readyProcessId)
+                        {
+                            int remaining = Math.Max(
+                                1,
+                                killWaitMilliseconds -
+                                    (int)cleanupStopwatch.ElapsedMilliseconds
+                            );
+                            TerminatePosixGroup(
+                                readyProcessId,
+                                process,
+                                remaining
+                            );
+                            verifiedGroupHandled = true;
+                            break;
+                        }
+                        if (processGroupId > 0)
+                        {
+                            throw new InvalidOperationException(
+                                "posix-launch-gate-group-invalid"
+                            );
+                        }
+                    }
+                }
+                catch (Exception lateGroupFailure)
+                {
+                    cleanupFailure = AppendCleanupFailure(
+                        cleanupFailure,
+                        lateGroupFailure
+                    );
+                    break;
+                }
+                Thread.Sleep(5);
+            }
+
+            if (!verifiedGroupHandled)
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        int remaining = Math.Max(
+                            1,
+                            killWaitMilliseconds -
+                                (int)cleanupStopwatch.ElapsedMilliseconds
+                        );
+                        if (!process.WaitForExit(remaining))
+                        {
+                            throw new InvalidOperationException(
+                                "posix-launch-direct-rewait-failed"
+                            );
+                        }
+                    }
+                }
+                catch (Exception directWaitFailure)
+                {
+                    cleanupFailure = AppendCleanupFailure(
+                        cleanupFailure,
+                        directWaitFailure
+                    );
+                }
+            }
+
+            if (cleanupFailure != null)
+            {
+                throw new AggregateException(
+                    "posix-unreleased-launch-cleanup-failed",
+                    cleanupFailure
+                );
+            }
+        }
+
+        private static void CleanupPosixLaunchGate(
+            PosixLaunchGate launchGate
+        )
+        {
+            if (launchGate == null)
+            {
+                return;
+            }
+            Exception cleanupFailure = null;
+            try
+            {
+                File.Delete(launchGate.Release);
+            }
+            catch (Exception releaseFailure)
+            {
+                cleanupFailure = AppendCleanupFailure(
+                    cleanupFailure,
+                    releaseFailure
+                );
+            }
+            try
+            {
+                File.Delete(launchGate.Ready);
+            }
+            catch (Exception readyFailure)
+            {
+                cleanupFailure = AppendCleanupFailure(
+                    cleanupFailure,
+                    readyFailure
+                );
+            }
+            try
+            {
+                // recursive deleteは使わず、既知2file以外があればfail closed。
+                Directory.Delete(launchGate.Root, false);
+            }
+            catch (Exception rootFailure)
+            {
+                cleanupFailure = AppendCleanupFailure(
+                    cleanupFailure,
+                    rootFailure
+                );
+            }
+            if (cleanupFailure != null)
+            {
+                throw new AggregateException(
+                    "posix-launch-gate-cleanup-failed",
+                    cleanupFailure
+                );
             }
         }
 
@@ -1867,6 +2355,43 @@ function ConvertTo-PrivateMarkerBoundedInteger {
     return [int]$wideValue
 }
 
+function New-PrivateMarkerChildEnvironment {
+    # child processへ親のambient environmentを複製しない。Windows PowerShell
+    # 5.1の絶対パス起動に必要なSystemRootだけをOS APIから再構築し、PATH、
+    # temp、home、loader、profiler、credential系を境界の外へ落とす。
+    $isWindows = (
+        [Environment]::OSVersion.Platform -eq
+            [System.PlatformID]::Win32NT
+    )
+    $comparer = if ($isWindows) {
+        [System.StringComparer]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparer]::Ordinal
+    }
+    $environment = New-Object `
+        'System.Collections.Generic.Dictionary[string,string]' `
+        $comparer
+
+    if ($isWindows) {
+        # ambient SystemRoot自体はcallerが差し替えられるため参照しない。
+        # SystemDirectoryの親をcanonical Windows rootとして固定する。
+        $systemDirectory = [Environment]::SystemDirectory
+        if (
+            [string]::IsNullOrWhiteSpace($systemDirectory) -or
+            -not [System.IO.Path]::IsPathRooted($systemDirectory)
+        ) {
+            throw 'process-environment-initialization-failed'
+        }
+        $windowsRoot = [System.IO.Directory]::GetParent($systemDirectory)
+        if ($null -eq $windowsRoot) {
+            throw 'process-environment-initialization-failed'
+        }
+        $environment['SystemRoot'] = $windowsRoot.FullName
+    }
+
+    return $environment
+}
+
 function Invoke-PrivateMarkerBoundedProcess {
     [CmdletBinding()]
     param(
@@ -1936,5 +2461,6 @@ function Invoke-PrivateMarkerBoundedProcess {
 
 Export-ModuleMember -Function @(
     'Get-PrivateMarkerTrustedSetsidPath',
+    'New-PrivateMarkerChildEnvironment',
     'Invoke-PrivateMarkerBoundedProcess'
 )

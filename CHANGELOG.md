@@ -8,9 +8,15 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
-- Hardened git-tracked private-marker enumeration against ambient `GIT_*`
-  repository, worktree, index, object, config, execution, prompt, and trace
-  overrides by running each Git command in a sanitized child environment.
+- Replaced ambient child-environment cloning with an exact minimal boundary:
+  OS-derived `SystemRoot` on Windows and no ambient values on POSIX. Git adds
+  only fixed `GIT_*`, `GCM_INTERACTIVE=Never`, and locale `C` controls; the
+  file reader adds only fixed PowerShell telemetry/update opt-outs and its
+  selected input path. Runtime convenience, loader/profiler, credential/token,
+  and SSH-agent variables are not inherited.
+- Hardened git-tracked private-marker enumeration against repository, worktree,
+  index, object, config, execution, prompt, and trace overrides by running each
+  Git command in that hermetic child environment.
 - Changed repository scans to a bounded regular stage-0 index/current-worktree
   union, including intent-to-add and unstaged content. Unique blobs use one
   strictly framed `git cat-file --batch` process, and raw index/debug snapshots
@@ -29,21 +35,44 @@ The format loosely follows Keep a Changelog conventions.
 - Added a byte-exact child-process runner. Windows uses suspended
   `CreateProcessW`, an explicit inherited-handle list, and a kill-on-close Job
   Object before resume. Launch failures check termination, re-wait, and every
-  owned native handle close. Linux uses trusted `setsid` and checked
-  process-group termination/re-wait. Child output, final UTF-8 output, and the
-  lower-only 120-second scan-wide time are capped.
+  owned native handle close. Linux uses trusted `setsid` behind an owner-only
+  fixed-`/tmp` release gate: it verifies the ready PID is its own process-group
+  leader before permitting target `exec`, then handles direct-launcher exit,
+  late-ready races, checked group termination/re-wait, and non-recursive gate
+  cleanup. Child output, final UTF-8 output, and the lower-only 120-second
+  scan-wide time are capped.
   Git 2.43's locale-fixed disabled-lazy-fetch warning is accepted only as an
   exact byte sequence; all other batch stderr remains fail closed.
 - Fixed the raw binary fixture as the first eager production-runner call with
   an AST validator that distinguishes definitions, stored scriptblocks, and
   `ScriptBlock.Invoke*()` execution. Direct/transitive and scope-qualified
   function calls, in-source aliases, static function references, and later
-  references to direct or function-indirect variable-backed scriptblocks are
-  followed. Target-name function/alias shadowing, Alias:/Function: provider
+  references and `Get-Variable`/`gv` recovery of direct or function-indirect
+  variable-backed scriptblocks are followed through in-source aliases, early
+  direct/transitive wrappers, and aliases to those wrappers. A lookup is now
+  accepted only for a uniquely assigned top-level unqualified or `script:`
+  variable whose literal value is exactly `{ $_ }` or `{ $PSItem }` with an
+  unqualified current-item variable and whose assignment completed before the
+  eager call. Lookup-name shadows remain fail closed. Target-name
+  function/alias shadowing, Alias:/Function: provider
   mutation through item/content commands, dynamic bootstrap dot-sourcing,
   command-argument scriptblocks, composite receiver invocation, risky class
-  invocation/casts/static initialization, runtime expressions, and unresolved dynamic calls/lookups fail
-  conservatively while literal application lookups remain accepted. A native
+  invocation/casts/static initialization, runtime expressions, and unresolved
+  dynamic calls/lookups fail conservatively. Unknown/unbound targets,
+  runtime-created or reassigned scriptblocks, scope-mismatched assignments,
+  qualified current-item variables, variable mutation, deferred
+  IEX/unknown/dynamic calls, risk-sensitive command aliases, alias
+  import/remove, module import/new/`using module` outside the exact
+  module-qualified bootstrap, module-qualified commands impersonating an
+  approved filesystem helper, Alias:/Function: provider
+  copy/move/rename/remove/clear, external PowerShell script execution, unbound
+  call-operator targets, and wildcard or unnamed lookups fail while the
+  explicitly proven safe-scriptblock and literal application lookups remain
+  accepted. Early `Remove-Item` wrappers are allowed only for a fixed `Env:`
+  path or the exact SHA-256-pinned bounded fixture-cleanup function.
+  Function-local call-operator targets require a unique literal-scriptblock
+  binding, and the runner bootstrap requires the SHA-256-pinned source prefix
+  plus module-qualified sibling import. A native
   Git batch fixture now proves BOM-less byte transport and exact caller
   input-encoding preservation on Windows PowerShell 5.1 as well as PowerShell
   7.
@@ -61,6 +90,10 @@ The format loosely follows Keep a Changelog conventions.
   scanner's fixed stdout/empty-stderr/exit-2 boundary.
 - Start the monotonic child-operation deadline before environment preparation
   and process launch, while preserving a separate bounded cleanup allowance.
+- Resolve Git only through the first native-application PATH candidate and
+  require a rooted regular non-reparse file. Normal Windows hard links are
+  accepted; aliases, functions, scripts, symbolic links, and reparse targets
+  remain fail closed.
 - Reject derived classes whose direct or transitive base constructor can run
   before the first trusted production-runner call.
 - Added incremental NUL and line parsing plus explicit local-marker, line, and

@@ -23,9 +23,9 @@ if ([string]::IsNullOrWhiteSpace($Path)) {
 
 $root = (Resolve-Path -LiteralPath $Path).Path
 $scanner = Join-Path $root 'scripts/scan-private-markers.ps1'
-$processRunnerModule = Join-Path (
-    Join-Path $root 'scripts'
-) 'private-marker-process-runner.psm1'
+$processRunnerModule = Join-Path `
+    $scriptRoot `
+    'private-marker-process-runner.psm1'
 $selfTest = $MyInvocation.MyCommand.Path
 if (-not (Test-Path -LiteralPath $scanner -PathType Leaf)) {
     throw "Missing scanner script: $scanner"
@@ -33,7 +33,7 @@ if (-not (Test-Path -LiteralPath $scanner -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $processRunnerModule -PathType Leaf)) {
     throw 'Missing private marker process runner module.'
 }
-Import-Module $processRunnerModule -Force
+Microsoft.PowerShell.Core\Import-Module $processRunnerModule -Force
 
 $isWindowsPlatform = [Environment]::OSVersion.Platform -eq [System.PlatformID]::Win32NT
 $hostExecutableName = if ($PSVersionTable.PSVersion.Major -le 5) {
@@ -168,6 +168,436 @@ function Test-FirstBoundedInvocationIsRawTransport {
             ''
         )
     }
+    $normalizeVariableName = {
+        param([AllowEmptyString()][string]$Name)
+
+        if ([string]::IsNullOrEmpty($Name)) {
+            return ''
+        }
+        return [regex]::Replace(
+            $Name,
+            '^(?i:(?:global|script|local|private):)',
+            ''
+        )
+    }
+
+    # raw前のmodule loadはmodule bodyをeager実行できる。唯一のbootstrap
+    # Import-Moduleだけは、script先頭からcommand末尾までのreview済みsourceが
+    # exact一致し、module-qualified command identityを使う場合に限り許可する。
+    $testCommandIsExactBootstrapModuleImport = {
+        param([System.Management.Automation.Language.CommandAst]$Command)
+
+        if (
+            $Command.GetCommandName() -ne
+                'Microsoft.PowerShell.Core\Import-Module' -or
+            ($Command.Extent.Text -replace '\s+', ' ').Trim() -ne
+                (
+                    'Microsoft.PowerShell.Core\Import-Module ' +
+                    '$processRunnerModule -Force'
+                )
+        ) {
+            return $false
+        }
+        $commandAncestor = $Command.Parent
+        while ($null -ne $commandAncestor) {
+            if (
+                $commandAncestor -is
+                    [System.Management.Automation.Language.FunctionDefinitionAst] -or
+                $commandAncestor -is
+                    [System.Management.Automation.Language.FunctionMemberAst] -or
+                $commandAncestor -is
+                    [System.Management.Automation.Language.TypeDefinitionAst]
+            ) {
+                return $false
+            }
+            $commandAncestor = $commandAncestor.Parent
+        }
+
+        $normalizedBootstrapSource = (
+            $Source.Substring(0, $Command.Extent.EndOffset) -replace
+                "`r`n", "`n"
+        ) -replace "`r", "`n"
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bootstrapHashBytes = $sha256.ComputeHash(
+                [System.Text.Encoding]::UTF8.GetBytes(
+                    $normalizedBootstrapSource
+                )
+            )
+            $bootstrapHash = -join (
+                $bootstrapHashBytes |
+                    ForEach-Object { $_.ToString('x2') }
+            )
+        }
+        finally {
+            $sha256.Dispose()
+        }
+        return $bootstrapHash -eq
+            'f29521a8724ec25d8611ea77e6bf8397cb0ff40cb9bff35aaa5d2b0c7b367ae8'
+    }
+
+    # function内のcall operatorは、同じfunctionのtop-levelで一度だけ
+    # literal scriptblockへ束縛されたlocal変数なら、そのbodyをAST graphが
+    # 別途検査できる。parameter/global/dynamic/reassigned targetは拒否する。
+    $testDynamicCallTargetIsBoundLocalScriptBlock = {
+        param(
+            [System.Management.Automation.Language.CommandAst]$Command,
+            [System.Management.Automation.Language.FunctionDefinitionAst]
+                $FunctionDefinition
+        )
+
+        if (
+            $Command.CommandElements.Count -eq 0 -or
+            $Command.CommandElements[0] -isnot
+                [System.Management.Automation.Language.VariableExpressionAst]
+        ) {
+            return $false
+        }
+        $targetVariablePath =
+            $Command.CommandElements[0].VariablePath.UserPath
+        if (
+            [string]::IsNullOrWhiteSpace($targetVariablePath) -or
+            $targetVariablePath -match ':'
+        ) {
+            return $false
+        }
+
+        $targetAssignments = @(
+            $FunctionDefinition.FindAll(
+                {
+                    param($node)
+                    if (
+                        $node -isnot
+                            [System.Management.Automation.Language.AssignmentStatementAst] -or
+                        $node.Left -isnot
+                            [System.Management.Automation.Language.VariableExpressionAst] -or
+                        $node.Left.VariablePath.UserPath -ne $targetVariablePath
+                    ) {
+                        return $false
+                    }
+                    $assignmentAncestor = $node.Parent
+                    while (
+                        $null -ne $assignmentAncestor -and
+                        $assignmentAncestor -ne $FunctionDefinition
+                    ) {
+                        if (
+                            $assignmentAncestor -is
+                                [System.Management.Automation.Language.ScriptBlockExpressionAst] -or
+                            $assignmentAncestor -is
+                                [System.Management.Automation.Language.FunctionDefinitionAst]
+                        ) {
+                            return $false
+                        }
+                        $assignmentAncestor = $assignmentAncestor.Parent
+                    }
+                    return $assignmentAncestor -eq $FunctionDefinition
+                },
+                $true
+            )
+        )
+        if (
+            $targetAssignments.Count -ne 1 -or
+            [string]$targetAssignments[0].Operator -ne 'Equals' -or
+            $targetAssignments[0].Extent.EndOffset -ge
+                $Command.Extent.StartOffset -or
+            $targetAssignments[0].Right -isnot
+                [System.Management.Automation.Language.CommandExpressionAst] -or
+            $targetAssignments[0].Right.Expression -isnot
+                [System.Management.Automation.Language.ScriptBlockExpressionAst]
+        ) {
+            return $false
+        }
+
+        $assignedScriptBlock =
+            $targetAssignments[0].Right.Expression.ScriptBlock
+        $identityMutations = @(
+            $assignedScriptBlock.FindAll(
+                {
+                    param($node)
+                    if (
+                        $node -isnot
+                            [System.Management.Automation.Language.CommandAst]
+                    ) {
+                        return $false
+                    }
+                    $assignedCommandName = & $normalizeFunctionName (
+                        $node.GetCommandName()
+                    )
+                    return @(
+                        'Invoke-Expression',
+                        'iex',
+                        'Set-Alias',
+                        'New-Alias',
+                        'sal',
+                        'nal',
+                        'Import-Alias',
+                        'ipal',
+                        'Remove-Alias',
+                        'ral',
+                        'Import-Module',
+                        'ipmo',
+                        'New-Module',
+                        'nmo',
+                        'Set-Item',
+                        'si',
+                        'Set-Content',
+                        'sc',
+                        'New-Item',
+                        'ni',
+                        'Clear-Item',
+                        'cli',
+                        'Remove-Item',
+                        'ri',
+                        'rm',
+                        'rmdir',
+                        'del',
+                        'erase',
+                        'rd',
+                        'Copy-Item',
+                        'copy',
+                        'cp',
+                        'cpi',
+                        'Move-Item',
+                        'move',
+                        'mv',
+                        'mi',
+                        'Rename-Item',
+                        'ren',
+                        'rni'
+                    ) -contains $assignedCommandName
+                },
+                $true
+            )
+        )
+        if ($identityMutations.Count -gt 0) {
+            return $false
+        }
+
+        # Set-Variable/Variable: providerでtarget binding自体を差し替える
+        # functionは、literal assignmentだけからruntime valueを証明しない。
+        $targetMutations = @(
+            $FunctionDefinition.FindAll(
+                {
+                    param($node)
+                    if (
+                        $node -isnot
+                            [System.Management.Automation.Language.CommandAst]
+                    ) {
+                        return $false
+                    }
+                    $mutationName = & $normalizeFunctionName (
+                        $node.GetCommandName()
+                    )
+                    return @(
+                        'Set-Variable',
+                        'sv',
+                        'New-Variable',
+                        'nv',
+                        'Clear-Variable',
+                        'clv',
+                        'Remove-Variable',
+                        'rv'
+                    ) -contains $mutationName -or
+                        (
+                            @(
+                                'Set-Item',
+                                'si',
+                                'Set-Content',
+                                'sc',
+                                'New-Item',
+                                'ni',
+                                'Clear-Item',
+                                'cli',
+                                'Remove-Item',
+                                'ri',
+                                'rm',
+                                'rmdir',
+                                'del',
+                                'erase',
+                                'rd'
+                            ) -contains $mutationName -and
+                            $node.Extent.Text -match '(?i)variable:'
+                        )
+                },
+                $true
+            )
+        )
+        return $targetMutations.Count -eq 0
+    }
+
+    # self-test cleanupは、bounded temp root・GUID名・reparse拒否を含む関数
+    # 全体がreview済みbyte sequenceと一致する場合だけ例外にする。関数名や
+    # `$resolvedRoot`変数だけを模倣したsourceはこのpositive proofを通らない。
+    $testCommandIsExactBoundedFixtureCleanup = {
+        param([System.Management.Automation.Language.CommandAst]$Command)
+
+        if (
+            (& $normalizeFunctionName $Command.GetCommandName()) -ne
+                'Remove-Item' -or
+            ($Command.Extent.Text -replace '\s+', ' ').Trim() -ne
+                'Remove-Item -LiteralPath $resolvedRoot -Recurse -Force'
+        ) {
+            return $false
+        }
+        $cleanupFunction = $Command.Parent
+        while (
+            $null -ne $cleanupFunction -and
+            $cleanupFunction -isnot
+                [System.Management.Automation.Language.FunctionDefinitionAst]
+        ) {
+            $cleanupFunction = $cleanupFunction.Parent
+        }
+        if (
+            $null -eq $cleanupFunction -or
+            $cleanupFunction.Name -ne 'Remove-TestRoot'
+        ) {
+            return $false
+        }
+
+        $normalizedCleanupSource = (
+            $cleanupFunction.Extent.Text -replace "`r`n", "`n"
+        ) -replace "`r", "`n"
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $cleanupHashBytes = $sha256.ComputeHash(
+                [System.Text.Encoding]::UTF8.GetBytes(
+                    $normalizedCleanupSource
+                )
+            )
+            $cleanupHash = -join (
+                $cleanupHashBytes |
+                    ForEach-Object { $_.ToString('x2') }
+            )
+        }
+        finally {
+            $sha256.Dispose()
+        }
+        return $cleanupHash -eq
+            'a70c391505cfa4c9bf783623e5178839fdefa270c3bbbadd7b88f3aec267ab5e'
+    }
+
+    # Remove/Clear-Item wrapperは、pathがEnv: providerへ固定される場合か、
+    # 上のexact cleanup proofを満たす場合だけcommand identityへ影響しない。
+    # filesystem変数や未知providerはfunction/alias targetを指し得るため拒否する。
+    $testRemoveOrClearItemCanChangeCommandIdentity = {
+        param([System.Management.Automation.Language.CommandAst]$Command)
+
+        if (& $testCommandIsExactBoundedFixtureCleanup -Command $Command) {
+            return $false
+        }
+        $providerPaths = New-Object System.Collections.Generic.List[object]
+        $pendingPathValue = ''
+        $positionalPathIndex = 0
+        for (
+            $elementIndex = 1;
+            $elementIndex -lt $Command.CommandElements.Count;
+            $elementIndex++
+        ) {
+            $element = $Command.CommandElements[$elementIndex]
+            if (
+                $element -is
+                    [System.Management.Automation.Language.CommandParameterAst]
+            ) {
+                if (-not [string]::IsNullOrEmpty($pendingPathValue)) {
+                    return $true
+                }
+                $parameterName = $element.ParameterName
+                if (@('Path', 'LiteralPath') -contains $parameterName) {
+                    if ($null -ne $element.Argument) {
+                        $providerPaths.Add($element.Argument) | Out-Null
+                    } else {
+                        $pendingPathValue = 'path'
+                    }
+                } elseif (
+                    @(
+                        'Filter',
+                        'Include',
+                        'Exclude',
+                        'ErrorAction',
+                        'WarningAction',
+                        'InformationAction',
+                        'ProgressAction',
+                        'ErrorVariable',
+                        'WarningVariable',
+                        'InformationVariable',
+                        'OutVariable',
+                        'OutBuffer',
+                        'PipelineVariable'
+                    ) -contains $parameterName
+                ) {
+                    if ($null -eq $element.Argument) {
+                        $pendingPathValue = 'skip'
+                    }
+                } elseif (
+                    @(
+                        'Force',
+                        'Recurse',
+                        'WhatIf',
+                        'Confirm',
+                        'Verbose',
+                        'Debug'
+                    ) -notcontains $parameterName
+                ) {
+                    return $true
+                }
+                continue
+            }
+            if ($pendingPathValue -eq 'path') {
+                $providerPaths.Add($element) | Out-Null
+                $pendingPathValue = ''
+                continue
+            }
+            if ($pendingPathValue -eq 'skip') {
+                $pendingPathValue = ''
+                continue
+            }
+            if ($positionalPathIndex -ne 0) {
+                return $true
+            }
+            $providerPaths.Add($element) | Out-Null
+            $positionalPathIndex++
+        }
+        if (
+            -not [string]::IsNullOrEmpty($pendingPathValue) -or
+            $providerPaths.Count -eq 0
+        ) {
+            return $true
+        }
+
+        foreach ($providerPath in $providerPaths) {
+            if (
+                $providerPath -is
+                    [System.Management.Automation.Language.StringConstantExpressionAst]
+            ) {
+                if (
+                    [string]$providerPath.Value -match
+                        '(?i)^(?:Alias|Function):'
+                ) {
+                    return $true
+                }
+                if ([string]$providerPath.Value -match '(?i)^Env:\\') {
+                    continue
+                }
+                return $true
+            }
+            # `('Env:\' + $name)` はprovider prefixが固定され、後半の値が
+            # command namespaceへ切り替える余地がない。
+            if (
+                $providerPath.Extent.Text -match
+                    '(?i)^\s*(?:\(\s*)?[''"](?:Alias|Function):'
+            ) {
+                return $true
+            }
+            if (
+                $providerPath.Extent.Text -match
+                    '(?i)^\s*(?:\(\s*)?[''"]Env:\\'
+            ) {
+                continue
+            }
+            return $true
+        }
+        return $false
+    }
 
     $rawAssignments = @(
         $sourceAst.FindAll(
@@ -228,6 +658,27 @@ function Test-FirstBoundedInvocationIsRawTransport {
                 -Command $rawOuterCommand
         )
     ) {
+        return $false
+    }
+
+    # `using module` はcommand ASTを経由せずparse/import時にmodule bodyを
+    # 実行するため、first eager runner callより前では一律に拒否する。
+    $earlyUsingModuleStatements = @(
+        $sourceAst.FindAll(
+            {
+                param($node)
+                return (
+                    $node -is
+                        [System.Management.Automation.Language.UsingStatementAst] -and
+                    [string]$node.UsingStatementKind -eq 'Module' -and
+                    $node.Extent.StartOffset -lt
+                        $rawOuterCommand.Extent.EndOffset
+                )
+            },
+            $true
+        )
+    )
+    if ($earlyUsingModuleStatements.Count -gt 0) {
         return $false
     }
 
@@ -333,14 +784,22 @@ function Test-FirstBoundedInvocationIsRawTransport {
                     @('Ampersand', 'Dot') -contains
                         ([string]$containedCommand.InvocationOperator)
                 )
+                $isBoundLocalScriptBlockCall = (
+                    $isUnresolvedCallOperator -and
+                    (
+                        & $testDynamicCallTargetIsBoundLocalScriptBlock `
+                            -Command $containedCommand `
+                            -FunctionDefinition $functionDefinition
+                    )
+                )
                 if (
                     (
                         -not [string]::IsNullOrEmpty($containedCommandName) -and
                         $riskyFunctionNames.Contains($containedCommandName)
                     ) -or
                     (
-                        $riskyFunctionNames.Count -gt 0 -and
-                        $isUnresolvedCallOperator
+                        $isUnresolvedCallOperator -and
+                        -not $isBoundLocalScriptBlockCall
                     )
                 ) {
                     if (
@@ -428,10 +887,53 @@ function Test-FirstBoundedInvocationIsRawTransport {
                 if (
                     $riskyFunctionNames.Contains($typeCommandName) -or
                     @('Invoke-Expression', 'iex') -contains $typeCommandName -or
+                    @(
+                        'Import-Module',
+                        'ipmo',
+                        'New-Module',
+                        'nmo',
+                        'Import-Alias',
+                        'ipal',
+                        'Remove-Alias',
+                        'ral',
+                        'Set-Item',
+                        'si',
+                        'Set-Content',
+                        'sc',
+                        'New-Item',
+                        'ni',
+                        'Copy-Item',
+                        'copy',
+                        'cp',
+                        'cpi',
+                        'Move-Item',
+                        'move',
+                        'mv',
+                        'mi',
+                        'Rename-Item',
+                        'ren',
+                        'rni'
+                    ) -contains $typeCommandName -or
                     (
-                        $riskyFunctionNames.Count -gt 0 -and
-                        $typeHasDynamicCall
-                    )
+                        @(
+                            'Remove-Item',
+                            'ri',
+                            'rm',
+                            'rmdir',
+                            'del',
+                            'erase',
+                            'rd',
+                            'Clear-Item',
+                            'cli'
+                        ) -contains $typeCommandName -and
+                        (
+                            & $testRemoveOrClearItemCanChangeCommandIdentity `
+                                -Command $typeCommand
+                        )
+                    ) -or
+                    $typeCommandName -match '(?i)\.ps(?:1|m1)$' -or
+                    ([string]$typeCommand.InvocationOperator) -eq 'Dot' -or
+                    $typeHasDynamicCall
                 ) {
                     $typeIsRisky = $true
                     break
@@ -535,13 +1037,67 @@ function Test-FirstBoundedInvocationIsRawTransport {
                         @('Ampersand', 'Dot') -contains
                             ([string]$functionCommand.InvocationOperator)
                     )
+                    $functionHasSafeLocalScriptBlockCall = (
+                        $functionHasDynamicCall -and
+                        (
+                            & $testDynamicCallTargetIsBoundLocalScriptBlock `
+                                -Command $functionCommand `
+                                -FunctionDefinition $functionDefinition
+                        )
+                    )
                     if (
                         $riskyFunctionNames.Contains($functionCommandName) -or
                         @('Invoke-Expression', 'iex') -contains
                             $functionCommandName -or
+                        @(
+                            'Import-Module',
+                            'ipmo',
+                            'New-Module',
+                            'nmo',
+                            'Import-Alias',
+                            'ipal',
+                            'Remove-Alias',
+                            'ral',
+                            'Set-Item',
+                            'si',
+                            'Set-Content',
+                            'sc',
+                            'New-Item',
+                            'ni',
+                            'Copy-Item',
+                            'copy',
+                            'cp',
+                            'cpi',
+                            'Move-Item',
+                            'move',
+                            'mv',
+                            'mi',
+                            'Rename-Item',
+                            'ren',
+                            'rni'
+                        ) -contains $functionCommandName -or
                         (
-                            $riskyFunctionNames.Count -gt 0 -and
-                            $functionHasDynamicCall
+                            @(
+                                'Remove-Item',
+                                'ri',
+                                'rm',
+                                'rmdir',
+                                'del',
+                                'erase',
+                                'rd',
+                                'Clear-Item',
+                                'cli'
+                            ) -contains $functionCommandName -and
+                            (
+                                & $testRemoveOrClearItemCanChangeCommandIdentity `
+                                    -Command $functionCommand
+                            )
+                        ) -or
+                        $functionCommandName -match '(?i)\.ps(?:1|m1)$' -or
+                        ([string]$functionCommand.InvocationOperator) -eq 'Dot' -or
+                        (
+                            $functionHasDynamicCall -and
+                            -not $functionHasSafeLocalScriptBlockCall
                         )
                     ) {
                         $functionIsRisky = $true
@@ -581,9 +1137,69 @@ function Test-FirstBoundedInvocationIsRawTransport {
         $earlyCommandName = & $normalizeFunctionName (
             $earlyCommand.GetCommandName()
         )
+        if (
+            @(
+                'Import-Module',
+                'ipmo',
+                'New-Module',
+                'nmo'
+            ) -contains $earlyCommandName
+        ) {
+            if (
+                $earlyCommandName -eq 'Import-Module' -and
+                (
+                    & $testCommandIsExactBootstrapModuleImport `
+                        -Command $earlyCommand
+                )
+            ) {
+                continue
+            }
+            return $false
+        }
         # Invoke-Expressionはliteral/dynamicの別を問わずruntime codeへ変換
         # できるため、first-runner proofより前では静的安全性を証明しない。
         if (@('Invoke-Expression', 'iex') -contains $earlyCommandName) {
+            return $false
+        }
+        # alias import/removeとAlias:/Function: provider mutationはcommand
+        # identityを外部入力・削除・複製で変更できる。filesystemとの静的識別を
+        # 広げず、raw前は保守的に拒否する。
+        if (
+            @(
+                'Import-Alias',
+                'ipal',
+                'Remove-Alias',
+                'ral',
+                'Remove-Item',
+                'ri',
+                'rm',
+                'rmdir',
+                'del',
+                'erase',
+                'rd',
+                'Clear-Item',
+                'cli',
+                'Copy-Item',
+                'copy',
+                'cp',
+                'cpi',
+                'Move-Item',
+                'move',
+                'mv',
+                'mi',
+                'Rename-Item',
+                'ren',
+                'rni'
+            ) -contains $earlyCommandName
+        ) {
+            return $false
+        }
+        # dot-sourceやPowerShell script pathの直接/call-operator実行は、
+        # global alias/functionを書き換えられるため、first-call証明前は拒否する。
+        if (
+            ([string]$earlyCommand.InvocationOperator) -eq 'Dot' -or
+            $earlyCommandName -match '(?i)\.ps(?:1|m1)$'
+        ) {
             return $false
         }
         if (
@@ -662,10 +1278,66 @@ function Test-FirstBoundedInvocationIsRawTransport {
                     return $false
                 }
                 $aliasValue = & $normalizeFunctionName $aliasElement.Value
+                $riskSensitiveAliasTargets = @(
+                    'Invoke-Expression',
+                    'iex',
+                    'New-Object',
+                    'Set-Alias',
+                    'New-Alias',
+                    'sal',
+                    'nal',
+                    'Import-Module',
+                    'ipmo',
+                    'New-Module',
+                    'nmo',
+                    'Set-Item',
+                    'si',
+                    'Set-Content',
+                    'sc',
+                    'New-Item',
+                    'ni',
+                    'Clear-Item',
+                    'cli',
+                    'Remove-Item',
+                    'ri',
+                    'rm',
+                    'rmdir',
+                    'del',
+                    'erase',
+                    'rd',
+                    'Import-Alias',
+                    'ipal',
+                    'Remove-Alias',
+                    'ral',
+                    'Get-Command',
+                    'gcm',
+                    'Get-Item',
+                    'gi',
+                    'Set-Variable',
+                    'sv',
+                    'New-Variable',
+                    'nv',
+                    'Clear-Variable',
+                    'clv',
+                    'Remove-Variable',
+                    'rv',
+                    'Copy-Item',
+                    'copy',
+                    'cp',
+                    'cpi',
+                    'Move-Item',
+                    'move',
+                    'mv',
+                    'mi',
+                    'Rename-Item',
+                    'ren',
+                    'rni'
+                )
                 if (
                     $aliasValue -eq
                         'Invoke-PrivateMarkerBoundedProcess' -or
-                    $riskyFunctionNames.Contains($aliasValue)
+                    $riskyFunctionNames.Contains($aliasValue) -or
+                    $riskSensitiveAliasTargets -contains $aliasValue
                 ) {
                     return $false
                 }
@@ -816,9 +1488,9 @@ function Test-FirstBoundedInvocationIsRawTransport {
                         $setItemAssignmentRight.PipelineElements.Count -eq 1 -and
                         $setItemAssignmentRight.PipelineElements[0] -is
                             [System.Management.Automation.Language.CommandAst] -and
-                        (& $normalizeFunctionName (
+                        (
                             $setItemAssignmentRight.PipelineElements[0].GetCommandName()
-                        )) -eq 'Join-Path' -and
+                        ) -eq 'Join-Path' -and
                         $setItemAssignmentRight.Extent.Text -notmatch
                             '(?i:(?:Alias|Function):)'
                     ) {
@@ -1075,10 +1747,60 @@ function Test-FirstBoundedInvocationIsRawTransport {
         }
     }
 
-    # top-level変数へ保存した risky scriptblock は、helperを直接呼ぶ場合だけで
-    # なく、helper-bearing functionを経由する場合も同じ変数の再参照でreject
-    # する。.Invoke*()、call/dot operator、別commandへの受け渡しを個別に
-    # 列挙せず、assignment後の利用そのものをfail closedに扱う。
+    # 保存scriptblockを「既知の危険名がないから安全」とは判定しない。
+    # command/member/type invocationを含まない明示的な式だけをpositive setへ
+    # 入れ、IEX、dynamic call、ScriptBlock::Create、unknown commandを含む
+    # deferred codeはすべて保守的にriskyとして扱う。
+    $testStoredScriptBlockIsExplicitlySafe = {
+        param(
+            [System.Management.Automation.Language.ScriptBlockExpressionAst]
+                $ScriptBlockExpression
+        )
+
+        $storedScriptBlock = $ScriptBlockExpression.ScriptBlock
+        if (
+            $null -ne $storedScriptBlock.ParamBlock -or
+            $null -ne $storedScriptBlock.DynamicParamBlock -or
+            $null -ne $storedScriptBlock.BeginBlock -or
+            $null -ne $storedScriptBlock.ProcessBlock -or
+            $null -eq $storedScriptBlock.EndBlock -or
+            $storedScriptBlock.EndBlock.Statements.Count -ne 1 -or
+            (
+                $null -ne $storedScriptBlock.EndBlock.Traps -and
+                $storedScriptBlock.EndBlock.Traps.Count -ne 0
+            )
+        ) {
+            return $false
+        }
+
+        $safeStatement = $storedScriptBlock.EndBlock.Statements[0]
+        if (
+            $safeStatement -isnot
+                [System.Management.Automation.Language.PipelineAst] -or
+            $safeStatement.PipelineElements.Count -ne 1 -or
+            $safeStatement.PipelineElements[0] -isnot
+                [System.Management.Automation.Language.CommandExpressionAst]
+        ) {
+            return $false
+        }
+        $safeCommandExpression = $safeStatement.PipelineElements[0]
+        if (
+            $safeCommandExpression.Redirections.Count -ne 0 -or
+            $safeCommandExpression.Expression -isnot
+                [System.Management.Automation.Language.VariableExpressionAst]
+        ) {
+            return $false
+        }
+        # `$global:_` 等は別scopeの任意値を返せるため、qualifierなしの
+        # pipeline current-item 変数だけをpositive setへ入れる。
+        return @('_', 'PSItem') -contains (
+            $safeCommandExpression.Expression.VariablePath.UserPath
+        )
+    }
+
+    # top-level変数へ保存した非safe scriptblockは、assignment後に変数として
+    # 再参照された時点でrejectする。個別の実行構文をblacklist化せず、
+    # 上のpositive proofを満たさないdeferred codeを一律fail closedにする。
     $riskyStoredScriptBlocks = @(
         $sourceAst.FindAll(
             {
@@ -1093,41 +1815,13 @@ function Test-FirstBoundedInvocationIsRawTransport {
             $true
         ) |
             Where-Object {
-                $storedCommands = @(
-                    $_.FindAll(
-                        {
-                            param($node)
-                            return (
-                                $node -is
-                                    [System.Management.Automation.Language.CommandAst]
-                            )
-                        },
-                        $true
-                    )
+                return -not (
+                    & $testStoredScriptBlockIsExplicitlySafe $_
                 )
-                foreach ($storedCommand in $storedCommands) {
-                    $storedCommandName = & $normalizeFunctionName (
-                        $storedCommand.GetCommandName()
-                    )
-                    $isStoredUnresolvedCallOperator = (
-                        [string]::IsNullOrEmpty($storedCommandName) -and
-                        @('Ampersand', 'Dot') -contains
-                            ([string]$storedCommand.InvocationOperator)
-                    )
-                    if (
-                        $storedCommandName -eq
-                            'Invoke-PrivateMarkerBoundedProcess' -or
-                        $riskyFunctionNames.Contains($storedCommandName) -or
-                        (
-                            $riskyFunctionNames.Count -gt 0 -and
-                            $isStoredUnresolvedCallOperator
-                        )
-                    ) {
-                        return $true
-                    }
-                }
-                return $false
             }
+    )
+    $riskyStoredVariableNames = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
     )
     foreach ($scriptBlockOwner in $riskyStoredScriptBlocks) {
         $ancestor = $scriptBlockOwner.Parent
@@ -1177,6 +1871,9 @@ function Test-FirstBoundedInvocationIsRawTransport {
             return $false
         }
         $storedVariableName = $assignmentOwner.Left.VariablePath.UserPath
+        [void]$riskyStoredVariableNames.Add(
+            (& $normalizeVariableName $storedVariableName)
+        )
         $earlyStoredReferences = @(
             $sourceAst.FindAll(
                 {
@@ -1196,6 +1893,850 @@ function Test-FirstBoundedInvocationIsRawTransport {
         )
         if ($earlyStoredReferences.Count -gt 0) {
             return $false
+        }
+    }
+
+    # literal Get-Variable lookupを許可するのは、raw fixtureより前に一度だけ
+    # top-levelで直接代入された、明示safeなscriptblock名だけに限定する。
+    # runtime生成、未束縛ambient、条件分岐内代入、再代入は証明不能として除外する。
+    $preRawVariableAssignmentCounts = @{}
+    $safeAssignmentCandidates =
+        [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+    $safeAssignmentCandidateEndOffsets = @{}
+    $preRawVariableAssignments = @(
+        $sourceAst.FindAll(
+            {
+                param($node)
+                return (
+                    $node -is
+                        [System.Management.Automation.Language.AssignmentStatementAst] -and
+                    $node.Left -is
+                        [System.Management.Automation.Language.VariableExpressionAst] -and
+                    $node.Extent.EndOffset -le
+                        $rawAssignments[0].Extent.StartOffset
+                )
+            },
+            $true
+        )
+    )
+    foreach ($variableAssignment in $preRawVariableAssignments) {
+        $assignmentVariablePath =
+            $variableAssignment.Left.VariablePath.UserPath
+        # top-levelのunqualified/script scope代入だけが、direct lookupと
+        # wrapperの`-Scope Script`の双方から同じ値として観測される。
+        if (
+            $assignmentVariablePath -match ':' -and
+            $assignmentVariablePath -notmatch '^(?i:script):[^:]+$'
+        ) {
+            continue
+        }
+        $assignmentVariableName = & $normalizeVariableName (
+            $assignmentVariablePath
+        )
+        if (-not $preRawVariableAssignmentCounts.ContainsKey(
+            $assignmentVariableName
+        )) {
+            $preRawVariableAssignmentCounts[$assignmentVariableName] = 0
+        }
+        $preRawVariableAssignmentCounts[$assignmentVariableName]++
+
+        $assignmentExpression = $null
+        if (
+            $variableAssignment.Parent -is
+                [System.Management.Automation.Language.NamedBlockAst] -and
+            $variableAssignment.Right -is
+                [System.Management.Automation.Language.CommandExpressionAst]
+        ) {
+            $assignmentExpression = $variableAssignment.Right.Expression
+        }
+        if (
+            $assignmentExpression -is
+                [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+            (& $testStoredScriptBlockIsExplicitlySafe $assignmentExpression)
+        ) {
+            [void]$safeAssignmentCandidates.Add($assignmentVariableName)
+            $safeAssignmentCandidateEndOffsets[$assignmentVariableName] =
+                $variableAssignment.Extent.EndOffset
+        }
+    }
+    $safeStoredVariableNames =
+        [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+    $safeStoredAssignmentEndOffsets = @{}
+    foreach ($safeAssignmentCandidate in $safeAssignmentCandidates) {
+        if (
+            $preRawVariableAssignmentCounts[$safeAssignmentCandidate] -eq 1
+        ) {
+            [void]$safeStoredVariableNames.Add($safeAssignmentCandidate)
+            $safeStoredAssignmentEndOffsets[$safeAssignmentCandidate] =
+                $safeAssignmentCandidateEndOffsets[$safeAssignmentCandidate]
+        }
+    }
+
+    # cmdlet/aliasやVariable: provider経由のmutationが同じ値を上書きし得る
+    # sourceでは、単純代入だけからruntime値を証明できないためpositive setを
+    # 無効化する。対象名やprovider pathがdynamicでもfail openにしない。
+    $unprovenVariableMutations = @(
+        $sourceAst.FindAll(
+            {
+                param($node)
+                if (
+                    $node.Extent.StartOffset -ge
+                        $rawAssignments[0].Extent.StartOffset
+                ) {
+                    return $false
+                }
+                if (
+                    $node -is
+                        [System.Management.Automation.Language.InvokeMemberExpressionAst]
+                ) {
+                    return $true
+                }
+                if (
+                    $node -isnot
+                        [System.Management.Automation.Language.CommandAst]
+                ) {
+                    return $false
+                }
+                $mutationCommandName = & $normalizeFunctionName (
+                    $node.GetCommandName()
+                )
+                if (
+                    @(
+                        'Set-Variable',
+                        'New-Variable',
+                        'Clear-Variable',
+                        'Remove-Variable',
+                        'sv',
+                        'nv',
+                        'clv',
+                        'rv'
+                    ) -contains $mutationCommandName
+                ) {
+                    return $true
+                }
+                return (
+                    @(
+                        'Set-Item',
+                        'Set-Content',
+                        'New-Item',
+                        'Clear-Item',
+                        'Remove-Item'
+                    ) -contains $mutationCommandName -and
+                    $node.Extent.Text -match '(?i)variable:'
+                )
+            },
+            $true
+        )
+    )
+    if ($unprovenVariableMutations.Count -gt 0) {
+        $safeStoredVariableNames.Clear()
+        $safeStoredAssignmentEndOffsets.Clear()
+    }
+
+    # Get-Variable/gvはVariableExpressionAstを作らず、保存scriptblockを値として
+    # 再取得できる。target解析を1か所へ固定し、direct lookupと早期実行される
+    # wrapper functionへ同じpositive-set判定を適用する。
+    $testVariableLookupCanRecoverRiskyStoredBlock = {
+        param(
+            [System.Management.Automation.Language.CommandAst]$Command,
+            [System.Collections.Generic.HashSet[string]]$SafeNames,
+            [hashtable]$SafeAssignmentEndOffsets,
+            [int]$ExecutionOffset = -1,
+            [pscustomobject]$RequiredAssignmentEndOffset = $null
+        )
+
+        $lookupTargets = New-Object System.Collections.Generic.List[object]
+        $lookupScopeTarget = $null
+        $pendingLookupValue = ''
+        $lookupPositionalIndex = 0
+        for (
+            $elementIndex = 1;
+            $elementIndex -lt $Command.CommandElements.Count;
+            $elementIndex++
+        ) {
+            $lookupElement = $Command.CommandElements[$elementIndex]
+            if (
+                $lookupElement -is
+                    [System.Management.Automation.Language.CommandParameterAst]
+            ) {
+                $parameterName = $lookupElement.ParameterName
+                $parameterOwnsName = $parameterName -eq 'Name'
+                $parameterOwnsScope = $parameterName -eq 'Scope'
+                $parameterIsSwitch = @(
+                    'ValueOnly',
+                    'Verbose',
+                    'Debug',
+                    'WhatIf',
+                    'Confirm'
+                ) -contains $parameterName
+                $parameterConsumesValue = @(
+                    'Name',
+                    'Scope',
+                    'ErrorAction',
+                    'WarningAction',
+                    'InformationAction',
+                    'ProgressAction',
+                    'ErrorVariable',
+                    'WarningVariable',
+                    'InformationVariable',
+                    'OutVariable',
+                    'OutBuffer',
+                    'PipelineVariable'
+                ) -contains $parameterName
+                if ($null -ne $lookupElement.Argument) {
+                    if ($parameterOwnsName) {
+                        $lookupTargets.Add($lookupElement.Argument) | Out-Null
+                    } elseif ($parameterOwnsScope) {
+                        if ($null -ne $lookupScopeTarget) {
+                            return $true
+                        }
+                        $lookupScopeTarget = $lookupElement.Argument
+                    } elseif (
+                        -not $parameterIsSwitch -and
+                        -not $parameterConsumesValue
+                    ) {
+                        return $true
+                    }
+                    $pendingLookupValue = ''
+                } elseif ($parameterOwnsName) {
+                    $pendingLookupValue = 'name'
+                } elseif ($parameterOwnsScope) {
+                    $pendingLookupValue = 'scope'
+                } elseif ($parameterConsumesValue) {
+                    $pendingLookupValue = 'skip'
+                } elseif ($parameterIsSwitch) {
+                    $pendingLookupValue = ''
+                } else {
+                    return $true
+                }
+                continue
+            }
+            if ($pendingLookupValue -eq 'skip') {
+                $pendingLookupValue = ''
+                continue
+            }
+            if ($pendingLookupValue -eq 'name') {
+                $lookupTargets.Add($lookupElement) | Out-Null
+                $pendingLookupValue = ''
+                continue
+            }
+            if ($pendingLookupValue -eq 'scope') {
+                if ($null -ne $lookupScopeTarget) {
+                    return $true
+                }
+                $lookupScopeTarget = $lookupElement
+                $pendingLookupValue = ''
+                continue
+            }
+            if ($lookupPositionalIndex -ne 0) {
+                return $true
+            }
+            $lookupTargets.Add($lookupElement) | Out-Null
+            $lookupPositionalIndex++
+        }
+        if (
+            -not [string]::IsNullOrEmpty($pendingLookupValue) -or
+            $lookupTargets.Count -eq 0
+        ) {
+            return $true
+        }
+        if ($null -ne $lookupScopeTarget) {
+            if (
+                $lookupScopeTarget -isnot
+                    [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                [string]$lookupScopeTarget.Value -ne 'Script'
+            ) {
+                return $true
+            }
+        } else {
+            $lookupAncestor = $Command.Parent
+            while ($null -ne $lookupAncestor) {
+                if (
+                    $lookupAncestor -is
+                        [System.Management.Automation.Language.FunctionDefinitionAst]
+                ) {
+                    return $true
+                }
+                $lookupAncestor = $lookupAncestor.Parent
+            }
+        }
+        foreach ($lookupTarget in $lookupTargets) {
+            if (
+                $lookupTarget -isnot
+                    [System.Management.Automation.Language.StringConstantExpressionAst]
+            ) {
+                return $true
+            }
+            $lookupName = & $normalizeVariableName (
+                [string]$lookupTarget.Value
+            )
+            if (
+                [System.Management.Automation.WildcardPattern]::
+                    ContainsWildcardCharacters($lookupName) -or
+                -not $SafeNames.Contains($lookupName)
+            ) {
+                return $true
+            }
+            $safeAssignmentEndOffset = [int](
+                $SafeAssignmentEndOffsets[$lookupName]
+            )
+            if (
+                $ExecutionOffset -ge 0 -and
+                $safeAssignmentEndOffset -gt $ExecutionOffset
+            ) {
+                return $true
+            }
+            if (
+                $null -ne $RequiredAssignmentEndOffset -and
+                $safeAssignmentEndOffset -gt
+                    [int]$RequiredAssignmentEndOffset.Value
+            ) {
+                $RequiredAssignmentEndOffset.Value =
+                    $safeAssignmentEndOffset
+            }
+        }
+        return $false
+    }
+
+    if ($earlyEagerCommands.Count -gt 0) {
+        # builtin名だけでなく、raw fixtureより前にliteral定義されたaliasも
+        # fixed pointで解決する。dynamic/ambiguous alias bindingは、lookup
+        # identityを静的に証明できないためfail closedにする。
+        $variableLookupCommandNames = (
+            [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        )
+        [void]$variableLookupCommandNames.Add('Get-Variable')
+        [void]$variableLookupCommandNames.Add('gv')
+        $literalAliasBindings = New-Object System.Collections.Generic.List[object]
+        foreach ($earlyCommand in $earlyEagerCommands) {
+            $earlyCommandName = & $normalizeFunctionName (
+                $earlyCommand.GetCommandName()
+            )
+            if (
+                @('Set-Alias', 'New-Alias', 'sal', 'nal') -notcontains
+                    $earlyCommandName
+            ) {
+                continue
+            }
+
+            $aliasNameElement = $null
+            $aliasTargetElement = $null
+            $pendingAliasValue = ''
+            for (
+                $elementIndex = 1;
+                $elementIndex -lt $earlyCommand.CommandElements.Count;
+                $elementIndex++
+            ) {
+                $aliasElement = $earlyCommand.CommandElements[$elementIndex]
+                if (
+                    $aliasElement -is
+                        [System.Management.Automation.Language.CommandParameterAst]
+                ) {
+                    $parameterName = $aliasElement.ParameterName
+                    $parameterOwnsName = $parameterName -eq 'Name'
+                    $parameterOwnsTarget = $parameterName -eq 'Value'
+                    $parameterIsSwitch = @(
+                        'Force',
+                        'PassThru',
+                        'Verbose',
+                        'Debug',
+                        'WhatIf',
+                        'Confirm'
+                    ) -contains $parameterName
+                    $parameterConsumesValue = @(
+                        'Name',
+                        'Value',
+                        'Description',
+                        'Option',
+                        'Scope',
+                        'ErrorAction',
+                        'WarningAction',
+                        'InformationAction',
+                        'ProgressAction',
+                        'ErrorVariable',
+                        'WarningVariable',
+                        'InformationVariable',
+                        'OutVariable',
+                        'OutBuffer',
+                        'PipelineVariable'
+                    ) -contains $parameterName
+                    if ($null -ne $aliasElement.Argument) {
+                        if ($parameterOwnsName) {
+                            if ($null -ne $aliasNameElement) {
+                                return $false
+                            }
+                            $aliasNameElement = $aliasElement.Argument
+                        } elseif ($parameterOwnsTarget) {
+                            if ($null -ne $aliasTargetElement) {
+                                return $false
+                            }
+                            $aliasTargetElement = $aliasElement.Argument
+                        } elseif (
+                            -not $parameterIsSwitch -and
+                            -not $parameterConsumesValue
+                        ) {
+                            return $false
+                        }
+                        $pendingAliasValue = ''
+                    } elseif ($parameterOwnsName) {
+                        $pendingAliasValue = 'name'
+                    } elseif ($parameterOwnsTarget) {
+                        $pendingAliasValue = 'target'
+                    } elseif ($parameterConsumesValue) {
+                        $pendingAliasValue = 'skip'
+                    } elseif ($parameterIsSwitch) {
+                        $pendingAliasValue = ''
+                    } else {
+                        return $false
+                    }
+                    continue
+                }
+                if ($pendingAliasValue -eq 'skip') {
+                    $pendingAliasValue = ''
+                    continue
+                }
+                if ($pendingAliasValue -eq 'name') {
+                    if ($null -ne $aliasNameElement) {
+                        return $false
+                    }
+                    $aliasNameElement = $aliasElement
+                    $pendingAliasValue = ''
+                    continue
+                }
+                if ($pendingAliasValue -eq 'target') {
+                    if ($null -ne $aliasTargetElement) {
+                        return $false
+                    }
+                    $aliasTargetElement = $aliasElement
+                    $pendingAliasValue = ''
+                    continue
+                }
+                if ($null -eq $aliasNameElement) {
+                    $aliasNameElement = $aliasElement
+                } elseif ($null -eq $aliasTargetElement) {
+                    $aliasTargetElement = $aliasElement
+                } else {
+                    return $false
+                }
+            }
+            if (
+                -not [string]::IsNullOrEmpty($pendingAliasValue) -or
+                $aliasNameElement -isnot
+                    [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                $aliasTargetElement -isnot
+                    [System.Management.Automation.Language.StringConstantExpressionAst]
+            ) {
+                return $false
+            }
+            $literalAliasBindings.Add(
+                [pscustomobject]@{
+                    Name = & $normalizeFunctionName (
+                        [string]$aliasNameElement.Value
+                    )
+                    Target = & $normalizeFunctionName (
+                        [string]$aliasTargetElement.Value
+                    )
+                }
+            ) | Out-Null
+        }
+
+        # Set-Alias/New-Alias自体へのliteral aliasは、次のcommandで新しい
+        # lookup aliasを生成できる。二段目以降を推測せず、alias定義cmdletの
+        # aliasが実行された時点でfail closedにする。
+        $builtInAliasDefinitionCommandNames = (
+            [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        )
+        foreach (
+            $aliasDefinitionCommandName in @(
+                'Set-Alias',
+                'New-Alias',
+                'sal',
+                'nal'
+            )
+        ) {
+            [void]$builtInAliasDefinitionCommandNames.Add(
+                $aliasDefinitionCommandName
+            )
+        }
+        $aliasDefinitionCommandNames = (
+            [System.Collections.Generic.HashSet[string]]::new(
+                $builtInAliasDefinitionCommandNames,
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        )
+        do {
+            $aliasDefinitionGraphChanged = $false
+            foreach ($aliasBinding in $literalAliasBindings) {
+                if (
+                    $aliasDefinitionCommandNames.Contains(
+                        [string]$aliasBinding.Target
+                    ) -and
+                    $aliasDefinitionCommandNames.Add(
+                        [string]$aliasBinding.Name
+                    )
+                ) {
+                    $aliasDefinitionGraphChanged = $true
+                }
+            }
+        } while ($aliasDefinitionGraphChanged)
+        $aliasedAliasDefinitionCalls = @(
+            $earlyEagerCommands |
+                Where-Object {
+                    $aliasDefinitionCommandName = & $normalizeFunctionName (
+                        $_.GetCommandName()
+                    )
+                    return (
+                        $aliasDefinitionCommandNames.Contains(
+                            $aliasDefinitionCommandName
+                        ) -and
+                        -not $builtInAliasDefinitionCommandNames.Contains(
+                            $aliasDefinitionCommandName
+                        )
+                    )
+                }
+        )
+        if ($aliasedAliasDefinitionCalls.Count -gt 0) {
+            return $false
+        }
+
+        do {
+            $lookupAliasGraphChanged = $false
+            foreach ($aliasBinding in $literalAliasBindings) {
+                if (
+                    $variableLookupCommandNames.Contains(
+                        [string]$aliasBinding.Target
+                    ) -and
+                    $variableLookupCommandNames.Add(
+                        [string]$aliasBinding.Name
+                    )
+                ) {
+                    $lookupAliasGraphChanged = $true
+                }
+            }
+        } while ($lookupAliasGraphChanged)
+
+        # variable mutation cmdletを指すsource内aliasもfixed pointで解決する。
+        # lookup実行前に呼ばれていれば、literal assignmentの値は保証できない。
+        $variableMutationCommandNames = (
+            [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        )
+        foreach (
+            $mutationCommandName in @(
+                'Set-Variable',
+                'New-Variable',
+                'Clear-Variable',
+                'Remove-Variable',
+                'sv',
+                'nv',
+                'clv',
+                'rv',
+                'Set-Item',
+                'Set-Content',
+                'New-Item',
+                'Clear-Item',
+                'Remove-Item'
+            )
+        ) {
+            [void]$variableMutationCommandNames.Add($mutationCommandName)
+        }
+        do {
+            $mutationAliasGraphChanged = $false
+            foreach ($aliasBinding in $literalAliasBindings) {
+                if (
+                    $variableMutationCommandNames.Contains(
+                        [string]$aliasBinding.Target
+                    ) -and
+                    $variableMutationCommandNames.Add(
+                        [string]$aliasBinding.Name
+                    )
+                ) {
+                    $mutationAliasGraphChanged = $true
+                }
+            }
+        } while ($mutationAliasGraphChanged)
+        $resolvedVariableMutationCalls = @(
+            $earlyEagerCommands |
+                Where-Object {
+                    $variableMutationCommandNames.Contains(
+                        (& $normalizeFunctionName $_.GetCommandName())
+                    )
+                }
+        )
+        if ($resolvedVariableMutationCalls.Count -gt 0) {
+            $safeStoredVariableNames.Clear()
+            $safeStoredAssignmentEndOffsets.Clear()
+        }
+
+        $earlyVariableLookups = @(
+            $earlyEagerCommands |
+                Where-Object {
+                    $variableLookupCommandNames.Contains(
+                        (& $normalizeFunctionName $_.GetCommandName())
+                    )
+                }
+        )
+        foreach ($variableLookup in $earlyVariableLookups) {
+            if (
+                & $testVariableLookupCanRecoverRiskyStoredBlock `
+                    -Command $variableLookup `
+                    -SafeNames $safeStoredVariableNames `
+                    -SafeAssignmentEndOffsets $safeStoredAssignmentEndOffsets `
+                    -ExecutionOffset $variableLookup.Extent.StartOffset
+            ) {
+                return $false
+            }
+        }
+
+        # lookupを含むfunctionは定義だけなら安全だが、raw fixtureより前の
+        # direct/transitive callで実行される。既存function graphと同じ規則で
+        # wrapper riskをfixed pointまで伝播する。
+        $lookupRiskyFunctionNames = (
+            [System.Collections.Generic.HashSet[string]]::new(
+                [System.StringComparer]::OrdinalIgnoreCase
+            )
+        )
+        $lookupRequiredAssignmentEndOffsets = @{}
+        foreach ($functionDefinition in $functionDefinitions) {
+            $normalizedLookupFunctionName = & $normalizeFunctionName (
+                $functionDefinition.Name
+            )
+            $functionAliasDefinitionCommands = @(
+                $functionDefinition.FindAll(
+                    {
+                        param($node)
+                        return (
+                            $node -is
+                                [System.Management.Automation.Language.CommandAst] -and
+                            $aliasDefinitionCommandNames.Contains(
+                                (& $normalizeFunctionName $node.GetCommandName())
+                            )
+                        )
+                    },
+                    $true
+                )
+            )
+            if ($functionAliasDefinitionCommands.Count -gt 0) {
+                [void]$lookupRiskyFunctionNames.Add(
+                    $normalizedLookupFunctionName
+                )
+                continue
+            }
+            $requiredAssignmentEndOffset = [pscustomobject]@{
+                Value = 0
+            }
+            $functionVariableLookups = @(
+                $functionDefinition.FindAll(
+                    {
+                        param($node)
+                        return (
+                            $node -is
+                                [System.Management.Automation.Language.CommandAst] -and
+                            $variableLookupCommandNames.Contains(
+                                (& $normalizeFunctionName $node.GetCommandName())
+                            )
+                        )
+                    },
+                    $true
+                )
+            )
+            foreach ($variableLookup in $functionVariableLookups) {
+                if (
+                    & $testVariableLookupCanRecoverRiskyStoredBlock `
+                        -Command $variableLookup `
+                        -SafeNames $safeStoredVariableNames `
+                        -SafeAssignmentEndOffsets `
+                            $safeStoredAssignmentEndOffsets `
+                        -RequiredAssignmentEndOffset `
+                            $requiredAssignmentEndOffset
+                ) {
+                    [void]$lookupRiskyFunctionNames.Add(
+                        $normalizedLookupFunctionName
+                    )
+                    break
+                }
+            }
+            if (
+                -not $lookupRiskyFunctionNames.Contains(
+                    $normalizedLookupFunctionName
+                ) -and
+                $requiredAssignmentEndOffset.Value -gt 0
+            ) {
+                $lookupRequiredAssignmentEndOffsets[
+                    $normalizedLookupFunctionName
+                ] = $requiredAssignmentEndOffset.Value
+            }
+        }
+        do {
+            $lookupRiskGraphChanged = $false
+            foreach ($functionDefinition in $functionDefinitions) {
+                $normalizedDefinitionName = (
+                    & $normalizeFunctionName $functionDefinition.Name
+                )
+                if (
+                    $lookupRiskyFunctionNames.Contains(
+                        $normalizedDefinitionName
+                    )
+                ) {
+                    continue
+                }
+                $containedCommands = @(
+                    $functionDefinition.FindAll(
+                        {
+                            param($node)
+                            return (
+                                $node -is
+                                    [System.Management.Automation.Language.CommandAst]
+                            )
+                        },
+                        $true
+                    )
+                )
+                foreach ($containedCommand in $containedCommands) {
+                    $containedCommandName = & $normalizeFunctionName (
+                        $containedCommand.GetCommandName()
+                    )
+                    $isUnresolvedCallOperator = (
+                        [string]::IsNullOrEmpty($containedCommandName) -and
+                        @('Ampersand', 'Dot') -contains
+                            ([string]$containedCommand.InvocationOperator)
+                    )
+                    $isUnknownLookupWrapperCommand = (
+                        $lookupRequiredAssignmentEndOffsets.ContainsKey(
+                            $normalizedDefinitionName
+                        ) -and
+                        -not $variableLookupCommandNames.Contains(
+                            $containedCommandName
+                        ) -and
+                        -not $lookupRequiredAssignmentEndOffsets.ContainsKey(
+                            $containedCommandName
+                        )
+                    )
+                    $isUnresolvedLookupWrapperCall = (
+                        $isUnresolvedCallOperator -and
+                        $lookupRequiredAssignmentEndOffsets.ContainsKey(
+                            $normalizedDefinitionName
+                        )
+                    )
+                    if (
+                        $lookupRiskyFunctionNames.Contains(
+                            $containedCommandName
+                        ) -or
+                        $isUnresolvedLookupWrapperCall -or
+                        $isUnknownLookupWrapperCommand
+                    ) {
+                        if (
+                            $lookupRiskyFunctionNames.Add(
+                                $normalizedDefinitionName
+                            )
+                        ) {
+                            $lookupRiskGraphChanged = $true
+                        }
+                        break
+                    }
+                    if (
+                        $lookupRequiredAssignmentEndOffsets.ContainsKey(
+                            $containedCommandName
+                        )
+                    ) {
+                        $containedRequirement = [int](
+                            $lookupRequiredAssignmentEndOffsets[
+                                $containedCommandName
+                            ]
+                        )
+                        $currentRequirement = 0
+                        if (
+                            $lookupRequiredAssignmentEndOffsets.ContainsKey(
+                                $normalizedDefinitionName
+                            )
+                        ) {
+                            $currentRequirement = [int](
+                                $lookupRequiredAssignmentEndOffsets[
+                                    $normalizedDefinitionName
+                                ]
+                            )
+                        }
+                        if ($containedRequirement -gt $currentRequirement) {
+                            $lookupRequiredAssignmentEndOffsets[
+                                $normalizedDefinitionName
+                            ] = $containedRequirement
+                            $lookupRiskGraphChanged = $true
+                        }
+                    }
+                }
+            }
+
+            # alias が lookup-risky wrapper を指す場合も同じ固定点へ取り込み、
+            # wrapper と alias を交互にたどる経路を早期実行判定から漏らさない。
+            # safe wrapperも代入完了offsetをaliasへ伝播し、先行callを許可しない。
+            foreach ($aliasBinding in $literalAliasBindings) {
+                if (
+                    $lookupRiskyFunctionNames.Contains(
+                        [string]$aliasBinding.Target
+                    ) -and
+                    $lookupRiskyFunctionNames.Add(
+                        [string]$aliasBinding.Name
+                    )
+                ) {
+                    $lookupRiskGraphChanged = $true
+                }
+                if (
+                    $lookupRequiredAssignmentEndOffsets.ContainsKey(
+                        [string]$aliasBinding.Target
+                    )
+                ) {
+                    $aliasRequirement = [int](
+                        $lookupRequiredAssignmentEndOffsets[
+                            [string]$aliasBinding.Target
+                        ]
+                    )
+                    $currentAliasRequirement = 0
+                    if (
+                        $lookupRequiredAssignmentEndOffsets.ContainsKey(
+                            [string]$aliasBinding.Name
+                        )
+                    ) {
+                        $currentAliasRequirement = [int](
+                            $lookupRequiredAssignmentEndOffsets[
+                                [string]$aliasBinding.Name
+                            ]
+                        )
+                    }
+                    if ($aliasRequirement -gt $currentAliasRequirement) {
+                        $lookupRequiredAssignmentEndOffsets[
+                            [string]$aliasBinding.Name
+                        ] = $aliasRequirement
+                        $lookupRiskGraphChanged = $true
+                    }
+                }
+            }
+        } while ($lookupRiskGraphChanged)
+
+        foreach ($earlyCommand in $earlyEagerCommands) {
+            $earlyCommandName = & $normalizeFunctionName (
+                $earlyCommand.GetCommandName()
+            )
+            if ($lookupRiskyFunctionNames.Contains($earlyCommandName)) {
+                return $false
+            }
+            if (
+                $lookupRequiredAssignmentEndOffsets.ContainsKey(
+                    $earlyCommandName
+                ) -and
+                $earlyCommand.Extent.StartOffset -lt
+                    [int]$lookupRequiredAssignmentEndOffsets[$earlyCommandName]
+            ) {
+                return $false
+            }
         }
     }
 
@@ -1246,6 +2787,329 @@ $rawTransportResult = Invoke-PrivateMarkerBoundedProcess
 '@
         },
         [pscustomobject]@{
+            Name = 'risk-sensitive-set-item-alias'
+            Expected = $false
+            Source = @'
+Set-Alias mutate Set-Item
+mutate Function:Invoke-PrivateMarkerBoundedProcess { Write-Output safe }
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'risk-sensitive-get-command-alias'
+            Expected = $false
+            Source = @'
+function Invoke-Early {
+    Invoke-PrivateMarkerBoundedProcess
+}
+Set-Alias resolve Get-Command
+$stored = (resolve Invoke-Early).ScriptBlock
+& $stored
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'risk-sensitive-new-object-alias'
+            Expected = $false
+            Source = @'
+class EarlyClass {
+    EarlyClass() {
+        Invoke-PrivateMarkerBoundedProcess
+    }
+}
+Set-Alias create New-Object
+create EarlyClass
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'copy-item-invoke-expression-alias'
+            Expected = $false
+            Source = @'
+Copy-Item Alias:iex Alias:runtext
+runtext 'Invoke-PrivateMarkerBoundedProcess'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'copy-item-get-variable-alias'
+            Expected = $false
+            Source = @'
+Copy-Item Alias:gv Alias:readstored
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+1 | ForEach-Object (readstored stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'copy-item-function-provider'
+            Expected = $false
+            Source = @'
+function Invoke-Early {
+    Invoke-PrivateMarkerBoundedProcess
+}
+Copy-Item Function:Invoke-Early Function:Invoke-Copied
+Invoke-Copied
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'move-item-invoke-expression-alias'
+            Expected = $false
+            Source = @'
+Move-Item Alias:iex Alias:runtext
+runtext 'Invoke-PrivateMarkerBoundedProcess'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'rename-item-invoke-expression-alias'
+            Expected = $false
+            Source = @'
+Rename-Item Alias:iex runtext
+runtext 'Invoke-PrivateMarkerBoundedProcess'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'wrapper-copy-item-alias-provider'
+            Expected = $false
+            Source = @'
+function Initialize-RunAlias {
+    Copy-Item Alias:iex Alias:runtext
+}
+Initialize-RunAlias
+runtext 'Invoke-PrivateMarkerBoundedProcess'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'import-alias-before'
+            Expected = $false
+            Source = @'
+Import-Alias '.\aliases.csv'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'import-module-before'
+            Expected = $false
+            Source = @'
+Import-Module '.\mutate.psm1'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'import-module-alias-before'
+            Expected = $false
+            Source = @'
+ipmo '.\mutate.psm1'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'module-qualified-import-before'
+            Expected = $false
+            Source = @'
+Microsoft.PowerShell.Core\Import-Module '.\mutate.psm1'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'new-module-before'
+            Expected = $false
+            Source = @'
+New-Module -ScriptBlock { Set-Alias Invoke-PrivateMarkerBoundedProcess Get-Item }
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'using-module-before'
+            Expected = $false
+            Source = @'
+using module '.\mutate.psm1'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'wrapper-import-module-before'
+            Expected = $false
+            Source = @'
+function Import-UntrustedModule {
+    Import-Module '.\mutate.psm1'
+}
+Import-UntrustedModule
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'class-import-module-before'
+            Expected = $false
+            Source = @'
+class ModuleLoader {
+    ModuleLoader() {
+        Import-Module '.\mutate.psm1'
+    }
+}
+[ModuleLoader]::new()
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'alias-to-import-module-before'
+            Expected = $false
+            Source = @'
+Set-Alias loadmodule Import-Module
+loadmodule '.\mutate.psm1'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'remove-alias-target'
+            Expected = $false
+            Source = @'
+Remove-Alias Invoke-PrivateMarkerBoundedProcess
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'remove-item-alias-target'
+            Expected = $false
+            Source = @'
+ri Alias:Invoke-PrivateMarkerBoundedProcess
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'remove-item-function-target'
+            Expected = $false
+            Source = @'
+Remove-Item Function:Invoke-PrivateMarkerBoundedProcess
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'wrapper-remove-item-function-target'
+            Expected = $false
+            Source = @'
+function Remove-Runner {
+    Remove-Item Function:Invoke-PrivateMarkerBoundedProcess
+}
+Remove-Runner
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'wrapper-dynamic-remove-item-function-target'
+            Expected = $false
+            Source = @'
+function Remove-Runner {
+    param([string]$Path)
+    Remove-Item -LiteralPath $Path
+}
+Remove-Runner Function:Invoke-PrivateMarkerBoundedProcess
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'wrapper-fixed-env-remove-item'
+            Expected = $true
+            Source = @'
+function Clear-TestEnvironment {
+    Remove-Item -LiteralPath ('Env:\' + 'SAFE_TEST_VALUE')
+}
+Clear-TestEnvironment
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'dot-sourced-script-before'
+            Expected = $false
+            Source = @'
+. '.\mutate.ps1'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'call-script-before'
+            Expected = $false
+            Source = @'
+& '.\mutate.ps1'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'direct-script-before'
+            Expected = $false
+            Source = @'
+.\mutate.ps1
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'wrapper-dynamic-script-before'
+            Expected = $false
+            Source = @'
+function Invoke-ScriptPath {
+    param([string]$ScriptPath)
+    & $ScriptPath
+}
+$scriptPath = '.\mutate.ps1'
+Invoke-ScriptPath $scriptPath
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'unused-dynamic-script-wrapper'
+            Expected = $true
+            Source = @'
+function Invoke-ScriptPath {
+    param([string]$ScriptPath)
+    & $ScriptPath
+}
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'bound-local-scriptblock-wrapper'
+            Expected = $true
+            Source = @'
+function Invoke-LocalHelper {
+    $localHelper = { param($Value) $Value }
+    & $localHelper 'safe'
+}
+Invoke-LocalHelper
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'bound-local-scriptblock-provider-mutation'
+            Expected = $false
+            Source = @'
+function Invoke-LocalHelper {
+    $localHelper = {
+        Set-Item Function:Invoke-PrivateMarkerBoundedProcess { 'shadow' }
+    }
+    & $localHelper
+}
+Invoke-LocalHelper
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'reassigned-local-scriptblock-wrapper'
+            Expected = $false
+            Source = @'
+function Invoke-LocalHelper {
+    $localHelper = { 'safe' }
+    $localHelper = { Invoke-PrivateMarkerBoundedProcess }
+    & $localHelper
+}
+Invoke-LocalHelper
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
             Name = 'set-item-alias-target'
             Expected = $false
             Source = @'
@@ -1258,6 +3122,30 @@ $rawTransportResult = Invoke-PrivateMarkerBoundedProcess
             Expected = $false
             Source = @'
 Set-Item -Path Function:Invoke-PrivateMarkerBoundedProcess -Value { $null }
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'wrapper-set-item-function-target'
+            Expected = $false
+            Source = @'
+function Set-RunnerShadow {
+    Set-Item Function:Invoke-PrivateMarkerBoundedProcess { 'shadow' }
+}
+Set-RunnerShadow
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'class-set-item-function-target'
+            Expected = $false
+            Source = @'
+class RunnerShadow {
+    static [void] Install() {
+        Set-Item Function:Invoke-PrivateMarkerBoundedProcess { 'shadow' }
+    }
+}
+[RunnerShadow]::Install()
 $rawTransportResult = Invoke-PrivateMarkerBoundedProcess
 '@
         },
@@ -1279,6 +3167,15 @@ $rawTransportResult = Invoke-PrivateMarkerBoundedProcess
             Source = @'
 $providerPath = 'Function:Invoke-PrivateMarkerBoundedProcess'
 New-Item -Path $providerPath -ItemType Directory -Value { 'shadow' }
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'module-qualified-join-path-provider'
+            Expected = $false
+            Source = @'
+$providerPath = Synthetic.Autoload\Join-Path $root 'fixture.txt'
+Set-Content -LiteralPath $providerPath -Value 'safe'
 $rawTransportResult = Invoke-PrivateMarkerBoundedProcess
 '@
         },
@@ -1390,6 +3287,363 @@ function Invoke-Deferred {
     Invoke-PrivateMarkerBoundedProcess
 }
 Get-Command git -CommandType Application
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-get-variable-foreach'
+            Expected = $false
+            Source = @'
+function Invoke-Early {
+    Invoke-PrivateMarkerBoundedProcess
+}
+$stored = { Invoke-Early }
+ForEach-Object -InputObject 1 -Process (Get-Variable stored).Value
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-gv-value-only'
+            Expected = $false
+            Source = @'
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+1 | ForEach-Object (gv stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-dynamic-get-variable'
+            Expected = $false
+            Source = @'
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+$lookupName = 'stored'
+1 | Where-Object (Get-Variable -Name $lookupName -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'unbound-literal-get-variable'
+            Expected = $false
+            Source = @'
+1 | ForEach-Object (Get-Variable ambientStored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'runtime-created-scriptblock-get-variable'
+            Expected = $false
+            Source = @'
+$generated = [scriptblock]::Create('Invoke-PrivateMarkerBoundedProcess')
+1 | ForEach-Object (Get-Variable generated -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'reassigned-runtime-scriptblock-get-variable'
+            Expected = $false
+            Source = @'
+$safeStored = { $_ }
+$safeStored = [scriptblock]::Create('Invoke-PrivateMarkerBoundedProcess')
+1 | ForEach-Object (Get-Variable safeStored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'compound-assignment-get-variable'
+            Expected = $false
+            Source = @'
+$safeStored = { $_ }
+$safeStored += { $_ }
+1 | ForEach-Object (Get-Variable safeStored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'alias-variable-mutation-get-variable'
+            Expected = $false
+            Source = @'
+Set-Alias mutate Set-Variable
+$safeStored = { $_ }
+mutate -Name safeStored -Scope Script -Value ([scriptblock]::Create(
+    'Invoke-PrivateMarkerBoundedProcess'
+))
+1 | ForEach-Object (Get-Variable safeStored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'member-variable-mutation-get-variable'
+            Expected = $false
+            Source = @'
+$safeStored = { $_ }
+$ExecutionContext.SessionState.PSVariable.Set(
+    'safeStored',
+    [scriptblock]::Create('Invoke-PrivateMarkerBoundedProcess')
+)
+1 | ForEach-Object (Get-Variable safeStored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-invoke-expression-get-variable'
+            Expected = $false
+            Source = @'
+$stored = { Invoke-Expression 'Invoke-PrivateMarkerBoundedProcess' }
+1 | ForEach-Object (Get-Variable stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-iex-get-variable'
+            Expected = $false
+            Source = @'
+$stored = { iex 'Invoke-PrivateMarkerBoundedProcess' }
+1 | ForEach-Object (Get-Variable stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-unresolved-call-get-variable'
+            Expected = $false
+            Source = @'
+$commandName = 'Invoke-PrivateMarkerBoundedProcess'
+$stored = { & $commandName }
+1 | ForEach-Object (Get-Variable stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-unbound-command-get-variable'
+            Expected = $false
+            Source = @'
+$stored = { Invoke-AmbientCommand }
+1 | ForEach-Object (Get-Variable stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-wildcard-get-variable'
+            Expected = $false
+            Source = @'
+$safeStored = { $_ }
+1 | ForEach-Object (Get-Variable 'safe*' -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-name-omitted-get-variable'
+            Expected = $false
+            Source = @'
+$safeStored = { $_ }
+1 | ForEach-Object (Get-Variable -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-get-variable-wrapper'
+            Expected = $false
+            Source = @'
+function Invoke-Stored {
+    (Get-Variable -Name stored -Scope Script -ValueOnly).Invoke()
+}
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+Invoke-Stored
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-get-variable-alias'
+            Expected = $false
+            Source = @'
+Set-Alias readstored Get-Variable
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+1 | ForEach-Object (readstored stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'alias-of-set-alias-get-variable'
+            Expected = $false
+            Source = @'
+Set-Alias makealias Set-Alias
+makealias readstored Get-Variable
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+1 | ForEach-Object (readstored stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'wrapper-set-alias-get-variable'
+            Expected = $false
+            Source = @'
+function Initialize-LookupAlias {
+    Set-Alias readstored Get-Variable -Scope Script
+}
+Initialize-LookupAlias
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+1 | ForEach-Object (readstored stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-get-variable-transitive-alias'
+            Expected = $false
+            Source = @'
+Set-Alias readstored Get-Variable
+Set-Alias readstoredagain readstored
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+1 | ForEach-Object (readstoredagain stored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'stored-scriptblock-get-variable-wrapper-alias'
+            Expected = $false
+            Source = @'
+function Get-Stored {
+    (Get-Variable -Name stored -Scope Script -ValueOnly).Invoke()
+}
+Set-Alias readstored Get-Stored
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+readstored
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'safe-get-variable-wrapper-alias'
+            Expected = $true
+            Source = @'
+function Get-SafeStored {
+    Get-Variable -Name safeStored -Scope Script -ValueOnly
+}
+Set-Alias readsafe Get-SafeStored
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+$safeStored = { $_ }
+readsafe
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'safe-get-variable-wrapper-alias-before-assignment'
+            Expected = $false
+            Source = @'
+function Get-SafeStored {
+    Get-Variable -Name safeStored -Scope Script -ValueOnly
+}
+Set-Alias readsafe Get-SafeStored
+readsafe
+$safeStored = { $_ }
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'safe-get-variable-wrapper-unknown-command'
+            Expected = $false
+            Source = @'
+function Get-SafeStored {
+    Get-Variable -Name safeStored -Scope Script -ValueOnly
+    Invoke-AmbientCommand
+}
+$safeStored = { $_ }
+Get-SafeStored
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'safe-get-variable-wrapper-dynamic-call'
+            Expected = $false
+            Source = @'
+function Get-SafeStored {
+    Get-Variable -Name safeStored -Scope Script -ValueOnly
+    & $commandName
+}
+$safeStored = { $_ }
+$commandName = 'Invoke-PrivateMarkerBoundedProcess'
+Get-SafeStored
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'safe-get-variable-alias-target'
+            Expected = $true
+            Source = @'
+Set-Alias readstored Write-Output
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+readstored safe
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'shadowed-get-variable-command'
+            Expected = $false
+            Source = @'
+function Get-Variable {
+    param([string]$Name)
+    return $Name
+}
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+Get-Variable stored
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'unused-get-variable-wrapper'
+            Expected = $true
+            Source = @'
+function Get-Stored {
+    Get-Variable -Name stored -Scope Script -ValueOnly
+}
+$stored = { Invoke-PrivateMarkerBoundedProcess }
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'safe-stored-scriptblock-get-variable'
+            Expected = $true
+            Source = @'
+function Invoke-Deferred {
+    Invoke-PrivateMarkerBoundedProcess
+}
+$stored = { Invoke-Deferred }
+$safeStored = { $_ }
+1 | ForEach-Object (Get-Variable safeStored -ValueOnly)
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'global-safe-assignment-get-variable'
+            Expected = $false
+            Source = @'
+$global:safeStored = { $_ }
+Get-Variable safeStored -Scope Script -ValueOnly
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'script-scoped-safe-assignment-get-variable'
+            Expected = $true
+            Source = @'
+$script:safeStored = { $_ }
+Get-Variable safeStored -Scope Script -ValueOnly
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'parameter-global-safe-assignment-get-variable'
+            Expected = $false
+            Source = @'
+param($safeStored)
+$global:safeStored = { $_ }
+Get-Variable safeStored -ValueOnly
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'qualified-current-item-scriptblock-get-variable'
+            Expected = $false
+            Source = @'
+$safeStored = { $global:_ }
+Get-Variable safeStored -ValueOnly
 $rawTransportResult = Invoke-PrivateMarkerBoundedProcess
 '@
         },
@@ -1582,6 +3836,15 @@ $rawTransportResult = Invoke-PrivateMarkerBoundedProcess
             Expected = $false
             Source = @'
 Invoke-Expression 'Invoke-PrivateMarkerBoundedProcess'
+$rawTransportResult = Invoke-PrivateMarkerBoundedProcess
+'@
+        },
+        [pscustomobject]@{
+            Name = 'invoke-expression-alias-helper'
+            Expected = $false
+            Source = @'
+Set-Alias runtext Invoke-Expression
+runtext 'Invoke-PrivateMarkerBoundedProcess'
 $rawTransportResult = Invoke-PrivateMarkerBoundedProcess
 '@
         },
@@ -2272,10 +4535,29 @@ function Get-EnvironmentVariableState {
     param([string]$Name)
 
     $environment = [Environment]::GetEnvironmentVariables('Process')
-    $exists = $environment.Contains($Name)
+    $comparison = if ($isWindowsPlatform) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparison]::Ordinal
+    }
+    $matchingEntry = $null
+    foreach ($entry in $environment.GetEnumerator()) {
+        if (
+            [string]::Equals(
+                [string]$entry.Key,
+                $Name,
+                $comparison
+            )
+        ) {
+            $matchingEntry = $entry
+            break
+        }
+    }
+    $exists = $null -ne $matchingEntry
     return [pscustomobject]@{
         Exists = $exists
-        Value = if ($exists) { [string]$environment[$Name] } else { $null }
+        Name = if ($exists) { [string]$matchingEntry.Key } else { $Name }
+        Value = if ($exists) { [string]$matchingEntry.Value } else { $null }
     }
 }
 
@@ -2292,6 +4574,124 @@ function Test-EnvironmentVariableStateEqual {
             $Left.Value -ceq $Right.Value
         )
     )
+}
+
+function Assert-ProductionChildEnvironmentAllowlist {
+    # 親に存在し得るcredential値は読まず、exact key setで非継承を証明する。
+    # 未知変数だけをsyntheticに追加し、旧ambient cloneへ戻る回帰も検出する。
+    $syntheticName = 'SYNTHETIC_UNKNOWN_NON_GIT_AMBIENT'
+    $syntheticBefore = Get-EnvironmentVariableState -Name $syntheticName
+    $forbiddenNames = @(
+        'PATH',
+        'ComSpec',
+        'PATHEXT',
+        'WINDIR',
+        'TEMP',
+        'TMP',
+        'TMPDIR',
+        'HOME',
+        'USERPROFILE',
+        'APPDATA',
+        'LOCALAPPDATA',
+        'PSModulePath',
+        'XDG_CONFIG_HOME',
+        'TZ',
+        'LD_PRELOAD',
+        'LD_LIBRARY_PATH',
+        'DYLD_INSERT_LIBRARIES',
+        'DOTNET_STARTUP_HOOKS',
+        'CORECLR_ENABLE_PROFILING',
+        'CORECLR_PROFILER_PATH',
+        'COR_ENABLE_PROFILING',
+        'COR_PROFILER_PATH',
+        'AWS_SECRET_ACCESS_KEY',
+        'GITHUB_TOKEN',
+        'SSH_AUTH_SOCK'
+    )
+
+    try {
+        [Environment]::SetEnvironmentVariable(
+            $syntheticName,
+            'synthetic-blocked-value',
+            'Process'
+        )
+
+        $childEnvironment = New-PrivateMarkerChildEnvironment
+        $comparer = if ($isWindowsPlatform) {
+            [System.StringComparer]::OrdinalIgnoreCase
+        } else {
+            [System.StringComparer]::Ordinal
+        }
+        $allowedNames = [System.Collections.Generic.HashSet[string]]::new(
+            $comparer
+        )
+        if ($isWindowsPlatform) {
+            [void]$allowedNames.Add('SystemRoot')
+        }
+
+        foreach ($name in $childEnvironment.Keys) {
+            if (-not $allowedNames.Contains([string]$name)) {
+                Add-Failure (
+                    'Production child environment admitted a non-allowlisted ' +
+                    'variable name.'
+                )
+                break
+            }
+        }
+        if ($childEnvironment.ContainsKey($syntheticName)) {
+            Add-Failure (
+                'Production child environment retained an unknown ambient ' +
+                'variable.'
+            )
+        }
+        foreach ($name in $forbiddenNames) {
+            if ($childEnvironment.ContainsKey($name)) {
+                Add-Failure (
+                    'Production child environment retained a loader, ' +
+                    'credential, or runtime convenience variable.'
+                )
+                break
+            }
+        }
+        if (
+            $childEnvironment.Count -ne $allowedNames.Count
+        ) {
+            Add-Failure (
+                'Production child environment did not use its exact minimal ' +
+                'allowlist.'
+            )
+        }
+        if ($isWindowsPlatform) {
+            $expectedRoot = [System.IO.Directory]::GetParent(
+                [Environment]::SystemDirectory
+            ).FullName
+            if (
+                -not $childEnvironment.ContainsKey('SystemRoot') -or
+                [string]$childEnvironment['SystemRoot'] -cne $expectedRoot
+            ) {
+                Add-Failure (
+                    'Production child environment did not derive SystemRoot ' +
+                    'from the OS runtime.'
+                )
+            }
+        }
+    }
+    finally {
+        if ($syntheticBefore.Exists) {
+            [Environment]::SetEnvironmentVariable(
+                $syntheticBefore.Name,
+                $syntheticBefore.Value,
+                'Process'
+            )
+        } else {
+            # .NET/Windowsの組合せによってnull代入がpresent-emptyを残す。
+            # Env: providerから固定名を削除し、元のabsent状態を復元する。
+            Remove-Item `
+                -LiteralPath ('Env:\' + $syntheticName) `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
+    }
 }
 
 function Invoke-TestGit {
@@ -2481,6 +4881,7 @@ try {
     [System.IO.File]::WriteAllText($script:testGitEmptyAttributes, '', $utf8NoBom)
     [System.IO.File]::WriteAllText($script:testGitEmptyExcludes, '', $utf8NoBom)
 
+    Assert-ProductionChildEnvironmentAllowlist
     Assert-FirstBoundedInvocationValidatorRegressions
     Assert-FirstBoundedInvocationIsRawTransport
 
@@ -2694,6 +5095,152 @@ namespace MultiAgentDelegation.Tests
             (Test-Path -LiteralPath $numericSentinel)
         ) {
             Add-Failure "Expected runner numeric case '$($invalidNumericCase.Name)' to reject raw non-integer input before child start."
+        }
+    }
+
+    if (-not $isWindowsPlatform) {
+        # fake setsidがdirect launcherの終了前後に実groupを遅延作成しても、
+        # verified PGIDより先にreleaseせず、late groupもcleanup budgetで回収する。
+        $trustedSetsidPath = Get-PrivateMarkerTrustedSetsidPath
+        $chmodPath = @('/usr/bin/chmod', '/bin/chmod') |
+            Where-Object {
+                [System.IO.File]::Exists($_)
+            } |
+            Select-Object -First 1
+        $sleepPath = @('/usr/bin/sleep', '/bin/sleep') |
+            Where-Object {
+                [System.IO.File]::Exists($_)
+            } |
+            Select-Object -First 1
+        if (
+            [string]::IsNullOrEmpty($trustedSetsidPath) -or
+            [string]::IsNullOrEmpty($chmodPath) -or
+            [string]::IsNullOrEmpty($sleepPath)
+        ) {
+            Add-Failure 'Expected trusted setsid, chmod, and sleep executables for the POSIX launch-gate regression.'
+        } else {
+            $gatePayload = Join-Path $tempRoot 'posix-gate-payload.sh'
+            [System.IO.File]::WriteAllText(
+                $gatePayload,
+                @'
+#!/bin/sh
+printf 'ran\n' > "$1"
+"$PRIVATE_MARKER_TEST_SLEEP" 10
+'@,
+                $utf8NoBom
+            )
+            $directDelaySetsid = Join-Path $tempRoot 'fake-setsid-direct-delay.sh'
+            [System.IO.File]::WriteAllText(
+                $directDelaySetsid,
+                @'
+#!/bin/sh
+printf '%s\n' "$7" > "$PRIVATE_MARKER_TEST_GATE_CAPTURE"
+"$PRIVATE_MARKER_TEST_SLEEP" 0.25
+exec "$PRIVATE_MARKER_TEST_REAL_SETSID" "$@"
+'@,
+                $utf8NoBom
+            )
+            $forkDelaySetsid = Join-Path $tempRoot 'fake-setsid-fork-delay.sh'
+            [System.IO.File]::WriteAllText(
+                $forkDelaySetsid,
+                @'
+#!/bin/sh
+printf '%s\n' "$7" > "$PRIVATE_MARKER_TEST_GATE_CAPTURE"
+(
+    "$PRIVATE_MARKER_TEST_SLEEP" 0.25
+    exec "$PRIVATE_MARKER_TEST_REAL_SETSID" "$@"
+) &
+exit 0
+'@,
+                $utf8NoBom
+            )
+            $chmodResult = Invoke-BoundedProcess `
+                -FilePath $chmodPath `
+                -Arguments @(
+                    '700',
+                    $gatePayload,
+                    $directDelaySetsid,
+                    $forkDelaySetsid
+                ) `
+                -WorkingDirectory $root `
+                -TimeoutMilliseconds 5000
+            if ($chmodResult.ExitCode -ne 0) {
+                Add-Failure 'Expected POSIX launch-gate fixtures to become executable.'
+            } else {
+                foreach ($launchGateCase in @(
+                    [pscustomobject]@{
+                        Name = 'direct-delay'
+                        SetsidPath = $directDelaySetsid
+                    },
+                    [pscustomobject]@{
+                        Name = 'fork-delay'
+                        SetsidPath = $forkDelaySetsid
+                    }
+                )) {
+                    $gateSentinel = Join-Path $tempRoot (
+                        'posix-gate-' + $launchGateCase.Name + '.sentinel'
+                    )
+                    $gateCapture = Join-Path $tempRoot (
+                        'posix-gate-' + $launchGateCase.Name + '.root'
+                    )
+                    $gateEnvironment = New-RunnerTestEnvironment
+                    $gateEnvironment[
+                        'PRIVATE_MARKER_TEST_REAL_SETSID'
+                    ] = $trustedSetsidPath
+                    $gateEnvironment[
+                        'PRIVATE_MARKER_TEST_GATE_CAPTURE'
+                    ] = $gateCapture
+                    $gateEnvironment[
+                        'PRIVATE_MARKER_TEST_SLEEP'
+                    ] = $sleepPath
+                    $gateTimeoutObserved = $false
+                    $gateStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                    try {
+                        [void][MultiAgentDelegation.PrivateMarkerBoundedProcess]::Run(
+                            $gatePayload,
+                            [string[]]@($gateSentinel),
+                            $root,
+                            $gateEnvironment,
+                            [byte[]]@(),
+                            100,
+                            1500,
+                            64KB,
+                            64KB,
+                            $launchGateCase.SetsidPath,
+                            ''
+                        )
+                    }
+                    catch {
+                        if ($_.Exception.Message -match 'process-timeout') {
+                            $gateTimeoutObserved = $true
+                        } else {
+                            Add-Failure "POSIX launch-gate case '$($launchGateCase.Name)' returned an unexpected failure class."
+                        }
+                    }
+                    finally {
+                        $gateStopwatch.Stop()
+                    }
+
+                    # method復帰後にも遅延childの実行余地を与え、gate rootと
+                    # sentinelの双方が残らないことをboundedに確認する。
+                    Start-Sleep -Milliseconds 400
+                    $capturedGateRoot = ''
+                    if (Test-Path -LiteralPath $gateCapture -PathType Leaf) {
+                        $capturedGateRoot = [System.IO.File]::ReadAllText(
+                            $gateCapture
+                        ).Trim()
+                    }
+                    if (
+                        -not $gateTimeoutObserved -or
+                        $gateStopwatch.ElapsedMilliseconds -ge 4000 -or
+                        [string]::IsNullOrWhiteSpace($capturedGateRoot) -or
+                        (Test-Path -LiteralPath $capturedGateRoot) -or
+                        (Test-Path -LiteralPath $gateSentinel)
+                    ) {
+                        Add-Failure "Expected POSIX launch-gate case '$($launchGateCase.Name)' to prevent target execution and remove its private gate."
+                    }
+                }
+            }
         }
     }
 
@@ -2979,6 +5526,9 @@ namespace MultiAgentDelegation.Tests
     $escapedRawGitRoot = $rawGitRoot.Replace("'", "''")
     $throwingRunnerSource = @"
 `$script:BoundaryInvocationCount = 0
+function New-PrivateMarkerChildEnvironment {
+    return @{}
+}
 function Invoke-PrivateMarkerBoundedProcess {
     param(
         [string]`$FilePath,
@@ -3004,7 +5554,10 @@ function Invoke-PrivateMarkerBoundedProcess {
     }
     throw '$escapedLeakyHelperPath'
 }
-Export-ModuleMember -Function Invoke-PrivateMarkerBoundedProcess
+Export-ModuleMember -Function @(
+    'New-PrivateMarkerChildEnvironment',
+    'Invoke-PrivateMarkerBoundedProcess'
+)
 "@
     $throwingRunnerScanner = & $writeBoundaryVariant `
         -Name 'throwing-runner' `
@@ -3530,7 +6083,8 @@ $childArguments += @('-File', $GrandchildScript, '-PidPath', $PidPath)
     }
 
     # 合成git.exeでmalformed空recordと4097件の非空recordを返し、
-    # downgrade拒否とparser/CPU budgetをbehaviorally固定する。
+    # downgrade拒否とparser/CPU budgetをbehaviorally固定する。mode/stateは
+    # child environmentに抜け道を作らず、fixture root内の固定fileで渡す。
     if ($isWindowsPlatform) {
         $syntheticGitRoot = Join-Path $tempRoot 'synthetic-nul-git-root'
         $syntheticGitBin = Join-Path $tempRoot 'synthetic-nul-git-bin'
@@ -3552,11 +6106,15 @@ public static class SyntheticGit
 {
     public static int Main(string[] args)
     {
-        string mode = Environment.GetEnvironmentVariable("SYNTHETIC_GIT_MODE");
+        string root = Directory.GetCurrentDirectory();
+        string modePath = Path.Combine(root, ".synthetic-git-mode");
+        string statePath = Path.Combine(root, ".synthetic-git-state");
+        string mode = File.Exists(modePath)
+            ? File.ReadAllText(modePath).Trim()
+            : String.Empty;
         if (Array.IndexOf(args, "--show-toplevel") >= 0)
         {
-            Console.WriteLine(
-                Environment.GetEnvironmentVariable("SYNTHETIC_GIT_ROOT"));
+            Console.WriteLine(root);
             return 0;
         }
 
@@ -3567,8 +6125,6 @@ public static class SyntheticGit
             {
                 if (Array.IndexOf(args, "--stage") >= 0)
                 {
-                    string statePath = Environment.GetEnvironmentVariable(
-                        "SYNTHETIC_GIT_STATE");
                     int count = File.Exists(statePath)
                         ? Int32.Parse(File.ReadAllText(statePath))
                         : 0;
@@ -3640,6 +6196,14 @@ public static class SyntheticGit
         ) {
             Add-Failure 'Synthetic bounded Git fixture could not be compiled.'
         } else {
+            $syntheticGitModePath = Join-Path (
+                $syntheticGitRoot
+            ) '.synthetic-git-mode'
+            [System.IO.File]::WriteAllText(
+                $syntheticGitModePath,
+                'record-limit',
+                $utf8NoBom
+            )
             $syntheticGitStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             try {
                 $syntheticGitResult = Invoke-Scanner `
@@ -3650,8 +6214,6 @@ public static class SyntheticGit
                             [System.IO.Path]::PathSeparator +
                             [Environment]::GetEnvironmentVariable('PATH')
                         )
-                        'SYNTHETIC_GIT_ROOT' = $syntheticGitRoot
-                        'SYNTHETIC_GIT_MODE' = 'record-limit'
                     }
             }
             finally {
@@ -3667,16 +6229,19 @@ public static class SyntheticGit
                 Add-Failure 'Excessive Git metadata records exceeded the parser deadline.'
             }
 
+            [System.IO.File]::WriteAllText(
+                $syntheticGitModePath,
+                'empty-record',
+                $utf8NoBom
+            )
             $syntheticEmptyRecordResult = Invoke-Scanner `
                 -ScanPath $syntheticGitRoot `
                 -EnvironmentOverrides @{
                     'PATH' = (
-                        $syntheticGitBin +
-                        [System.IO.Path]::PathSeparator +
-                        [Environment]::GetEnvironmentVariable('PATH')
-                    )
-                    'SYNTHETIC_GIT_ROOT' = $syntheticGitRoot
-                    'SYNTHETIC_GIT_MODE' = 'empty-record'
+                            $syntheticGitBin +
+                            [System.IO.Path]::PathSeparator +
+                            [Environment]::GetEnvironmentVariable('PATH')
+                        )
                 }
             if (
                 $syntheticEmptyRecordResult.ExitCode -eq 0 -or
@@ -3688,19 +6253,25 @@ public static class SyntheticGit
             # 同じscanner runの最初と最後でraw stage outputを変え、contentが
             # 空でもsnapshot equalityが必ずfail closedになることを固定する。
             $snapshotMutationState = Join-Path (
-                $tempRoot
-            ) 'synthetic-git-snapshot-state'
+                $syntheticGitRoot
+            ) '.synthetic-git-state'
+            [System.IO.File]::WriteAllText(
+                $syntheticGitModePath,
+                'snapshot-mutation',
+                $utf8NoBom
+            )
+            Remove-Item `
+                -LiteralPath $snapshotMutationState `
+                -Force `
+                -ErrorAction SilentlyContinue
             $snapshotMutationResult = Invoke-Scanner `
                 -ScanPath $syntheticGitRoot `
                 -EnvironmentOverrides @{
                     'PATH' = (
-                        $syntheticGitBin +
-                        [System.IO.Path]::PathSeparator +
-                        [Environment]::GetEnvironmentVariable('PATH')
-                    )
-                    'SYNTHETIC_GIT_ROOT' = $syntheticGitRoot
-                    'SYNTHETIC_GIT_MODE' = 'snapshot-mutation'
-                    'SYNTHETIC_GIT_STATE' = $snapshotMutationState
+                            $syntheticGitBin +
+                            [System.IO.Path]::PathSeparator +
+                            [Environment]::GetEnvironmentVariable('PATH')
+                        )
                 }
             if (
                 $snapshotMutationResult.ExitCode -eq 0 -or

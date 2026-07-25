@@ -26,7 +26,7 @@
 
 ### Git snapshot と scan 対象
 
-1. ambient の全 `GIT_*` を child から除去し、present-empty と absent を区別する。
+1. child environment は親から複製せず、Windows の OS API 由来 `SystemRoot` だけを共通基底、POSIX は空を基底にする。Git は固定 `GIT_*`、`GCM_INTERACTIVE=Never`、`LC_ALL/LANG=C`、file-reader は固定 PowerShell telemetry/update opt-out と入力 path だけを追加し、`PATH`、temp、home/profile、loader/profiler、credential/token、SSH-agent を継承しない。Git executableは `Get-Command git -CommandType Application` のPATH先頭candidateだけを固定し、rooted regular non-reparse fileを要求する。Windowsの通常hard linkはregular fileとして許可するが、alias/function/script/symbolic link/reparse targetや不適格な先頭candidateから後順位へのfallbackは許可しない。
 2. regular stage-0 blob と安全な current worktree file の union を scan する。
 3. regular non-reparse `.git` gitfileを持つlinked worktree/submoduleは、bounded Git probeでrequested rootとexact一致した場合だけrepository modeとして許可する。broken/dangling/reparse/mismatchを含め、scan rootまたはancestorの`.git` entryからexact rootを確立できない場合はexit 2と固定診断 `Private marker scan failed closed (integrity: git-probe).` でfail closedにする。
 4. 真の non-Git fallback では scan root より下のexact-case `.git` directory/leafだけをcontrol metadataとして除外し、内容を開かない。case-sensitive POSIXの`.GIT`はordinary contentとしてscanする。
@@ -40,9 +40,9 @@
 
 1. stdin/stdout/stderr は byte stream のまま扱い、`0x00`、`0x80`、`0xFF`、partial read/write、EOF、nonzero exit を保持する。
 2. Windows は suspended `CreateProcessW` で起動し、限定 handle list と kill-on-close Job Object へ割り当ててから resume する。
-3. Windows は C# の raw pipe handle を直接読み書きし、PowerShell text `StandardInput` や PowerShell proxy を境界に挟まない。最初の eager production-runner call を AST で固定し、direct/transitive/scope-qualified function call、source内alias、staticなfunction provider / `Get-Command` 参照、直接またはfunction経由の保存scriptblock、risky class constructor/method/cast/static initialization、derived classのdirect/transitive base constructorを追跡する。target function/alias shadow、`Set-Item`/`Set-Content`/`New-Item`のAlias:/Function: provider mutation、bootstrap変数上書き後のdynamic dot-source、`ForEach-Object`/`Where-Object`への保存scriptblock渡し、複合receiverのunknown `.Invoke()`、`Invoke-Expression`、解決不能なdynamic call/lookupは保守的に拒否し、`Get-Command git -CommandType Application` のようなliteral application lookupは許可する。native Git batch response と caller input encoding の不変性で BOM-less transport を実測する。
+3. Windows は C# の raw pipe handle を直接読み書きし、PowerShell text `StandardInput` や PowerShell proxy を境界に挟まない。最初の eager production-runner call を AST で固定し、direct/transitive/scope-qualified function call、source内alias、staticなfunction provider / `Get-Command` 参照、直接またはfunction経由の保存scriptblockとその `Get-Variable`/`gv` 再取得（source内literal alias、early direct/transitive wrapper、lookup-risky wrapperを指すaliasを含む）、risky class constructor/method/cast/static initialization、derived classのdirect/transitive base constructorを追跡する。`Get-Variable`/`gv` はraw fixtureより前にtop-levelのunqualifiedまたは`script:`変数へ一度だけ直接代入され、lookup実行前に代入が完了した、unqualified current-item変数だけのliteral `{ $_ }` / `{ $PSItem }` だけをpositive safe setとして許可する。target function/alias shadow、lookup-name shadow、scope不一致代入、qualified current-item変数、alias import/remove、exactなmodule-qualified bootstrap以外のmodule import/new/`using module`、safe filesystem helperを装うmodule-qualified command、`Set-Item`/`Set-Content`/`New-Item`と`Copy-Item`/`Move-Item`/`Rename-Item`/`Remove-Item`/`Clear-Item`のAlias:/Function: provider mutation、外部PowerShell scriptのdirect/call-operator/dot-source実行、bootstrap変数上書き後のdynamic dot-source、`ForEach-Object`/`Where-Object`への保存scriptblock渡し、複合receiverのunknown `.Invoke()`、`Invoke-Expression`とそのalias、unknown/unbound変数、runtime生成・再代入・variable mutation、deferred IEX/unknown/dynamic call、wildcard/name省略の保存変数lookup、解決不能なdynamic call/lookupは保守的に拒否する。function-local call operatorは一意なliteral scriptblock束縛とbodyのidentity検査を満たす場合だけ許可する。early `Remove-Item` wrapperは固定`Env:` pathまたはSHA-256で固定したbounded fixture cleanup関数だけを例外とし、runner module bootstrapもSHA-256固定source prefixとsibling moduleへの`Microsoft.PowerShell.Core\Import-Module`だけを許可する。lookup以外を指すsafe alias、`Get-Command git -CommandType Application` のようなliteral application lookupは許可する。native Git batch response と caller input encoding の不変性で BOM-less transport を実測する。
 4. Windows の assign/resume/Job cleanup failure は target を実行せず、terminate、wait、pipe/thread/process/Job handle close の全 native result を検査する。Job handleはclose成功前に0化せず1回だけ再試行し、launch cleanupのJob termination失敗時もdirect `TerminateProcess` fallbackを維持する。success pathもpump Task、pipe FileStream、bufferを明示Disposeし、GCを呼ばない40回実行のhandle countをboundedに保つ。
-5. POSIX は trusted `setsid` で新規 process group/session を作り、libc `kill(2)` と direct `WaitForExit` の return を検査して group を終了・確認する。`finally` の termination failure も握り潰さず、pump Task、stream、bufferを明示Disposeする。GCを呼ばない40回実行のfile descriptor countをboundedに保つ。
+5. POSIX は trusted `setsid` で新規 process group/session を作る。固定 `/tmp` 配下へ `mkdir(0700)` した private release gate で shell の ready PID を受け、`getpgid(pid) == pid` を確認した後にだけ one-shot release fileを作ってtargetを`exec`する。release前timeoutではdirect launcherを止め、独立kill-wait内のlate-readyも検証してgroupを終了する。`finally` はlauncher exit後もverified groupをprobeし、既知のready/releaseとnon-recursive gate directoryだけを削除する。libc `kill(2)` と direct `WaitForExit` の return、termination failureを握り潰さず、pump Task、stream、bufferを明示Disposeする。GCを呼ばない40回実行のfile descriptor countをboundedに保つ。
 6. process 単位 timeout に加え、lower-only `1..120000` ms の scan-wide monotonic deadline を全 child/read/parse/serialize と実出力直前へ伝播する。process operationのmonotonic budgetはenvironment準備とprocess launchより前に開始し、termination/cleanupには独立したbounded kill-wait allowanceを使う。exported runnerのpublic numeric parameterはcanonical integerだけを受理し、fractional、exponential、aggregate、overflow、範囲違反を`process-limit-invalid`へ畳む。public scanner deadlineはbinding attributeでなくentrypoint body内で検査し、scannerの固定stdout・空stderr・exit 2境界を維持する。
 
 ### CI workflow
@@ -74,17 +74,17 @@
 - `.env`、`.env.*`、`.npmrc`、`.pem`、`.key`、extensionless file
 - conflict stage、symlink、gitlink、junction/reparse
 - valid linked-worktree gitfileのexact root許可、broken root/ancestor `.git` file/directoryとdangling/reparse `.git`の固定exit 2、nested exact-case `.git`のfallback除外、POSIX `.GIT`のscan
-- ambient/unknown/present-empty `GIT_*`
+- ambient/unknown/present-empty `GIT_*` と、unknown non-Git、loader/profiler、credential/token、SSH-agent environment の非継承
 - scan 中の stage/debug mutation
 - `cat-file --batch` の malformed、short、oversized、missing response
 - hostile/nonexistent path の Unicode/control
 - byte-exact stdin/stdout/stderr、EOF、nonzero exit、partial writes
-- first eager call の AST ownership（target function/alias/Set-Item・Set-Content・New-Item provider shadow、bootstrap path overwrite、未実行／実行済み／scope-qualified／alias経由／static参照／transitive function、未使用／変数保存／function間接保存／ForEach/Where引数 scriptblock、risky class constructor/method/cast/static initializer、derived classのdirect/transitive base constructor、`.Invoke()` / `.InvokeReturnAsIs()` / composite receiver / call operator / `Invoke-Expression`、dynamic lookupのfail closed、literal application lookupの許可）
+- first eager call の AST ownership（target function/alias/Set-Item・Set-Content・New-Item provider shadow、alias import/remove、module import/new/usingとexact bootstrap proof、Copy/Move/Rename/Remove/Clear provider identity、外部PowerShell scriptのdirect/call/dot-source実行、function-local literal scriptblock call proof、bootstrap path overwrite、未実行／実行済み／scope-qualified／alias経由／static参照／transitive function、未使用／変数保存／function間接保存／`Get-Variable`/`gv` のpositive safe assignmentとassignment/current-item scope、unknown/unbound/runtime生成/再代入/IEX/unresolved/wildcard/name省略、source内alias・wrapper・wrapper alias・代入順序伝播／ForEach/Where引数 scriptblock、risky class constructor/method/cast/static initializer、derived classのdirect/transitive base constructor、`.Invoke()` / `.InvokeReturnAsIs()` / composite receiver / call operator / `Invoke-Expression`とalias、dynamic lookupのfail closed、literal application lookupの許可）
 - native Git batch の binary blob、BOM-less stdin、caller `Console.InputEncoding` 復元
 - descendant escape、pre-launchを含むoperation timeout、独立したcleanup allowance、stdout/stderr cap
 - Windows assign/resume failure の PID 消失と未実行 sentinel
 - Windows Job termination/close failure のdirect process fallback、handle保持、bounded close retry
-- Windows success 40回・GC未実行のpump/pipe/thread handle安定性とPOSIX file descriptor安定性
+- Windows success 40回・GC未実行のpump/pipe/thread handle安定性、POSIX file descriptor安定性、direct-delay/fork-delay fake `setsid` がrelease前にtargetを実行せずlate groupとprivate gateを残さないこと
 - helper欠落／helper例外／Git isolation create/remove失敗の固定redacted stdout、空stderr、exit 2
 - lower-only scan-wide deadline の bounded runtimeとpublic numeric parameter（fractional/exponential/aggregate/overflow/範囲違反）の固定diagnostic
 - final output byte boundary（実 OS newline 込み）
@@ -110,6 +110,6 @@
 
 ## Handoff
 
-- 現在: 実装・契約同期・Windows/Ubuntu 実測済み、静的 gate と独立 review 待ち
-- commit / push / PR: source freeze 後の独立 review 0 まで禁止
+- 現在: pushed base `eb257d1` の独立 review で検出した child environment / `Get-Variable` / alias・provider・外部script・module load実行境界を実装・契約同期した。最新code treeはWindows PS7 / PS5.1 / Ubuntuのreadiness・full self-test・repository scan、AST / YAML / diff / Gitleaks / applicable generic Semgrep gateを実測済み。PSScriptAnalyzerは未導入のため未確認。
+- commit / push / PR: base `eb257d1` はpush済み。追補treeは対象8ファイルだけをexact stageし、commit / push / PRせず統合担当へ引き継ぐ。
 - external cost / OAuth / secret / real data: 使用しない

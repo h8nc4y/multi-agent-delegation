@@ -76,12 +76,27 @@ Explicit non-Git scans enumerate one directory level at a time and reject
 links or reparse points before traversal. Content reads use a bounded child so
 special files and replacement races fail without blocking the parent scanner.
 
-Git runs in a bounded child process with ambient `GIT_*` values removed and
-machine/global/system config, hooks, attributes, excludes, templates, prompts,
-and trace output isolated. Windows assigns a suspended process to a
-kill-on-close Job Object before resuming it; Linux uses trusted `setsid` and
-checked process-group termination and re-wait. Windows launch cleanup also
-checks termination, wait, and every owned pipe/thread/process/Job handle-close
+Git and file-reader children start from a fixed minimal environment rather than
+inheriting the scanner process. Windows receives only an OS-derived
+`SystemRoot`; POSIX receives no ambient values. Git adds explicit `GIT_*`,
+`GCM_INTERACTIVE=Never`, and locale controls, while the reader adds fixed
+PowerShell telemetry/update opt-outs and one input path. `PATH`, temp,
+home/profile, loader/profiler, credential/token, and SSH-agent variables are not
+inherited. Git machine/global/system config, hooks, attributes, excludes,
+templates, prompts, and trace output remain isolated. Git resolution fixes the
+first native-application PATH candidate and requires a rooted regular
+non-reparse file; ordinary Windows hard links are allowed, while aliases,
+functions, scripts, symbolic links, and reparse targets fail closed. Windows
+assigns a suspended process to a kill-on-close Job Object before resuming it;
+Linux uses
+trusted `setsid` behind an owner-only fixed-`/tmp` release gate. The parent
+reads the gate shell PID, verifies `getpgid(pid) == pid`, and only then creates
+the release file that permits target `exec`. An unreleased timeout kills the
+direct launcher, boundedly probes a late ready file, terminates any verified
+group, and removes only the private known gate entries. Final cleanup probes
+the verified group even after launcher exit. Windows
+launch cleanup also checks termination, wait, and every owned
+pipe/thread/process/Job handle-close
 result. Raw stdin/stdout/stderr, child-output caps, the final 64 KiB UTF-8
 report, and the lower-only two-minute scan deadline are enforced without
 line-ending assumptions. The child-operation budget begins before environment
@@ -99,12 +114,32 @@ on Windows, and PowerShell 7 on Ubuntu 24.04. Windows uses direct raw C# pipe
 handles rather than PowerShell's text stdin writer; the first eager runner
 call is AST-validated through direct/transitive and scope-qualified function
 calls, in-source aliases, static function references, and later direct or
-function-indirect stored-scriptblock references. Target-name shadowing, risky
-class construction/method calls/casts/static initialization, Alias:/Function:
-provider mutation through `Set-Item`, `Set-Content`, or `New-Item`, dynamic
-bootstrap dot-sourcing, command-argument scriptblocks, composite receiver
-invocation, runtime expressions, and dynamic calls/lookups
-fail closed while a literal application lookup remains accepted. Job cleanup
+function-indirect stored-scriptblock references. `Get-Variable`/`gv` recovery
+is accepted only for a uniquely assigned top-level unqualified or `script:`
+variable whose literal value is exactly `{ $_ }` or `{ $PSItem }` with an
+unqualified current-item variable, and whose assignment completes before the
+eager call; that positive proof propagates through in-source aliases, early
+direct/transitive wrappers, and aliases to those wrappers. Shadowed lookup names
+remain fail closed. Target-name shadowing, risky class construction/method
+calls/casts/static initialization, Alias:/Function: provider mutation through
+`Set-Item`, `Set-Content`, or `New-Item`, dynamic bootstrap dot-sourcing,
+command-argument scriptblocks, composite receiver invocation, runtime
+expressions, unknown or unbound variables, runtime-created or reassigned
+scriptblocks, scope-mismatched assignments, qualified current-item variables,
+variable mutation, deferred IEX/unknown/dynamic calls,
+risk-sensitive command aliases, alias import/remove, module
+import/new/`using module` outside the exact module-qualified bootstrap,
+module-qualified commands impersonating an approved filesystem helper,
+Alias:/Function: provider copy/move/rename/remove/clear, external PowerShell
+script execution, unbound call-operator targets, and wildcard or unnamed
+lookups fail closed. Function-local call-operator targets are accepted only
+when uniquely bound to a literal scriptblock whose body passes the same
+identity checks. The explicitly proven
+safe-scriptblock lookup and literal application lookups remain accepted. The
+only early `Remove-Item` wrapper exceptions are a fixed `Env:` path and the
+exact SHA-256-pinned bounded fixture-cleanup function. The runner bootstrap is
+also fixed to a SHA-256-pinned source prefix and the module-qualified import of
+the sibling runner module. Job cleanup
 retains a handle until close succeeds, retries once, and keeps a direct-process
 fallback when Job termination fails. Entry/helper/isolation exceptions are
 reduced to fixed redacted exit-2 diagnostics. A native Git batch response proves

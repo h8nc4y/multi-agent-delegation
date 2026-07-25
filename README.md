@@ -220,16 +220,39 @@ repository-root/probe failures, snapshot mutation, a hostile Git environment,
 present-empty removal and preservation, redaction, exact byte transport,
 native Git batch bytes without a BOM, caller input-encoding preservation,
 outside-artifact prevention, and bounded child-tree/output-pipe termination.
+On POSIX it also injects direct-delay and fork-delay `setsid` launchers to
+prove that no target runs before a verified process-group release and that a
+late group is removed without leaving its private gate directory.
 An AST regression requires the raw binary fixture to remain the first eager
 production-runner call, including against deferred scriptblocks and
 `ScriptBlock.Invoke*()` cases. Function call graphs, scope-qualified calls,
 in-source aliases, static function-provider/`Get-Command` references, and later
 references to direct or function-indirect stored scriptblocks are followed
-before that fixture. Target-name function/alias shadowing, invoked risky class
+before that fixture. `Get-Variable`/`gv` recovery is fail closed unless its
+literal target is a uniquely assigned top-level, unqualified or `script:`
+variable whose value is exactly `{ $_ }` or `{ $PSItem }` with an unqualified
+current-item variable, and that assignment completes before the eager call.
+This positive proof propagates through in-source aliases, early
+direct/transitive wrappers, and aliases to those wrappers. Unknown or unbound
+targets, runtime-created or reassigned scriptblocks, scope-mismatched
+assignments, qualified current-item variables, variable mutation, deferred
+IEX/unknown/dynamic calls, risk-sensitive command aliases, alias import/remove,
+module import/new/`using module` outside the exact module-qualified bootstrap,
+Alias:/Function: provider copy/move/rename/remove/clear, external PowerShell
+script execution, unbound call-operator targets, wildcards, and omitted names
+are rejected. A function-local call-operator target is accepted only when it is
+uniquely bound to a literal scriptblock whose body passes the same identity
+checks. Shadowed lookup names remain fail closed because their runtime identity
+cannot be proven. Target-name function/alias shadowing, invoked risky class
 constructors/methods, derived classes with a risky direct or transitive base
 constructor, `Invoke-Expression`, and unresolved dynamic calls/lookups fail
-conservatively. A literal application lookup such as
-`Get-Command git -CommandType Application` remains allowed. Scanner
+conservatively. An unused lookup wrapper and the explicitly proven safe
+scriptblock lookup remain allowed. A literal application lookup such as
+`Get-Command git -CommandType Application` remains allowed. The only early
+`Remove-Item` wrapper exceptions are a fixed `Env:` path and the exact
+SHA-256-pinned bounded fixture-cleanup function. The runner module bootstrap is
+likewise limited to the SHA-256-pinned source prefix and
+`Microsoft.PowerShell.Core\Import-Module` of the sibling runner module. Scanner
 entry/helper/isolation failures return one fixed redacted stdout line, empty
 stderr, and exit code 2. Workflow validation fixes the top-level triggers,
 read-only permission, two job IDs, job-local permission absence, exact steps,
@@ -266,12 +289,21 @@ and remains in the fallback scan. Index metadata is capped at 8 MiB and 4,096 en
 metadata and batch responses are parsed incrementally and validated against the
 exact request order.
 
-Each Git command receives a child environment cloned from — but isolated from
-— the scanner process. The scanner removes all ambient `GIT_*` values before
-adding only non-interactive, read-only settings and empty global/system config,
-hooks, attributes, excludes, and template paths. This prevents repository,
-index, object, config, execution, prompt, or trace overrides from changing the
-tracked scan or writing outside its temporary isolation directory.
+Each child starts from a fixed minimal environment instead of a clone of the
+scanner process. Windows receives only an OS-derived `SystemRoot`; POSIX
+receives no ambient values. Git then receives only explicit non-interactive,
+read-only `GIT_*` settings, `GCM_INTERACTIVE=Never`, locale `C`, and empty
+global/system config, hooks, attributes, excludes, and template paths. The file
+reader receives only fixed PowerShell telemetry/update opt-outs and the
+selected input path. `PATH`, temp, home/profile, loader/profiler, cloud
+credential, token, and SSH-agent variables are not inherited. This prevents
+external helpers and repository, index, object, config, execution, prompt, or
+trace overrides from changing the tracked scan or writing outside its
+temporary isolation directory.
+The scanner resolves `git` only as a native application, fixes the first PATH
+candidate, and requires a rooted regular non-reparse file. A normal Windows
+hard link remains a regular file; aliases, functions, scripts, symbolic links,
+and junction/reparse targets are not accepted.
 Lazy promisor fetches and replacement refs are disabled, and protocol and
 credential-helper use is denied, so a missing blob fails locally instead of
 starting a remote helper or substituting different content. Git 2.43 emits
@@ -285,10 +317,16 @@ enforce output caps. Windows starts each process suspended, attaches it to a
 kill-on-close Job Object with an explicit inherited-handle list, then resumes
 it. Launch-failure cleanup checks Job/process termination, bounded waits, and
 every owned pipe/thread/process/Job handle close. Linux starts a new session
-through trusted `setsid` and terminates the whole process group with checked
-`kill(2)` and direct re-wait results. Other POSIX environments without one of
-the trusted `setsid` paths fail closed instead of silently falling back to
-parent-only termination. The Windows path writes raw pipe handles from C#
+through trusted `setsid`. An owner-only gate under fixed `/tmp` records the
+new session leader, and the parent verifies `getpgid(pid) == pid` before it
+creates the one-shot release file that permits `exec`. Timeout or launch
+failure before that point never releases the target; direct-launcher exit is
+followed by a bounded late-ready probe and checked process-group termination.
+Final cleanup probes the verified group even when the direct launcher has
+already exited, then removes only the known gate files and non-recursive
+directory. Other POSIX environments without one of the trusted `setsid` paths
+fail closed instead of silently falling back to parent-only termination. The
+Windows path writes raw pipe handles from C#
 after direct `CreateProcessW`; it does not pass bytes through PowerShell's
 text `StandardInput` writer or require a PowerShell proxy. The self-test sends
 an arbitrary binary fixture first, then compares a native
@@ -298,8 +336,12 @@ Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
 buffers. Forty-run no-GC regressions bound Windows process-handle growth and
 POSIX file-descriptor growth.
 The first-call AST gate also rejects Alias:/Function: mutations through
-`Set-Item`, `Set-Content`, or `New-Item`, dynamic bootstrap dot-sourcing,
-composite `.Invoke()` receivers, and risky class casts/static initialization.
+`Set-Item`, `Set-Content`, `New-Item`, provider copy/move/rename/remove/clear,
+alias import/remove, unapproved module loading,
+direct/call-operator/dot-sourced PowerShell scripts,
+dynamic bootstrap dot-sourcing, composite `.Invoke()` receivers, risky class
+casts/static initialization, and literal or dynamic `Get-Variable` recovery of
+a risky stored scriptblock.
 
 Explicit non-Git fixture directories use a one-level-at-a-time working-tree
 walk. Links and reparse points are rejected before traversal or content reads.
