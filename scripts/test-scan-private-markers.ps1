@@ -5327,37 +5327,63 @@ exit 0
 
     if ($isWindowsPlatform) {
         # GCへpipe/FileStream/Task handle回収を委ねる実装は成功ごとにhandleが
-        # 単調増加する。.NET FrameworkのThreadPoolは同期anonymous-pipe読取を
-        # 最初の継続負荷で段階的に増員するため、1回だけのwarm-upではruntimeが
-        # 所有するworker-thread handleをproduction runnerの漏れと誤認し得る。
-        # 測定と同じ40回でThreadPoolを事前調整した後、別の40回をGCなしで測り、
-        # runner所有handleが反復ごとに増える回帰は従来の閾値で検出し続ける。
+        # 単調増加する。Windows PowerShell 5.1では最初の継続負荷だけhandleが
+        # 増えることがあるため、startupとsteady-stateを別windowで測る。
+        # aggregate HandleCountだけでruntime threadとrunner漏れを断定しない。
+        # startupにも上限を設け、継続的なrunner所有handle漏れは最初の40回から
+        # 検出する。次の40回は従来のより厳しい閾値を維持する。
         $handleProbeTarget = Join-Path (
             [Environment]::SystemDirectory
         ) 'cmd.exe'
         $handleProbeArguments = @('/d', '/c', 'exit', '0')
         $handleWarmupRuns = 40
         $handleMeasuredRuns = 40
-        for ($handleWarmupAttempt = 0; $handleWarmupAttempt -lt $handleWarmupRuns; $handleWarmupAttempt++) {
-            $handleWarmupResult = Invoke-PrivateMarkerBoundedProcess `
-                -FilePath $handleProbeTarget `
-                -Arguments $handleProbeArguments `
-                -WorkingDirectory $root `
-                -EnvironmentVariables (New-RunnerTestEnvironment) `
-                -TimeoutMilliseconds 10000
-            if (
-                $handleWarmupResult.ExitCode -ne 0 -or
-                $handleWarmupResult.StandardOutputBytes.Length -ne 0 -or
-                $handleWarmupResult.StandardErrorBytes.Length -ne 0
-            ) {
-                Add-Failure 'Expected every Windows handle-stability warm-up child to exit cleanly.'
-                break
-            }
-        }
+        $handleStartupGrowthLimit = 16
+        $handleMeasuredFinalGrowthLimit = 4
+        $handleMeasuredPeakGrowthLimit = 8
         $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
         try {
             $handleProbeProcess.Refresh()
-            $handleBaseline = $handleProbeProcess.HandleCount
+            $handleStartupBaseline = $handleProbeProcess.HandleCount
+            $handleWarmupFinal = $handleStartupBaseline
+            $handleWarmupMaximum = $handleStartupBaseline
+            for ($handleWarmupAttempt = 0; $handleWarmupAttempt -lt $handleWarmupRuns; $handleWarmupAttempt++) {
+                $handleWarmupResult = Invoke-PrivateMarkerBoundedProcess `
+                    -FilePath $handleProbeTarget `
+                    -Arguments $handleProbeArguments `
+                    -WorkingDirectory $root `
+                    -EnvironmentVariables (New-RunnerTestEnvironment) `
+                    -TimeoutMilliseconds 10000
+                if (
+                    $handleWarmupResult.ExitCode -ne 0 -or
+                    $handleWarmupResult.StandardOutputBytes.Length -ne 0 -or
+                    $handleWarmupResult.StandardErrorBytes.Length -ne 0
+                ) {
+                    Add-Failure 'Expected every Windows handle-stability warm-up child to exit cleanly.'
+                    break
+                }
+                $handleProbeProcess.Refresh()
+                $handleWarmupFinal = $handleProbeProcess.HandleCount
+                $handleWarmupMaximum = [Math]::Max(
+                    $handleWarmupMaximum,
+                    $handleWarmupFinal
+                )
+            }
+            if (
+                ($handleWarmupFinal - $handleStartupBaseline) -gt
+                    $handleStartupGrowthLimit -or
+                ($handleWarmupMaximum - $handleStartupBaseline) -gt
+                    $handleStartupGrowthLimit
+            ) {
+                Add-Failure (
+                    "Expected $handleWarmupRuns Windows startup runs without GC to keep process " +
+                    "handles bounded (baseline=$handleStartupBaseline, " +
+                    "final=$handleWarmupFinal, max=$handleWarmupMaximum, " +
+                    "limit=$handleStartupGrowthLimit)."
+                )
+            }
+
+            $handleBaseline = $handleWarmupFinal
             $handleMaximum = $handleBaseline
             $handleFinal = $handleBaseline
             for ($handleAttempt = 0; $handleAttempt -lt $handleMeasuredRuns; $handleAttempt++) {
@@ -5383,8 +5409,10 @@ exit 0
                 )
             }
             if (
-                ($handleFinal - $handleBaseline) -gt 4 -or
-                ($handleMaximum - $handleBaseline) -gt 8
+                ($handleFinal - $handleBaseline) -gt
+                    $handleMeasuredFinalGrowthLimit -or
+                ($handleMaximum - $handleBaseline) -gt
+                    $handleMeasuredPeakGrowthLimit
             ) {
                 Add-Failure (
                     "Expected $handleMeasuredRuns Windows success runs without GC to keep process " +
@@ -5393,8 +5421,12 @@ exit 0
                 )
             }
             $windowsHandleProbeEvidence = (
-                "baseline=$handleBaseline, final=$handleFinal, " +
-                "max=$handleMaximum, warmup=$handleWarmupRuns, " +
+                "startup-baseline=$handleStartupBaseline, " +
+                "startup-final=$handleWarmupFinal, " +
+                "startup-max=$handleWarmupMaximum, " +
+                "startup-limit=$handleStartupGrowthLimit, " +
+                "warmup=$handleWarmupRuns, baseline=$handleBaseline, " +
+                "final=$handleFinal, max=$handleMaximum, " +
                 "runs=$handleMeasuredRuns, gc=not-invoked"
             )
         }

@@ -335,10 +335,12 @@ an arbitrary binary fixture first, then compares a native
 `git cat-file --batch` response byte-for-byte and confirms that the caller's
 `Console.InputEncoding` code page and preamble are unchanged on return.
 Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
-buffers. Windows first runs a forty-invocation preconditioning window so
-Windows PowerShell 5.1 can finish bounded ThreadPool hill-climbing, then a
-separate forty-run no-GC regression bounds runner-owned process-handle growth.
-POSIX keeps its forty-run no-GC file-descriptor regression.
+buffers. Windows measures a forty-invocation startup window with a bounded
+aggregate handle-growth allowance, then applies tighter final and peak limits
+to a separate forty-run steady-state window. Both windows run without forcing
+GC; the split avoids attributing startup-only runtime growth to a per-call leak
+while still bounding it. POSIX keeps its forty-run no-GC file-descriptor
+regression.
 The first-call AST gate also rejects Alias:/Function: mutations through
 `Set-Item`, `Set-Content`, `New-Item`, provider copy/move/rename/remove/clear,
 alias import/remove, unapproved module loading,

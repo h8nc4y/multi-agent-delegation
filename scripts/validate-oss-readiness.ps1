@@ -75,6 +75,128 @@ function Assert-FileDoesNotContain {
     }
 }
 
+function Test-WindowsHandleProbeContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source
+    )
+
+    # loop headerだけの正規表現では、runner呼出しをbody外へ移動または削除した
+    # no-op実装を見抜けない。ASTで2つのfor bodyを特定し、各windowが実際に
+    # process実行とhandle更新を所有することをextent内で検査する。
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput(
+        $Source,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($parseErrors.Count -ne 0) {
+        return $false
+    }
+
+    $forStatements = @(
+        $ast.FindAll(
+            {
+                param($node)
+                $node -is [System.Management.Automation.Language.ForStatementAst]
+            },
+            $true
+        )
+    )
+    $warmupLoops = @(
+        $forStatements |
+            Where-Object {
+                $_.Condition.Extent.Text -match (
+                    '^\s*\$handleWarmupAttempt\s*-lt\s*' +
+                    '\$handleWarmupRuns\s*$'
+                )
+            }
+    )
+    $measuredLoops = @(
+        $forStatements |
+            Where-Object {
+                $_.Condition.Extent.Text -match (
+                    '^\s*\$handleAttempt\s*-lt\s*' +
+                    '\$handleMeasuredRuns\s*$'
+                )
+            }
+    )
+    if ($warmupLoops.Count -ne 1 -or $measuredLoops.Count -ne 1) {
+        return $false
+    }
+
+    $warmupLoop = $warmupLoops[0]
+    $measuredLoop = $measuredLoops[0]
+    if (
+        $warmupLoop.Extent.StartOffset -ge
+            $measuredLoop.Extent.StartOffset
+    ) {
+        return $false
+    }
+
+    # sourceをASTの境界で分割し、startup baseline → warm-up body →
+    # startup上限 → steady-state body → steady-state上限の順序も固定する。
+    $prefix = $Source.Substring(0, $warmupLoop.Extent.StartOffset)
+    $warmupBody = $warmupLoop.Extent.Text
+    $between = $Source.Substring(
+        $warmupLoop.Extent.EndOffset,
+        $measuredLoop.Extent.StartOffset - $warmupLoop.Extent.EndOffset
+    )
+    $measuredBody = $measuredLoop.Extent.Text
+    $suffix = $Source.Substring($measuredLoop.Extent.EndOffset)
+
+    $prefixContract = (
+        '(?s)' +
+        '\$handleWarmupRuns\s*=\s*40.*?' +
+        '\$handleMeasuredRuns\s*=\s*40.*?' +
+        '\$handleStartupGrowthLimit\s*=\s*16.*?' +
+        '\$handleMeasuredFinalGrowthLimit\s*=\s*4.*?' +
+        '\$handleMeasuredPeakGrowthLimit\s*=\s*8.*?' +
+        '\$handleProbeProcess\s*=\s*' +
+        '\[System\.Diagnostics\.Process\]::GetCurrentProcess\(\).*?' +
+        '\$handleStartupBaseline\s*=\s*' +
+        '\$handleProbeProcess\.HandleCount'
+    )
+    $warmupBodyContract = (
+        '(?s)' +
+        '\$handleWarmupResult\s*=\s*Invoke-PrivateMarkerBoundedProcess.*?' +
+        '\$handleProbeProcess\.Refresh\(\).*?' +
+        '\$handleWarmupFinal\s*=\s*\$handleProbeProcess\.HandleCount.*?' +
+        '\$handleWarmupMaximum\s*=\s*\[Math\]::Max\('
+    )
+    $betweenContract = (
+        '(?s)' +
+        '\(\$handleWarmupFinal\s*-\s*\$handleStartupBaseline\)\s*' +
+        '-gt\s*\$handleStartupGrowthLimit.*?' +
+        '\(\$handleWarmupMaximum\s*-\s*\$handleStartupBaseline\)\s*' +
+        '-gt\s*\$handleStartupGrowthLimit.*?' +
+        '\$handleBaseline\s*=\s*\$handleWarmupFinal'
+    )
+    $measuredBodyContract = (
+        '(?s)' +
+        '\$handleProbeResult\s*=\s*Invoke-PrivateMarkerBoundedProcess.*?' +
+        '\$handleProbeProcess\.Refresh\(\).*?' +
+        '\$handleFinal\s*=\s*\$handleProbeProcess\.HandleCount.*?' +
+        '\$handleMaximum\s*=\s*\[Math\]::Max\('
+    )
+    $suffixContract = (
+        '(?s)' +
+        '\(\$handleFinal\s*-\s*\$handleBaseline\)\s*' +
+        '-gt\s*\$handleMeasuredFinalGrowthLimit.*?' +
+        '\(\$handleMaximum\s*-\s*\$handleBaseline\)\s*' +
+        '-gt\s*\$handleMeasuredPeakGrowthLimit'
+    )
+
+    return (
+        $prefix -match $prefixContract -and
+        $warmupBody -match $warmupBodyContract -and
+        $between -match $betweenContract -and
+        $measuredBody -match $measuredBodyContract -and
+        $suffix -match $suffixContract
+    )
+}
+
 function Test-StringSequenceEqual {
     param(
         [AllowEmptyCollection()]
@@ -993,10 +1115,96 @@ Assert-FileContains `
     -RelativePath 'scripts/private-marker-process-runner.psm1' `
     -Pattern '(?s)ConvertTo-PrivateMarkerBoundedInteger.*?\^\[0-9\]\+\$.*?\[object\]\$TimeoutMilliseconds.*?\[object\]\$KillWaitMilliseconds.*?\[object\]\$MaxStandardOutputBytes.*?\[object\]\$MaxStandardErrorBytes' `
     -Description 'raw integer validation for exported runner numeric arguments'
-Assert-FileContains `
-    -RelativePath 'scripts/test-scan-private-markers.ps1' `
-    -Pattern '(?s)\$handleWarmupRuns\s*=\s*40.*?\$handleMeasuredRuns\s*=\s*40.*?\$handleWarmupAttempt\s*=\s*0.*?\$handleWarmupAttempt\s*-lt\s*\$handleWarmupRuns.*?HandleCount.*?\$handleAttempt\s*=\s*0.*?\$handleAttempt\s*-lt\s*\$handleMeasuredRuns.*?\(\$handleFinal\s*-\s*\$handleBaseline\)\s*-gt\s*4.*?\(\$handleMaximum\s*-\s*\$handleBaseline\)\s*-gt\s*8' `
-    -Description 'preconditioned forty-run Windows handle stability regression without GC'
+$windowsHandleProbePath = Get-RepoFilePath `
+    -RelativePath 'scripts/test-scan-private-markers.ps1'
+if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
+    Add-Failure 'Cannot inspect missing Windows handle stability regression.'
+} else {
+    $windowsHandleProbeSource = Get-Content `
+        -LiteralPath $windowsHandleProbePath `
+        -Raw
+    if (
+        -not (
+            Test-WindowsHandleProbeContract `
+                -Source $windowsHandleProbeSource
+        )
+    ) {
+        Add-Failure (
+            'scripts/test-scan-private-markers.ps1 is missing: ' +
+            'bounded startup and steady-state Windows handle regressions without GC'
+        )
+    }
+}
+
+# 変数名とloop headerだけを残したno-op実装をpositiveにしないことも固定する。
+# validator自身のAST契約が弱体化すると、production runnerを一度も呼ばない検査が
+# readinessを通過できるため、最小のnegative controlを同じ場所で実行する。
+$windowsHandleProbeNoOpFixture = @'
+$handleWarmupRuns = 40
+$handleMeasuredRuns = 40
+$handleStartupGrowthLimit = 16
+$handleMeasuredFinalGrowthLimit = 4
+$handleMeasuredPeakGrowthLimit = 8
+$handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
+$handleStartupBaseline = $handleProbeProcess.HandleCount
+for ($handleWarmupAttempt = 0; $handleWarmupAttempt -lt $handleWarmupRuns; $handleWarmupAttempt++) {
+}
+if (($handleWarmupFinal - $handleStartupBaseline) -gt $handleStartupGrowthLimit -or
+    ($handleWarmupMaximum - $handleStartupBaseline) -gt $handleStartupGrowthLimit) {
+}
+$handleBaseline = $handleWarmupFinal
+for ($handleAttempt = 0; $handleAttempt -lt $handleMeasuredRuns; $handleAttempt++) {
+}
+if (($handleFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
+    ($handleMaximum - $handleBaseline) -gt $handleMeasuredPeakGrowthLimit) {
+}
+'@
+if (
+    Test-WindowsHandleProbeContract `
+        -Source $windowsHandleProbeNoOpFixture
+) {
+    Add-Failure 'Windows handle readiness AST contract accepts a no-op probe.'
+}
+
+# runner呼出しとhandle更新を各loop直後へ逃がした場合も、token順だけなら
+# positiveに見える。AST extent検査がbody所属を要求していることを明示する。
+$windowsHandleProbeScopeEscapeFixture = @'
+$handleWarmupRuns = 40
+$handleMeasuredRuns = 40
+$handleStartupGrowthLimit = 16
+$handleMeasuredFinalGrowthLimit = 4
+$handleMeasuredPeakGrowthLimit = 8
+$handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
+$handleProbeProcess.Refresh()
+$handleStartupBaseline = $handleProbeProcess.HandleCount
+for ($handleWarmupAttempt = 0; $handleWarmupAttempt -lt $handleWarmupRuns; $handleWarmupAttempt++) {
+}
+$handleWarmupResult = Invoke-PrivateMarkerBoundedProcess
+$handleProbeProcess.Refresh()
+$handleWarmupFinal = $handleProbeProcess.HandleCount
+$handleWarmupMaximum = [Math]::Max($handleWarmupMaximum, $handleWarmupFinal)
+if (($handleWarmupFinal - $handleStartupBaseline) -gt $handleStartupGrowthLimit -or
+    ($handleWarmupMaximum - $handleStartupBaseline) -gt $handleStartupGrowthLimit) {
+}
+$handleBaseline = $handleWarmupFinal
+for ($handleAttempt = 0; $handleAttempt -lt $handleMeasuredRuns; $handleAttempt++) {
+}
+$handleProbeResult = Invoke-PrivateMarkerBoundedProcess
+$handleProbeProcess.Refresh()
+$handleFinal = $handleProbeProcess.HandleCount
+$handleMaximum = [Math]::Max($handleMaximum, $handleFinal)
+if (($handleFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
+    ($handleMaximum - $handleBaseline) -gt $handleMeasuredPeakGrowthLimit) {
+}
+'@
+if (
+    Test-WindowsHandleProbeContract `
+        -Source $windowsHandleProbeScopeEscapeFixture
+) {
+    Add-Failure (
+        'Windows handle readiness AST contract accepts loop-body scope escape.'
+    )
+}
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
     -Pattern '(?s)/proc/\$PID/fd.*?\$fdAttempt\s*=\s*0.*?\$fdAttempt\s*-lt\s*40' `

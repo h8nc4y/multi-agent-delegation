@@ -85,10 +85,11 @@ The format loosely follows Keep a Changelog conventions.
   redacted stdout line with empty stderr and exit code 2.
 - Explicitly dispose Windows and POSIX success-path pump Tasks, pipe streams,
   and buffers instead of relying on GC. The Windows regression now
-  preconditions the Windows PowerShell 5.1 ThreadPool for 40 invocations before
-  measuring a separate 40-run no-GC handle-count window, avoiding runtime
-  hill-climbing false positives without widening the owned-handle threshold;
-  the POSIX 40-run no-GC file-descriptor regression remains unchanged.
+  bounds aggregate handle growth across a 40-invocation startup window before
+  applying tighter final and peak limits to a separate 40-run steady-state
+  window. Both run without forced GC, so startup-only runtime growth is not
+  misreported as a per-call leak or absorbed without a limit; the POSIX 40-run
+  no-GC file-descriptor regression remains unchanged.
   Exported runner numeric
   arguments, including fractional and overflow inputs, are body-validated into
   a fixed `process-limit-invalid` exception instead of coercion or
