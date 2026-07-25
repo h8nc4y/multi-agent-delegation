@@ -46,8 +46,8 @@ pwsh -NoProfile -File .\scripts\test-scan-private-markers.ps1
 pwsh -NoProfile -File .\scripts\scan-private-markers.ps1
 ```
 
-On macOS, Linux, or any POSIX shell with PowerShell 7 (`pwsh`) installed, use
-forward slashes:
+On Linux with PowerShell 7 (`pwsh`) and trusted `setsid` at
+`/usr/bin/setsid` or `/bin/setsid`, use forward slashes:
 
 ```bash
 pwsh -NoProfile -File ./scripts/validate-oss-readiness.ps1
@@ -58,12 +58,24 @@ pwsh -NoProfile -File ./scripts/scan-private-markers.ps1
 The self-test deliberately reuses the host that launched it: a
 `powershell.exe` run validates Windows PowerShell 5.1, while a `pwsh` run
 validates PowerShell 7. Every scanner and Git child process has a finite
-timeout and bounded termination path. Git fixture commands use a sanitized
-child environment; do not replace that boundary with parent-process
-environment mutation. Repository scans are defined by regular stage-0 index
-blobs with lazy fetches and replacement refs disabled; do not replace them
-with working-tree path reads. Non-Git fixture scans must reject links/reparse
-points before traversal and keep content reads in a bounded child.
+timeout and bounded termination path, and each scan has a lower-only 120-second
+monotonic deadline whose invalid values are checked inside the fixed-diagnostic
+entrypoint boundary. Git fixture commands use a sanitized child environment; do not
+replace that boundary with parent-process environment mutation. Repository
+scans are defined by a byte-stable union of regular stage-0 index blobs and
+safe current-worktree content, including intent-to-add files. Preserve the
+single strictly framed `git cat-file --batch` read, before/after raw snapshot
+equality, lazy-fetch/replacement-ref denial, and reparse checks. Non-Git fixture
+scans must reject links/reparse points before traversal and keep content reads
+in a bounded child. Preserve exact-case `.git` exclusion on POSIX and bounded
+exact-root support for regular linked-worktree/submodule gitfiles. Keep the AST-validated first runner call as the binary
+transport fixture and keep its native Git batch/BOM/input-encoding regression;
+the Windows runner intentionally uses direct C# pipe handles instead of
+PowerShell text stdin and explicitly disposes completed pump/stream resources.
+Do not expand workflow triggers or permissions, add
+jobs/steps, or replace full commit SHA action pins without updating the exact
+workflow contract and its mutation tests. Windows and Ubuntu CI jobs are both
+limited to 25 minutes.
 
 ## Pull Request Expectations
 
