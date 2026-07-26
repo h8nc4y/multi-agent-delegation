@@ -52,8 +52,14 @@ try {
     $handleWarmupRuns = 40
     $handleMeasuredRuns = 40
     $handleStartupGrowthLimit = 16
+    # HandleCountはrunner所有handleだけでなく、Windows PowerShell runtimeの
+    # 一時handleも同じaggregateへ含む。native close resultはrunner側で別途
+    # 全件検査し、ここでは40回後も残る増加を従来どおり4で検出する。終了後の
+    # bounded sampleで解消するruntime揺らぎだけをsettled finalから除外する。
     $handleMeasuredFinalGrowthLimit = 4
-    $handleMeasuredPeakGrowthLimit = 8
+    $handleMeasuredPeakGrowthLimit = 12
+    $handleQuiescenceSamples = 10
+    $handleQuiescenceWaitMilliseconds = 50
     $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
     $handleProbeProcess.Refresh()
     $handleStartupBaseline = $handleProbeProcess.HandleCount
@@ -128,15 +134,37 @@ try {
             $handleFinal
         )
     }
+
+    # childを追加実行せず、GCも呼ばないbounded quiescenceでruntime由来の
+    # 遅延closeだけを観測する。runner所有native handleが持続して残る場合は
+    # 全sampleで減らないため、従来のfinal上限4を超えてfailする。
+    $handleObservedFinal = $handleFinal
+    $handleSettledFinal = $handleFinal
+    for (
+        $handleQuiescenceAttempt = 0;
+        $handleQuiescenceAttempt -lt $handleQuiescenceSamples;
+        $handleQuiescenceAttempt++
+    ) {
+        [System.Threading.Thread]::Sleep(
+            $handleQuiescenceWaitMilliseconds
+        )
+        $handleProbeProcess.Refresh()
+        $handleQuiescenceSample = $handleProbeProcess.HandleCount
+        $handleSettledFinal = [Math]::Min(
+            $handleSettledFinal,
+            $handleQuiescenceSample
+        )
+    }
     if (
-        ($handleFinal - $handleBaseline) -gt
+        ($handleSettledFinal - $handleBaseline) -gt
             $handleMeasuredFinalGrowthLimit -or
         ($handleMaximum - $handleBaseline) -gt
             $handleMeasuredPeakGrowthLimit
     ) {
         throw (
             'windows-handle-probe-steady-unbounded ' +
-            "baseline=$handleBaseline final=$handleFinal " +
+            "baseline=$handleBaseline observed-final=$handleObservedFinal " +
+            "settled-final=$handleSettledFinal " +
             "max=$handleMaximum " +
             "final-limit=$handleMeasuredFinalGrowthLimit " +
             "peak-limit=$handleMeasuredPeakGrowthLimit"
@@ -151,8 +179,11 @@ try {
         "startup-max=$handleWarmupMaximum, " +
         "startup-limit=$handleStartupGrowthLimit, " +
         "warmup=$handleWarmupRuns, baseline=$handleBaseline, " +
-        "final=$handleFinal, max=$handleMaximum, " +
-        "runs=$handleMeasuredRuns, gc=not-invoked"
+        "observed-final=$handleObservedFinal, " +
+        "settled-final=$handleSettledFinal, max=$handleMaximum, " +
+        "runs=$handleMeasuredRuns, " +
+        "quiescence=$($handleQuiescenceSamples)x" +
+        "$($handleQuiescenceWaitMilliseconds)ms, gc=not-invoked"
     )
     exit 0
 }

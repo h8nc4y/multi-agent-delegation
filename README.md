@@ -340,11 +340,15 @@ Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
 buffers. After the main self-test proves raw byte transport, Windows launches
 a dedicated handle-probe script in a fresh instance of the same PowerShell
 executable. That host measures a forty-invocation startup window with a bounded
-aggregate handle-growth allowance, then applies tighter final and peak limits
-to a separate forty-run steady-state window. Both windows run without forcing
-GC; isolating earlier self-test tasks avoids attributing unrelated host cleanup
-to a per-call leak while still bounding startup and steady-state growth. POSIX
-keeps its forty-run no-GC file-descriptor regression.
+aggregate handle-growth allowance, then applies a final limit of 4 and a peak
+limit of 12 to a separate forty-run steady-state window. A bounded 10-by-50 ms
+quiescence sample records the minimum settled final without starting another
+child or forcing GC. The aggregate includes short-lived PowerShell runtime
+handles, while every runner-owned native handle close is checked separately.
+Isolating earlier self-test tasks and waiting only for bounded runtime
+quiescence avoids attributing unrelated host cleanup to a per-call leak while
+still failing sustained growth. POSIX keeps its forty-run no-GC file-descriptor
+regression.
 OSS readiness seals the dedicated Windows probe's canonical UTF-8 source with
 SHA-256 and separately checks its loop headers, direct child-runner statements,
 result guards, handle updates, and thresholds through the PowerShell AST.
