@@ -176,7 +176,9 @@ repository paths you cannot publish, or customer data in public issues.
   mapping for other environments is described in SKILL.md, but exact resume
   semantics differ per tool.
 - CI measures PowerShell 7 and Windows PowerShell 5.1 on Windows, plus
-  PowerShell 7 on Ubuntu 24.04.
+  PowerShell 7 on Ubuntu 24.04. macOS 15 CI verifies only the explicit
+  unsupported-platform fail-closed boundary; it does not run the full scanner
+  suite.
 
 ## Non-Goals
 
@@ -255,7 +257,7 @@ likewise limited to the SHA-256-pinned source prefix and
 `Microsoft.PowerShell.Core\Import-Module` of the sibling runner module. Scanner
 entry/helper/isolation failures return one fixed redacted stdout line, empty
 stderr, and exit code 2. Workflow validation fixes the top-level triggers,
-read-only permission, two job IDs, job-local permission absence, exact steps,
+read-only permission, three job IDs, job-local permission absence, exact steps,
 and full-SHA action pins.
 Every scanner and Git child process has a finite timeout, and each scan has a
 two-minute monotonic deadline. A child operation's budget begins before
@@ -337,12 +339,16 @@ an arbitrary binary fixture first, then compares a native
 Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
 buffers. After the main self-test proves raw byte transport, Windows launches
 a dedicated handle-probe script in a fresh instance of the same PowerShell
-executable. That host measures a forty-invocation startup window with a bounded
-aggregate handle-growth allowance, then applies tighter final and peak limits
-to a separate forty-run steady-state window. Both windows run without forcing
-GC; isolating earlier self-test tasks avoids attributing unrelated host cleanup
-to a per-call leak while still bounding startup and steady-state growth. POSIX
-keeps its forty-run no-GC file-descriptor regression.
+executable. That host measures an eighty-invocation startup window with a bounded
+aggregate handle-growth allowance, then applies a final limit of 4 and a peak
+limit of 12 to a separate forty-run steady-state window. A bounded 10-by-50 ms
+quiescence sample records the minimum settled final without starting another
+child or forcing GC. The aggregate includes short-lived PowerShell runtime
+handles, while every runner-owned native handle close is checked separately.
+Isolating earlier self-test tasks and waiting only for bounded runtime
+quiescence avoids attributing unrelated host cleanup to a per-call leak while
+still failing sustained growth. POSIX keeps its forty-run no-GC file-descriptor
+regression.
 OSS readiness seals the dedicated Windows probe's canonical UTF-8 source with
 SHA-256 and separately checks its loop headers, direct child-runner statements,
 result guards, handle updates, and thresholds through the PowerShell AST.
@@ -375,6 +381,11 @@ git diff --check
 The GitHub Actions workflow runs validation, the private-marker self-test and
 repository scan, and whitespace checks on Windows and Ubuntu 24.04. Windows
 tests both PowerShell 7 and Windows PowerShell 5.1; Ubuntu tests PowerShell 7.
+Because GitHub-hosted macOS does not provide either trusted `setsid` path, a
+separate macOS 15 job proves that the process runner rejects a synthetic
+target before launch and that the public scanner returns fixed redacted
+stdout, empty stderr, and exit code 2. It does not claim full scanner support
+on macOS.
 Each job has a 25-minute timeout.
 
 ## Contributing

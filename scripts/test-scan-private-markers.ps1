@@ -5350,8 +5350,9 @@ exit 0
                 '^Windows handle stability: ' +
                 '(?<Evidence>startup-baseline=[0-9]+, ' +
                 'startup-final=[0-9]+, startup-max=[0-9]+, ' +
-                'startup-limit=16, warmup=40, baseline=[0-9]+, ' +
-                'final=[0-9]+, max=[0-9]+, runs=40, ' +
+                'startup-limit=16, warmup=80, baseline=[0-9]+, ' +
+                'observed-final=[0-9]+, settled-final=[0-9]+, ' +
+                'max=[0-9]+, runs=40, quiescence=10x50ms, ' +
                 'gc=not-invoked)$'
             ),
             [System.Text.RegularExpressions.RegexOptions]::CultureInvariant,

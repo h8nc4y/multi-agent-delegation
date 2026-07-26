@@ -87,11 +87,13 @@ The format loosely follows Keep a Changelog conventions.
   and buffers instead of relying on GC. The Windows regression now runs in a
   dedicated script in a fresh instance of the same PowerShell executable,
   after the main self-test has proved raw transport. It bounds aggregate handle
-  growth across a 40-invocation startup window before applying tighter final
-  and peak limits to a separate 40-run steady-state window. Both run without
-  forced GC, so earlier self-test cleanup is excluded and startup-only growth
-  is not absorbed without a limit; the POSIX 40-run no-GC file-descriptor
-  regression remains unchanged.
+  growth across an 80-invocation startup window before applying a final limit of
+  4 and a peak limit of 12 to a separate 40-run steady-state window. A bounded
+  10-by-50 ms quiescence sample records the minimum settled final without
+  starting another child or forcing GC. This accounts for observed short-lived
+  Windows PowerShell runtime handles; runner-owned native handle closes remain
+  checked individually, and sustained per-call growth still fails. The POSIX
+  40-run no-GC file-descriptor regression remains unchanged.
 - Seal the dedicated Windows handle probe's canonical UTF-8 source with
   SHA-256, while retaining a separate AST contract and parse-valid negative
   fixtures for zero-run loops, runtime limit mutation, control-flow arguments,
@@ -125,6 +127,11 @@ The format loosely follows Keep a Changelog conventions.
   immutable action pins, mutation rejection, and 25-minute job deadlines.
 - Pinned the checkout action to the v5.0.1 commit instead of a mutable major
   tag.
+- Added a native macOS 15 CI job for the explicitly unsupported runner path.
+  It uses only synthetic input to prove that the missing trusted `setsid`
+  boundary rejects the target before launch and that the public scanner emits
+  fixed redacted stdout, empty stderr, and exit code 2. Windows and Ubuntu
+  remain the full scanner-support jobs.
 
 ## 0.1.0 - 2026-07-16
 

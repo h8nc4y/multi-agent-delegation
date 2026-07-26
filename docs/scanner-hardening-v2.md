@@ -3,7 +3,7 @@
 ## 目的と分類
 
 - 分類: Class L（公開用 security scanner、複数 OS の process 境界、Git index/worktree 契約を変更）
-- 目的: scan 対象・実行中 snapshot・child process・診断出力の各境界を fail closed にし、Windows と Ubuntu の実測可能な同一契約へ揃える。
+- 目的: scan 対象・実行中 snapshot・child process・診断出力の各境界を fail closed にし、Windows と Ubuntu の実測可能な同一契約へ揃える。macOS はtrusted `setsid`不在時のunsupported-platform境界をnative runnerで実測する。
 - 非目的: あらゆる secret 形式を検出すること、real credential を fixture に使うこと、外部サービスへデータを送ること。
 
 ## Source of truth
@@ -41,7 +41,7 @@
 1. stdin/stdout/stderr は byte stream のまま扱い、`0x00`、`0x80`、`0xFF`、partial read/write、EOF、nonzero exit を保持する。
 2. Windows は suspended `CreateProcessW` で起動し、限定 handle list と kill-on-close Job Object へ割り当ててから resume する。
 3. Windows は C# の raw pipe handle を直接読み書きし、PowerShell text `StandardInput` や PowerShell proxy を境界に挟まない。最初の eager production-runner call を AST で固定し、direct/transitive/scope-qualified function call、source内alias、staticなfunction provider / `Get-Command` 参照、直接またはfunction経由の保存scriptblockとその `Get-Variable`/`gv` 再取得（source内literal alias、early direct/transitive wrapper、lookup-risky wrapperを指すaliasを含む）、risky class constructor/method/cast/static initialization、derived classのdirect/transitive base constructorを追跡する。`Get-Variable`/`gv` はraw fixtureより前にtop-levelのunqualifiedまたは`script:`変数へ一度だけ直接代入され、lookup実行前に代入が完了した、unqualified current-item変数だけのliteral `{ $_ }` / `{ $PSItem }` だけをpositive safe setとして許可する。target function/alias shadow、lookup-name shadow、scope不一致代入、qualified current-item変数、alias import/remove、exactなmodule-qualified bootstrap以外のmodule import/new/`using module`、safe filesystem helperを装うmodule-qualified command、`Set-Item`/`Set-Content`/`New-Item`と`Copy-Item`/`Move-Item`/`Rename-Item`/`Remove-Item`/`Clear-Item`のAlias:/Function: provider mutation、外部PowerShell scriptのdirect/call-operator/dot-source実行、bootstrap変数上書き後のdynamic dot-source、`ForEach-Object`/`Where-Object`への保存scriptblock渡し、複合receiverのunknown `.Invoke()`、`Invoke-Expression`とそのalias、unknown/unbound変数、runtime生成・再代入・variable mutation、deferred IEX/unknown/dynamic call、wildcard/name省略の保存変数lookup、解決不能なdynamic call/lookupは保守的に拒否する。function-local call operatorは一意なliteral scriptblock束縛とbodyのidentity検査を満たす場合だけ許可する。early `Remove-Item` wrapperは固定`Env:` pathまたはSHA-256で固定したbounded fixture cleanup関数だけを例外とし、runner module bootstrapもSHA-256固定source prefixとsibling moduleへの`Microsoft.PowerShell.Core\Import-Module`だけを許可する。lookup以外を指すsafe alias、`Get-Command git -CommandType Application` のようなliteral application lookupは許可する。native Git batch response と caller input encoding の不変性で BOM-less transport を実測する。
-4. Windows の assign/resume/Job cleanup failure は target を実行せず、terminate、wait、pipe/thread/process/Job handle close の全 native result を検査する。Job handleはclose成功前に0化せず1回だけ再試行し、launch cleanupのJob termination失敗時もdirect `TerminateProcess` fallbackを維持する。success pathもpump Task、pipe FileStream、bufferを明示Disposeする。main self-testでraw transport契約を確認した後、handle回帰は同じPowerShell executableのfresh専用hostと専用scriptで実行する。専用scriptはcanonical UTF-8 sourceのSHA-256封印と別系統のAST契約を併用し、run数の再代入、引数内control flow、provider command shadow、到達不能bodyを拒否する。aggregate `HandleCount`だけでruntime threadとrunner漏れを断定せず、GCなし40回のstartup window自体に増加上限を設けた後、別の40回へより厳しいfinal／peak上限を適用する。これにより先行self-testの遅延cleanupを混在させず、startup-only growthを無制限にbaselineへ吸収せず、steady-stateの反復漏れも検出する。
+4. Windows の assign/resume/Job cleanup failure は target を実行せず、terminate、wait、pipe/thread/process/Job handle close の全 native result を検査する。Job handleはclose成功前に0化せず1回だけ再試行し、launch cleanupのJob termination失敗時もdirect `TerminateProcess` fallbackを維持する。success pathもpump Task、pipe FileStream、bufferを明示Disposeする。main self-testでraw transport契約を確認した後、handle回帰は同じPowerShell executableのfresh専用hostと専用scriptで実行する。専用scriptはcanonical UTF-8 sourceのSHA-256封印と別系統のAST契約を併用し、run数の再代入、引数内control flow、provider command shadow、到達不能bodyを拒否する。aggregate `HandleCount`だけでruntime threadとrunner漏れを断定せず、GCなし80回のstartup window自体に増加上限16を設けた後、別の40回へfinal上限4／peak上限12を適用する。さらにchild追加実行・GCなしの10回×50 ms bounded quiescence sampleで最小のsettled finalを測る。runner所有native handleのclose結果は別途全件検査するため、call 41–80で一度だけ増えてplateauするWindows PowerShell runtimeの遅延初期化と、次の40回でも増える持続leakを区別する。これにより先行self-testの遅延cleanupを混在させず、startup-only growthを無制限にbaselineへ吸収せず、steady-stateの反復漏れも検出する。
 5. POSIX は trusted `setsid` で新規 process group/session を作る。固定 `/tmp` 配下へ `mkdir(0700)` した private release gate で shell の ready PID を受け、`getpgid(pid) == pid` を確認した後にだけ one-shot release fileを作ってtargetを`exec`する。release前timeoutではdirect launcherを止め、独立kill-wait内のlate-readyも検証してgroupを終了する。`finally` はlauncher exit後もverified groupをprobeし、既知のready/releaseとnon-recursive gate directoryだけを削除する。libc `kill(2)` と direct `WaitForExit` の return、termination failureを握り潰さず、pump Task、stream、bufferを明示Disposeする。GCを呼ばない40回実行のfile descriptor countをboundedに保つ。
 6. process 単位 timeout に加え、lower-only `1..120000` ms の scan-wide monotonic deadline を全 child/read/parse/serialize と実出力直前へ伝播する。process operationのmonotonic budgetはenvironment準備とprocess launchより前に開始し、termination/cleanupには独立したbounded kill-wait allowanceを使う。exported runnerのpublic numeric parameterはcanonical integerだけを受理し、fractional、exponential、aggregate、overflow、範囲違反を`process-limit-invalid`へ畳む。public scanner deadlineはbinding attributeでなくentrypoint body内で検査し、scannerの固定stdout・空stderr・exit 2境界を維持する。
 
@@ -50,7 +50,8 @@
 1. top-level key は `name`、`on`、`permissions`、`jobs` の exact sequence とする。
 2. trigger は `pull_request` と `main` への `push`、permission は top-level `contents: read` だけとし、job-local override を許可しない。
 3. job ID、各 job の direct key、全 step property を exact に検査し、third-party action は full commit SHA pin だけを許可する。
-4. `pull_request_target`、extra trigger、duplicate job、job permission override、mutable action ref の synthetic mutation が validator を通らないことを self-check する。
+4. Windows、Ubuntu 24.04、macOS 15の3 jobを固定する。macOS jobはfull scanner成功ではなく、trusted `setsid`不在時にsynthetic targetを起動せず、repository rootの最初のbounded Git probeを固定診断 `Private marker scan failed closed (integrity: git-probe).`、空stderr、exit 2へ畳むunsupported-platform契約だけを検証する。
+5. `pull_request_target`、extra trigger、duplicate job、job permission override、mutable action ref の synthetic mutation が validator を通らないことを self-check する。
 
 ### Resource caps
 
@@ -84,7 +85,7 @@
 - descendant escape、pre-launchを含むoperation timeout、独立したcleanup allowance、stdout/stderr cap
 - Windows assign/resume failure の PID 消失と未実行 sentinel
 - Windows Job termination/close failure のdirect process fallback、handle保持、bounded close retry
-- fresh同一PowerShell hostでWindows successをstartup 40回の増加上限＋steady-state 40回の厳格なfinal／peak上限・GC未実行で確認するpump/pipe/thread handle安定性、POSIX file descriptor安定性、direct-delay/fork-delay fake `setsid` がrelease前にtargetを実行せずlate groupとprivate gateを残さないこと
+- fresh同一PowerShell hostでWindows successをstartup 80回の増加上限16＋steady-state 40回のfinal上限4／peak上限12＋10回×50 ms bounded quiescence・GC未実行で確認するpump/pipe/thread handle安定性、POSIX file descriptor安定性、direct-delay/fork-delay fake `setsid` がrelease前にtargetを実行せずlate groupとprivate gateを残さないこと
 - helper欠落／helper例外／Git isolation create/remove失敗の固定redacted stdout、空stderr、exit 2
 - lower-only scan-wide deadline の bounded runtimeとpublic numeric parameter（fractional/exponential/aggregate/overflow/範囲違反）の固定diagnostic
 - final output byte boundary（実 OS newline 込み）
@@ -95,6 +96,7 @@
 - Windows PowerShell 7
 - Windows PowerShell 5.1
 - official PowerShell Ubuntu container + Ubuntu Git 2.43
+- GitHub-hosted macOS 15 + PowerShell 7（trusted `setsid`不在時のfail-closed契約のみ。full scanner supportではない）
 
 ### 最終 gate
 
@@ -112,6 +114,7 @@
 
 - 統合状況（2026-07-26確認）: scanner境界強化はPR #3（merge commit `36e4d08`）、Windows PowerShell 5.1のhandle probe安定化はPR #4（merge commit `07d593a`）として`main`へ統合済み。state sync着手前にlocal `main` = `origin/main` = `07d593a`、tracked tree cleanを確認した。
 - 検証証拠: GitHub Actions `Validate` run `30160602927` はcommit `07d593a` に対するWindows / Ubuntu jobが成功した。localではreadinessをPowerShell 7 / Windows PowerShell 5.1で、repository scanをPowerShell 7で実行して成功した。以後の統合状態は最新のdefault branchとGitHub Actionsを正本とし、この項目のcommit / runは2026-07-26時点の証拠baselineとして扱う。
+- 現在のWIP（2026-07-27確認）: branch `test/macos-ci-validation` のPR #6でmacOS 15 unsupported-platform CI契約とWindows handle回帰の安定化を検証中。head `674fe1b`に対するGitHub Actions run `30216107094` はWindows / Ubuntu / macOSの全3 jobが成功した。Windows jobではPowerShell 7のstartup `515 → 519`（max 519）、measured `519 → 517`（settled 517、max 519）、Windows PowerShell 5.1のstartup `581 → 587`（max 592）、measured `587 → 587`（settled 586、max 587）を実測した。localでもreadiness、scanner self-test、repository scanを両PowerShell hostで実行して成功し、専用handle probeも各hostで3回成功した。Gitleaksと`git diff --check`も成功し、独立reviewはP1/P2/P3すべて0だった。Semgrepはglobal pre-commitで対象fileなしとしてskipされ、PSScriptAnalyzerは未導入。残る統合条件はHandoff同期後の最終PR CI成功である。
 - 残る未確認事項: PSScriptAnalyzerは未導入。PATH先頭native Git candidateの署名・配布元identity、PID / PGIDが意図したprocessであることのkernel-level identity、aggregate handle増加のhandle type別内訳は未確認。
-- commit / push / PR: 未統合の実装WIPや旧追補treeはない。
+- commit / push / PR: 初回run `30211691039` のwrapper exception比較defectは修正済み。2回目run `30211979565` はpublic scanner exact boundaryまで進み、3回目run `30212238159` ではmacOS stdoutだけを`unexpected-shape`へ限定した。同runのWindows PowerShell 5.1 handle probeはsteady-state final growth 5（limit 4）で失敗したが、4回目run `30213839522` のWindows / Ubuntuは成功し、macOS raw captureも安全な分類`stdout-other-fixed-shape`まで進んだ。repository rootでは最初のbounded Git probeがtrusted `setsid`不在で拒否されるため、公開scannerの正しい既存境界はruntime診断でなく固定integrity診断`git-probe`である。テスト期待値をこのexact boundaryへ合わせた5回目run `30214124086` はmacOS / Ubuntuが成功した一方、Windows PowerShell 5.1はbaseline 585、observed final 585、peak 594の一時peak growth 9（limit 8）だけで失敗した。final上限4を緩めず、peak上限12と10回×50 ms bounded quiescenceを追加した6回目run `30215268468` はmacOS / Ubuntu / Windows PowerShell 7が成功したが、PS5.1はbaseline 587、observed / settled final 592、max 592で再び+5を示した。runner所有native handle closeの個別検査とstartup total上限16、measured final上限4／peak上限12は維持したままstartupを80回へ延長し、call 41–80で一度だけ増えるruntime plateauと、次の40回でも増える低頻度持続leakを分離した。7回目run `30216107094` はWindows / Ubuntu / macOSの全jobが成功し、PS5.1 measured区間のgrowthは0だった。StreamReaderのBOM正規化を避け、cap後も有限childをblockしないbounded raw BaseStream drainは0 / 65535 / 65536 / 65537 byte境界と1 MiB pipe fixtureで再freeze・独立review済み。
 - external cost / OAuth / secret / real data: 使用しない

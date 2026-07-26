@@ -104,7 +104,11 @@ function Test-WindowsHandleProbeLoopContract {
         $initializer.Left -isnot
             [System.Management.Automation.Language.VariableExpressionAst] -or
         -not $initializer.Left.VariablePath.IsUnqualified -or
-        $initializer.Left.VariablePath.UserPath -cne $CounterName -or
+        -not [string]::Equals(
+            $initializer.Left.VariablePath.UserPath,
+            $CounterName,
+            [System.StringComparison]::Ordinal
+        ) -or
         $initializer.Right -isnot
             [System.Management.Automation.Language.CommandExpressionAst] -or
         $initializer.Right.Expression -isnot
@@ -142,8 +146,12 @@ function Test-WindowsHandleProbeLoopContract {
             $iterator.PipelineElements[0].
                 Expression.Child.VariablePath.IsUnqualified
         ) -or
-        $iterator.PipelineElements[0].
-            Expression.Child.VariablePath.UserPath -cne $CounterName
+        -not [string]::Equals(
+            $iterator.PipelineElements[0].
+                Expression.Child.VariablePath.UserPath,
+            $CounterName,
+            [System.StringComparison]::Ordinal
+        )
     ) {
         return $false
     }
@@ -211,6 +219,112 @@ function Test-WindowsHandleProbeLoopContract {
     )
 }
 
+function Test-WindowsHandleQuiescenceLoopContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Management.Automation.Language.ForStatementAst]$Loop
+    )
+
+    # sample回数を0へ迂回したり、Sleep/Refresh/min更新を条件分岐へ隠したり
+    # できないよう、headerと4つの直下statementをAST extentで全体一致する。
+    if (
+        $Loop.Initializer.Extent.Text -notmatch
+            '^\s*\$handleQuiescenceAttempt\s*=\s*0\s*$' -or
+        $Loop.Condition.Extent.Text -notmatch (
+            '^\s*\$handleQuiescenceAttempt\s*-lt\s*' +
+            '\$handleQuiescenceSamples\s*$'
+        ) -or
+        $Loop.Iterator.Extent.Text -notmatch
+            '^\s*\$handleQuiescenceAttempt\+\+\s*$'
+    ) {
+        return $false
+    }
+
+    $statements = @($Loop.Body.Statements)
+    if (
+        $statements.Count -ne 4 -or
+        $statements[0] -isnot
+            [System.Management.Automation.Language.PipelineAst] -or
+        $statements[1] -isnot
+            [System.Management.Automation.Language.PipelineAst] -or
+        $statements[2] -isnot
+            [System.Management.Automation.Language.AssignmentStatementAst] -or
+        $statements[3] -isnot
+            [System.Management.Automation.Language.AssignmentStatementAst]
+    ) {
+        return $false
+    }
+
+    $sleepContract = (
+        '(?s)^\s*\[System\.Threading\.Thread\]::Sleep\(\s*' +
+        '\$handleQuiescenceWaitMilliseconds\s*\)\s*$'
+    )
+    $refreshContract = '^\s*\$handleProbeProcess\.Refresh\(\)\s*$'
+    $sampleContract = (
+        '^\s*\$handleQuiescenceSample\s*=\s*' +
+        '\$handleProbeProcess\.HandleCount\s*$'
+    )
+    $minimumContract = (
+        '(?s)^\s*\$handleSettledFinal\s*=\s*\[Math\]::Min\(\s*' +
+        '\$handleSettledFinal\s*,\s*\$handleQuiescenceSample\s*\)\s*$'
+    )
+    return (
+        $statements[0].Extent.Text -match $sleepContract -and
+        $statements[1].Extent.Text -match $refreshContract -and
+        $statements[2].Extent.Text -match $sampleContract -and
+        $statements[3].Extent.Text -match $minimumContract
+    )
+}
+
+function Test-WindowsHandleSeriesWithinLimits {
+    param(
+        [int]$Baseline,
+        [int]$ObservedFinal,
+        [int]$Maximum,
+        [int[]]$QuiescenceSamples
+    )
+
+    # AST契約と同じmin-settle/final4/peak12判定をsynthetic seriesへ適用し、
+    # 一時揺らぎだけを許可して持続・低頻度leakを許可しないことを自己検査する。
+    if ($QuiescenceSamples.Count -ne 10) {
+        return $false
+    }
+    $settledFinal = $ObservedFinal
+    foreach ($sample in $QuiescenceSamples) {
+        $settledFinal = [Math]::Min($settledFinal, $sample)
+    }
+    return (
+        ($settledFinal - $Baseline) -le 4 -and
+        ($Maximum - $Baseline) -le 12
+    )
+}
+
+function Test-WindowsHandleWindowsWithinLimits {
+    param(
+        [int]$StartupBaseline,
+        [int]$WarmupFinal,
+        [int]$WarmupMaximum,
+        [int]$ObservedFinal,
+        [int]$MeasuredMaximum,
+        [int[]]$QuiescenceSamples
+    )
+
+    # startup 80回全体のcapと、その後40回の厳格な増加を別々に適用する。
+    # call 41-80だけで一度増えてplateauするruntime初期化はstartupへ留まり、
+    # 次の40回でも増える低頻度leakはmeasured final上限で拒否される。
+    return (
+        ($WarmupFinal - $StartupBaseline) -le 16 -and
+        ($WarmupMaximum - $StartupBaseline) -le 16 -and
+        (
+            Test-WindowsHandleSeriesWithinLimits `
+                -Baseline $WarmupFinal `
+                -ObservedFinal $ObservedFinal `
+                -Maximum $MeasuredMaximum `
+                -QuiescenceSamples $QuiescenceSamples
+        )
+    )
+}
+
 function Test-WindowsHandleProbeAstContract {
     param(
         [Parameter(Mandatory = $true)]
@@ -218,8 +332,8 @@ function Test-WindowsHandleProbeAstContract {
     )
 
     # loop headerだけの正規表現では、runner呼出しをbody外へ移動または削除した
-    # no-op実装を見抜けない。ASTで2つのfor bodyを特定し、各windowが実際に
-    # process実行とhandle更新を直下statementとして所有することを検査する。
+    # no-op実装を見抜けない。ASTで3つのfor bodyを特定し、各測定windowと
+    # quiescence sampleが必要な処理を直下statementとして所有することを検査する。
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput(
@@ -274,15 +388,32 @@ function Test-WindowsHandleProbeAstContract {
                 )
             }
     )
-    if ($warmupLoops.Count -ne 1 -or $measuredLoops.Count -ne 1) {
+    $quiescenceLoops = @(
+        $forStatements |
+            Where-Object {
+                $_.Condition.Extent.Text -match (
+                    '^\s*\$handleQuiescenceAttempt\s*-lt\s*' +
+                    '\$handleQuiescenceSamples\s*$'
+                )
+            }
+    )
+    if (
+        $forStatements.Count -ne 3 -or
+        $warmupLoops.Count -ne 1 -or
+        $measuredLoops.Count -ne 1 -or
+        $quiescenceLoops.Count -ne 1
+    ) {
         return $false
     }
 
     $warmupLoop = $warmupLoops[0]
     $measuredLoop = $measuredLoops[0]
+    $quiescenceLoop = $quiescenceLoops[0]
     if (
         $warmupLoop.Extent.StartOffset -ge
-            $measuredLoop.Extent.StartOffset
+            $measuredLoop.Extent.StartOffset -or
+        $measuredLoop.Extent.StartOffset -ge
+            $quiescenceLoop.Extent.StartOffset
     ) {
         return $false
     }
@@ -290,6 +421,10 @@ function Test-WindowsHandleProbeAstContract {
         -not [object]::ReferenceEquals(
             $warmupLoop.Parent,
             $measuredLoop.Parent
+        ) -or
+        -not [object]::ReferenceEquals(
+            $warmupLoop.Parent,
+            $quiescenceLoop.Parent
         ) -or
         $warmupLoop.Parent -isnot
             [System.Management.Automation.Language.StatementBlockAst] -or
@@ -302,7 +437,7 @@ function Test-WindowsHandleProbeAstContract {
     # run数とgrowth上限は、同じTry直下で各1回だけ定数代入し、最初のloopより
     # 前に確定させる。loop直前の0再代入や、evidence直前の40復元を拒否する。
     $constantAssignments = @(
-        [pscustomobject]@{ Name = 'handleWarmupRuns'; Value = 40 },
+        [pscustomobject]@{ Name = 'handleWarmupRuns'; Value = 80 },
         [pscustomobject]@{ Name = 'handleMeasuredRuns'; Value = 40 },
         [pscustomobject]@{ Name = 'handleStartupGrowthLimit'; Value = 16 },
         [pscustomobject]@{
@@ -311,7 +446,15 @@ function Test-WindowsHandleProbeAstContract {
         },
         [pscustomobject]@{
             Name = 'handleMeasuredPeakGrowthLimit'
-            Value = 8
+            Value = 12
+        },
+        [pscustomobject]@{
+            Name = 'handleQuiescenceSamples'
+            Value = 10
+        },
+        [pscustomobject]@{
+            Name = 'handleQuiescenceWaitMilliseconds'
+            Value = 50
         }
     )
     $assignmentStatements = @(
@@ -385,13 +528,17 @@ function Test-WindowsHandleProbeAstContract {
                 -FinalName 'handleFinal' `
                 -MaximumName 'handleMaximum' `
                 -ChildFailureCode 'windows-handle-probe-steady-child-failed'
+        ) -or
+        -not (
+            Test-WindowsHandleQuiescenceLoopContract `
+                -Loop $quiescenceLoop
         )
     ) {
         return $false
     }
 
     # sourceをASTの境界で分割し、startup baseline → warm-up body →
-    # startup上限 → steady-state body → steady-state上限の順序も固定する。
+    # startup上限 → steady-state body → quiescence → steady-state上限の順序も固定する。
     $prefix = $Source.Substring(0, $warmupLoop.Extent.StartOffset)
     $warmupBody = $warmupLoop.Extent.Text
     $between = $Source.Substring(
@@ -399,15 +546,21 @@ function Test-WindowsHandleProbeAstContract {
         $measuredLoop.Extent.StartOffset - $warmupLoop.Extent.EndOffset
     )
     $measuredBody = $measuredLoop.Extent.Text
-    $suffix = $Source.Substring($measuredLoop.Extent.EndOffset)
+    $beforeQuiescence = $Source.Substring(
+        $measuredLoop.Extent.EndOffset,
+        $quiescenceLoop.Extent.StartOffset - $measuredLoop.Extent.EndOffset
+    )
+    $suffix = $Source.Substring($quiescenceLoop.Extent.EndOffset)
 
     $prefixContract = (
         '(?s)' +
-        '\$handleWarmupRuns\s*=\s*40.*?' +
+        '\$handleWarmupRuns\s*=\s*80.*?' +
         '\$handleMeasuredRuns\s*=\s*40.*?' +
         '\$handleStartupGrowthLimit\s*=\s*16.*?' +
         '\$handleMeasuredFinalGrowthLimit\s*=\s*4.*?' +
-        '\$handleMeasuredPeakGrowthLimit\s*=\s*8.*?' +
+        '\$handleMeasuredPeakGrowthLimit\s*=\s*12.*?' +
+        '\$handleQuiescenceSamples\s*=\s*10.*?' +
+        '\$handleQuiescenceWaitMilliseconds\s*=\s*50.*?' +
         '\$handleProbeProcess\s*=\s*' +
         '\[System\.Diagnostics\.Process\]::GetCurrentProcess\(\).*?' +
         '\$handleStartupBaseline\s*=\s*' +
@@ -439,9 +592,14 @@ function Test-WindowsHandleProbeAstContract {
         '\$handleFinal\s*=\s*\$handleProbeProcess\.HandleCount.*?' +
         '\$handleMaximum\s*=\s*\[Math\]::Max\('
     )
+    $beforeQuiescenceContract = (
+        '(?s)' +
+        '\$handleObservedFinal\s*=\s*\$handleFinal.*?' +
+        '\$handleSettledFinal\s*=\s*\$handleFinal'
+    )
     $suffixContract = (
         '(?s)' +
-        '\(\$handleFinal\s*-\s*\$handleBaseline\)\s*' +
+        '\(\$handleSettledFinal\s*-\s*\$handleBaseline\)\s*' +
         '-gt\s*\$handleMeasuredFinalGrowthLimit.*?' +
         '\(\$handleMaximum\s*-\s*\$handleBaseline\)\s*' +
         '-gt\s*\$handleMeasuredPeakGrowthLimit'
@@ -452,6 +610,11 @@ function Test-WindowsHandleProbeAstContract {
         $warmupBody -match $warmupBodyContract -and
         $between -match $betweenContract -and
         $measuredBody -match $measuredBodyContract -and
+        $beforeQuiescence -match $beforeQuiescenceContract -and
+        (
+            Test-WindowsHandleQuiescenceLoopContract `
+                -Loop $quiescenceLoop
+        ) -and
         $suffix -match $suffixContract
     )
 }
@@ -466,7 +629,7 @@ function Test-WindowsHandleProbeContract {
     # source全体をSHA-256で封印する。Set-Variable、outer wrapper、偽evidence等の
     # AST上は合法な追記も、個別deny-listへ依存せず必ずreview対象に戻す。
     $expectedSourceSha256 = (
-        'dcad83706cd800b7d52a0d7f2d83b81f85aee752256dc45dcec6c78a83444e7c'
+        '0a93f2ae4254bb4f002d825e8b4b6f00075a66de7d7c9c46b4ab8a633ab674e0'
     )
     $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -479,7 +642,13 @@ function Test-WindowsHandleProbeContract {
     finally {
         $sha256.Dispose()
     }
-    if ($actualSourceSha256 -cne $expectedSourceSha256) {
+    if (
+        -not [string]::Equals(
+            $actualSourceSha256,
+            $expectedSourceSha256,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
         return $false
     }
 
@@ -498,7 +667,13 @@ function Test-StringSequenceEqual {
         return $false
     }
     for ($index = 0; $index -lt $Left.Count; $index++) {
-        if ($Left[$index] -cne $Right[$index]) {
+        if (
+            -not [string]::Equals(
+                $Left[$index],
+                $Right[$index],
+                [System.StringComparison]::Ordinal
+            )
+        ) {
             return $false
         }
     }
@@ -535,7 +710,13 @@ function Test-WorkflowBoundaryContract {
 
     $jobsIndexes = @()
     for ($index = 0; $index -lt $lines.Count; $index++) {
-        if ($lines[$index] -ceq 'jobs:') {
+        if (
+            [string]::Equals(
+                $lines[$index],
+                'jobs:',
+                [System.StringComparison]::Ordinal
+            )
+        ) {
             $jobsIndexes += $index
         }
     }
@@ -582,7 +763,7 @@ function Test-WorkflowBoundaryContract {
         -not (
             Test-StringSequenceEqual `
                 -Left @($jobNames.ToArray()) `
-                -Right @('validate', 'validate_ubuntu')
+                -Right @('validate', 'validate_ubuntu', 'validate_macos')
         )
     ) {
         return $false
@@ -592,7 +773,7 @@ function Test-WorkflowBoundaryContract {
     }
 
     # third-party action は immutable full commit SHA だけを許可する。
-    # 現 workflow は Windows/Ubuntu 各 1 回の checkout 以外を持たない。
+    # 現 workflow は Windows/Ubuntu/macOS 各 1 回の checkout 以外を持たない。
     $expectedCheckout = (
         'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
     )
@@ -608,12 +789,16 @@ function Test-WorkflowBoundaryContract {
             ) | Out-Null
         }
     }
-    if ($usesValues.Count -ne 2) {
+    if ($usesValues.Count -ne 3) {
         return $false
     }
     foreach ($usesValue in $usesValues) {
         if (
-            $usesValue -cne $expectedCheckout -or
+            -not [string]::Equals(
+                $usesValue,
+                $expectedCheckout,
+                [System.StringComparison]::Ordinal
+            ) -or
             $usesValue -cnotmatch
                 '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$'
         ) {
@@ -834,7 +1019,13 @@ function Assert-WorkflowJobSet {
     )
     if ($expectedSequenceMatches) {
         for ($index = 0; $index -lt $ExpectedJobs.Count; $index++) {
-            if ($actualJobs[$index] -cne $ExpectedJobs[$index]) {
+            if (
+                -not [string]::Equals(
+                    $actualJobs[$index],
+                    $ExpectedJobs[$index],
+                    [System.StringComparison]::Ordinal
+                )
+            ) {
                 $expectedSequenceMatches = $false
                 break
             }
@@ -1120,12 +1311,27 @@ function Assert-WorkflowUsesStep {
         [string]$Uses
     )
 
-    $matches = @($Steps | Where-Object { $_.Name -ceq $Name })
+    $matches = @(
+        $Steps |
+            Where-Object {
+                [string]::Equals(
+                    $_.Name,
+                    $Name,
+                    [System.StringComparison]::Ordinal
+                )
+            }
+    )
     if ($matches.Count -ne 1) {
         Add-Failure "Workflow must contain exactly one active step named '$Name' (found $($matches.Count))"
         return
     }
-    if ($matches[0].Uses -cne $Uses) {
+    if (
+        -not [string]::Equals(
+            $matches[0].Uses,
+            $Uses,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
         Add-Failure "Workflow step '$Name' must use '$Uses' (found '$($matches[0].Uses)')"
     }
     if ($matches[0].UsesCount -ne 1 -or
@@ -1146,7 +1352,16 @@ function Assert-WorkflowStep {
         [string]$Run
     )
 
-    $matches = @($Steps | Where-Object { $_.Name -ceq $Name })
+    $matches = @(
+        $Steps |
+            Where-Object {
+                [string]::Equals(
+                    $_.Name,
+                    $Name,
+                    [System.StringComparison]::Ordinal
+                )
+            }
+    )
     if ($matches.Count -ne 1) {
         Add-Failure "Workflow must contain exactly one active step named '$Name' (found $($matches.Count))"
         return
@@ -1164,7 +1379,13 @@ function Assert-WorkflowStep {
     if (-not $step.Shell.Equals($Shell, [System.StringComparison]::OrdinalIgnoreCase)) {
         Add-Failure "Workflow step '$Name' must use shell '$Shell' (found '$($step.Shell)')"
     }
-    if ($step.Run -cne $Run) {
+    if (
+        -not [string]::Equals(
+            $step.Run,
+            $Run,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
         Add-Failure "Workflow step '$Name' must run '$Run' (found '$($step.Run)')"
     }
 }
@@ -1257,6 +1478,7 @@ $requiredFiles = @(
     'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
     'scripts/scan-private-markers-v2.ps1',
+    'scripts/test-macos-fail-closed.ps1',
     'scripts/test-private-marker-handle-stability.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
@@ -1425,7 +1647,7 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
         )
     }
 
-    # 片方だけ0回へ変えても必ずrejectされることを別々に検証する。両方を同時に
+    # 各windowだけを0回へ変えても必ずrejectされることを別々に検証する。同時に
     # 変えるfixtureでは、一方のheader検査が欠けてもnegativeになり得るため分離する。
     $windowsHandleZeroRunCases = @(
         [pscustomobject]@{
@@ -1437,6 +1659,14 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             Name = 'steady-state'
             Before = '$handleAttempt = 0;'
             After = '$handleAttempt = $handleMeasuredRuns;'
+        },
+        [pscustomobject]@{
+            Name = 'quiescence'
+            Before = '$handleQuiescenceAttempt = 0;'
+            After = (
+                '$handleQuiescenceAttempt = ' +
+                '$handleQuiescenceSamples;'
+            )
         }
     )
     foreach ($zeroRunCase in $windowsHandleZeroRunCases) {
@@ -1444,7 +1674,13 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             $zeroRunCase.Before,
             $zeroRunCase.After
         )
-        if ($zeroRunFixture -ceq $windowsHandleProbeSource) {
+        if (
+            [string]::Equals(
+                $zeroRunFixture,
+                $windowsHandleProbeSource,
+                [System.StringComparison]::Ordinal
+            )
+        ) {
             Add-Failure (
                 'Windows handle readiness zero-run fixture setup failed: ' +
                 $zeroRunCase.Name
@@ -1460,17 +1696,27 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
         }
     }
 
-    # headerを変えずlimitだけ0へ再代入する変異も各windowでrejectする。
-    # evidence直前に40へ戻して表示値だけ正規化しても、代入数検査で失敗する。
+    # headerを変えずlimitを再代入・短縮・緩和する変異もrejectする。
+    # evidence直前に80へ戻して表示値だけ正規化しても、代入数検査で失敗する。
     $windowsHandleLimitReassignmentCases = @(
         [pscustomobject]@{
             Name = 'startup'
-            Before = '$handleWarmupRuns = 40'
+            Before = '$handleWarmupRuns = 80'
             After = (
-                '$handleWarmupRuns = 40' +
+                '$handleWarmupRuns = 80' +
                 "`n    " +
                 '$handleWarmupRuns = 0'
             )
+        },
+        [pscustomobject]@{
+            Name = 'startup shortened'
+            Before = '$handleWarmupRuns = 80'
+            After = '$handleWarmupRuns = 40'
+        },
+        [pscustomobject]@{
+            Name = 'startup growth relaxed'
+            Before = '$handleStartupGrowthLimit = 16'
+            After = '$handleStartupGrowthLimit = 17'
         },
         [pscustomobject]@{
             Name = 'steady-state'
@@ -1479,6 +1725,24 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
                 '$handleMeasuredRuns = 40' +
                 "`n    " +
                 '$handleMeasuredRuns = 0'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'quiescence samples'
+            Before = '$handleQuiescenceSamples = 10'
+            After = (
+                '$handleQuiescenceSamples = 10' +
+                "`n    " +
+                '$handleQuiescenceSamples = 0'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'quiescence wait'
+            Before = '$handleQuiescenceWaitMilliseconds = 50'
+            After = (
+                '$handleQuiescenceWaitMilliseconds = 50' +
+                "`n    " +
+                '$handleQuiescenceWaitMilliseconds = 0'
             )
         }
     )
@@ -1497,7 +1761,11 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             [ref]$limitFixtureParseErrors
         ) | Out-Null
         if (
-            $limitReassignmentFixture -ceq $windowsHandleProbeSource -or
+            [string]::Equals(
+                $limitReassignmentFixture,
+                $windowsHandleProbeSource,
+                [System.StringComparison]::Ordinal
+            ) -or
             $limitFixtureParseErrors.Count -ne 0
         ) {
             Add-Failure (
@@ -1554,7 +1822,11 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             [ref]$runnerFixtureParseErrors
         ) | Out-Null
         if (
-            $runnerSubstitutionFixture -ceq $windowsHandleProbeSource -or
+            [string]::Equals(
+                $runnerSubstitutionFixture,
+                $windowsHandleProbeSource,
+                [System.StringComparison]::Ordinal
+            ) -or
             $runnerFixtureParseErrors.Count -ne 0
         ) {
             Add-Failure (
@@ -1597,9 +1869,9 @@ Microsoft.PowerShell.Utility\Set-Alias `
     $canonicalSealMutationCases = @(
         [pscustomobject]@{
             Name = 'runtime limit mutation'
-            Before = '$handleWarmupRuns = 40'
+            Before = '$handleWarmupRuns = 80'
             After = (
-                '$handleWarmupRuns = 40' +
+                '$handleWarmupRuns = 80' +
                 "`n    " +
                 'Set-Variable -Name handleWarmupRuns -Value 0'
             )
@@ -1632,7 +1904,11 @@ Microsoft.PowerShell.Utility\Set-Alias `
             [ref]$canonicalSealParseErrors
         ) | Out-Null
         if (
-            $canonicalSealFixture -ceq $windowsHandleProbeSource -or
+            [string]::Equals(
+                $canonicalSealFixture,
+                $windowsHandleProbeSource,
+                [System.StringComparison]::Ordinal
+            ) -or
             $canonicalSealParseErrors.Count -ne 0
         ) {
             Add-Failure (
@@ -1676,7 +1952,11 @@ function Invoke-PrivateMarkerBoundedProcess {
         [ref]$shadowFixtureParseErrors
     ) | Out-Null
     if (
-        $shadowFunctionFixture -ceq $windowsHandleProbeSource -or
+        [string]::Equals(
+            $shadowFunctionFixture,
+            $windowsHandleProbeSource,
+            [System.StringComparison]::Ordinal
+        ) -or
         $shadowFixtureParseErrors.Count -ne 0
     ) {
         Add-Failure (
@@ -1691,7 +1971,7 @@ function Invoke-PrivateMarkerBoundedProcess {
         )
     }
 
-    # body全体を到達不能なifへ包む変異も、startup/steady-stateごとに拒否する。
+    # body全体を到達不能なifへ包む変異も各windowごとに拒否する。
     # ASTのbody offsetから組み立てることで、runner文字列を残した実際的なbypassを
     # validator自身へのnegative controlとして維持する。
     $fixtureTokens = $null
@@ -1731,6 +2011,18 @@ function Invoke-PrivateMarkerBoundedProcess {
                         $_.Condition.Extent.Text -match (
                             '^\s*\$handleAttempt\s*-lt\s*' +
                             '\$handleMeasuredRuns\s*$'
+                        )
+                    }
+            )
+        },
+        [pscustomobject]@{
+            Name = 'quiescence'
+            Loops = @(
+                $fixtureForStatements |
+                    Where-Object {
+                        $_.Condition.Extent.Text -match (
+                            '^\s*\$handleQuiescenceAttempt\s*-lt\s*' +
+                            '\$handleQuiescenceSamples\s*$'
                         )
                     }
             )
@@ -1784,15 +2076,78 @@ function Invoke-PrivateMarkerBoundedProcess {
     }
 }
 
+# call 41-80で一度だけ増えるplateauとmeasured transientだけがpassし、
+# 1回ごとのleak、次の40回でも増える低頻度leak、peak超過がfailする。
+# source ASTと同じstartup16/final4/peak12の独立negative control。
+$transientHandleSeries = @(
+    105, 104, 103, 102, 101, 100, 100, 100, 100, 100
+)
+$plateauHandleSeries = @(105, 105, 105, 105, 105, 105, 105, 105, 105, 105)
+$onePerCallHandleSeries = @(220, 220, 220, 220, 220, 220, 220, 220, 220, 220)
+if (
+    -not (
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 105 `
+            -WarmupMaximum 109 `
+            -ObservedFinal 105 `
+            -MeasuredMaximum 105 `
+            -QuiescenceSamples $plateauHandleSeries
+    ) -or
+    -not (
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 100 `
+            -WarmupMaximum 100 `
+            -ObservedFinal 105 `
+            -MeasuredMaximum 109 `
+            -QuiescenceSamples $transientHandleSeries
+    ) -or
+    (
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 180 `
+            -WarmupMaximum 180 `
+            -ObservedFinal 220 `
+            -MeasuredMaximum 220 `
+            -QuiescenceSamples $onePerCallHandleSeries
+    ) -or
+    (
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 110 `
+            -WarmupMaximum 110 `
+            -ObservedFinal 115 `
+            -MeasuredMaximum 115 `
+            -QuiescenceSamples @(115, 115, 115, 115, 115, 115, 115, 115, 115, 115)
+    ) -or
+    (
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 100 `
+            -WarmupMaximum 100 `
+            -ObservedFinal 100 `
+            -MeasuredMaximum 113 `
+            -QuiescenceSamples @(100, 100, 100, 100, 100, 100, 100, 100, 100, 100)
+    )
+) {
+    Add-Failure (
+        'Windows handle readiness synthetic quiescence/leak boundary ' +
+        'regression failed.'
+    )
+}
+
 # 変数名とloop headerだけを残したno-op実装をpositiveにしないことも固定する。
 # validator自身のAST契約が弱体化すると、production runnerを一度も呼ばない検査が
 # readinessを通過できるため、最小のnegative controlを同じ場所で実行する。
 $windowsHandleProbeNoOpFixture = @'
-$handleWarmupRuns = 40
+$handleWarmupRuns = 80
 $handleMeasuredRuns = 40
 $handleStartupGrowthLimit = 16
 $handleMeasuredFinalGrowthLimit = 4
-$handleMeasuredPeakGrowthLimit = 8
+$handleMeasuredPeakGrowthLimit = 12
+$handleQuiescenceSamples = 10
+$handleQuiescenceWaitMilliseconds = 50
 $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
 $handleStartupBaseline = $handleProbeProcess.HandleCount
 for ($handleWarmupAttempt = 0; $handleWarmupAttempt -lt $handleWarmupRuns; $handleWarmupAttempt++) {
@@ -1803,7 +2158,15 @@ if (($handleWarmupFinal - $handleStartupBaseline) -gt $handleStartupGrowthLimit 
 $handleBaseline = $handleWarmupFinal
 for ($handleAttempt = 0; $handleAttempt -lt $handleMeasuredRuns; $handleAttempt++) {
 }
-if (($handleFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
+$handleObservedFinal = $handleFinal
+$handleSettledFinal = $handleFinal
+for ($handleQuiescenceAttempt = 0; $handleQuiescenceAttempt -lt $handleQuiescenceSamples; $handleQuiescenceAttempt++) {
+    [System.Threading.Thread]::Sleep($handleQuiescenceWaitMilliseconds)
+    $handleProbeProcess.Refresh()
+    $handleQuiescenceSample = $handleProbeProcess.HandleCount
+    $handleSettledFinal = [Math]::Min($handleSettledFinal, $handleQuiescenceSample)
+}
+if (($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
     ($handleMaximum - $handleBaseline) -gt $handleMeasuredPeakGrowthLimit) {
 }
 '@
@@ -1817,11 +2180,13 @@ if (
 # runner呼出しとhandle更新を各loop直後へ逃がした場合も、token順だけなら
 # positiveに見える。AST extent検査がbody所属を要求していることを明示する。
 $windowsHandleProbeScopeEscapeFixture = @'
-$handleWarmupRuns = 40
+$handleWarmupRuns = 80
 $handleMeasuredRuns = 40
 $handleStartupGrowthLimit = 16
 $handleMeasuredFinalGrowthLimit = 4
-$handleMeasuredPeakGrowthLimit = 8
+$handleMeasuredPeakGrowthLimit = 12
+$handleQuiescenceSamples = 10
+$handleQuiescenceWaitMilliseconds = 50
 $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
 $handleProbeProcess.Refresh()
 $handleStartupBaseline = $handleProbeProcess.HandleCount
@@ -1841,7 +2206,15 @@ $handleProbeResult = Invoke-PrivateMarkerBoundedProcess
 $handleProbeProcess.Refresh()
 $handleFinal = $handleProbeProcess.HandleCount
 $handleMaximum = [Math]::Max($handleMaximum, $handleFinal)
-if (($handleFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
+$handleObservedFinal = $handleFinal
+$handleSettledFinal = $handleFinal
+for ($handleQuiescenceAttempt = 0; $handleQuiescenceAttempt -lt $handleQuiescenceSamples; $handleQuiescenceAttempt++) {
+    [System.Threading.Thread]::Sleep($handleQuiescenceWaitMilliseconds)
+    $handleProbeProcess.Refresh()
+    $handleQuiescenceSample = $handleProbeProcess.HandleCount
+    $handleSettledFinal = [Math]::Min($handleSettledFinal, $handleQuiescenceSample)
+}
+if (($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
     ($handleMaximum - $handleBaseline) -gt $handleMeasuredPeakGrowthLimit) {
 }
 '@
@@ -1989,12 +2362,16 @@ Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
     -Pattern '(?s)missing-implementation.*?missing-runner.*?throwing-runner.*?isolation-create-failure.*?isolation-remove-failure' `
     -Description 'missing implementation/helper, helper exception, and isolation failure redaction regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-macos-fail-closed.ps1' `
+    -Pattern '(?s)Get-PrivateMarkerTrustedSetsidPath.*?trusted-setsid-missing.*?Private marker scan failed closed \(integrity: git-probe\)\..*?ExitCode\s+-ne\s+2' `
+    -Description 'native macOS unsupported-platform fail-closed contract'
 
 $workflowPath = '.github/workflows/validate.yml'
 Assert-WorkflowBoundaryContract -RelativePath $workflowPath
 Assert-WorkflowJobSet `
     -RelativePath $workflowPath `
-    -ExpectedJobs @('validate', 'validate_ubuntu')
+    -ExpectedJobs @('validate', 'validate_ubuntu', 'validate_macos')
 Assert-WorkflowJobTimeout `
     -RelativePath $workflowPath `
     -JobName 'validate' `
@@ -2002,6 +2379,10 @@ Assert-WorkflowJobTimeout `
 Assert-WorkflowJobTimeout `
     -RelativePath $workflowPath `
     -JobName 'validate_ubuntu' `
+    -Minutes 25
+Assert-WorkflowJobTimeout `
+    -RelativePath $workflowPath `
+    -JobName 'validate_macos' `
     -Minutes 25
 Assert-WorkflowJobDirectValue `
     -RelativePath $workflowPath `
@@ -2013,6 +2394,11 @@ Assert-WorkflowJobDirectValue `
     -JobName 'validate_ubuntu' `
     -Key 'runs-on' `
     -Value 'ubuntu-24.04'
+Assert-WorkflowJobDirectValue `
+    -RelativePath $workflowPath `
+    -JobName 'validate_macos' `
+    -Key 'runs-on' `
+    -Value 'macos-15'
 
 $workflowSteps = Get-WorkflowSteps `
     -RelativePath $workflowPath `
@@ -2074,10 +2460,36 @@ Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Scan for private markers'
 Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Check whitespace' `
     -Shell 'pwsh' -Run $whitespaceCommand
 
+$macosWorkflowSteps = Get-WorkflowSteps `
+    -RelativePath $workflowPath `
+    -JobName 'validate_macos'
+Assert-WorkflowStepCount `
+    -Steps $macosWorkflowSteps `
+    -JobName 'validate_macos' `
+    -ExpectedCount 4
+$macosWorkflowJobLines = Get-WorkflowJobLines `
+    -RelativePath $workflowPath `
+    -JobName 'validate_macos'
+Assert-WorkflowJobShape `
+    -Lines $macosWorkflowJobLines `
+    -JobName 'validate_macos' `
+    -ExpectedStepCount 4 `
+    -ExpectedShellCount 3 `
+    -ExpectedRunCount 3
+Assert-WorkflowUsesStep -Steps $macosWorkflowSteps -Name 'Check out repository' `
+    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Validate OSS readiness' `
+    -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
+Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Test unsupported macOS fail-closed contract' `
+    -Shell 'pwsh' -Run './scripts/test-macos-fail-closed.ps1'
+Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Check whitespace' `
+    -Shell 'pwsh' -Run $whitespaceCommand
+
 foreach ($powerShellScript in @(
     'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
     'scripts/scan-private-markers-v2.ps1',
+    'scripts/test-macos-fail-closed.ps1',
     'scripts/test-private-marker-handle-stability.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
