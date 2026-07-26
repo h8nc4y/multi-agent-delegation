@@ -143,16 +143,53 @@ try {
             'Private marker scan failed: scanner-runtime-failed' +
             [Environment]::NewLine
         )
+        $boundaryFailures = New-Object System.Collections.Generic.List[string]
+        if ($process.ExitCode -ne 2) {
+            $boundaryFailures.Add(
+                'exit-code-' +
+                $process.ExitCode.ToString(
+                    [System.Globalization.CultureInfo]::InvariantCulture
+                )
+            ) | Out-Null
+        }
         if (
-            $process.ExitCode -ne 2 -or
             -not [string]::Equals(
                 $standardOutput,
                 $expectedOutput,
                 [System.StringComparison]::Ordinal
-            ) -or
-            -not [string]::IsNullOrEmpty($standardError)
+            )
         ) {
-            throw 'The public scanner did not preserve its fixed unsupported-platform boundary.'
+            $entrypointOutput = (
+                'Private marker scan failed: scanner-entrypoint-failed' +
+                [Environment]::NewLine
+            )
+            $outputClass = if (
+                [string]::IsNullOrEmpty($standardOutput)
+            ) {
+                'stdout-empty'
+            } elseif (
+                [string]::Equals(
+                    $standardOutput,
+                    $entrypointOutput,
+                    [System.StringComparison]::Ordinal
+                )
+            ) {
+                'stdout-entrypoint-fixed'
+            } else {
+                # raw output、長さ、hashを公開せずshape不一致だけを報告する。
+                'stdout-unexpected-shape'
+            }
+            $boundaryFailures.Add($outputClass) | Out-Null
+        }
+        if (-not [string]::IsNullOrEmpty($standardError)) {
+            $boundaryFailures.Add('stderr-nonempty') | Out-Null
+        }
+        if ($boundaryFailures.Count -gt 0) {
+            throw (
+                'The public scanner did not preserve its fixed ' +
+                'unsupported-platform boundary: ' +
+                ($boundaryFailures -join ',')
+            )
         }
     }
     finally {
