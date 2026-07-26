@@ -36,7 +36,7 @@ try {
     $environment = [System.Collections.Generic.Dictionary[string, string]]::new(
         [System.StringComparer]::Ordinal
     )
-    $runnerFailure = ''
+    $runnerFailureObserved = $false
     try {
         [void](Invoke-PrivateMarkerBoundedProcess `
             -FilePath '/bin/sh' `
@@ -54,15 +54,39 @@ try {
             -MaxStandardErrorBytes 4096)
     }
     catch {
-        $runnerFailure = [string]$_.Exception.Message
+        # PowerShellはstatic .NET callの例外をMethodInvocationException等で
+        # 包む。raw outer messageを出力・部分一致せず、有限depthのexception
+        # chain内に固定codeそのものがある場合だけexpected failureとする。
+        $candidateException = $_.Exception
+        for (
+            $exceptionDepth = 0;
+            $exceptionDepth -lt 8 -and $null -ne $candidateException;
+            $exceptionDepth++
+        ) {
+            if (
+                [string]::Equals(
+                    [string]$candidateException.Message,
+                    'trusted-setsid-missing',
+                    [System.StringComparison]::Ordinal
+                )
+            ) {
+                $runnerFailureObserved = $true
+                break
+            }
+            $nextException = $candidateException.InnerException
+            if (
+                $null -ne $nextException -and
+                [object]::ReferenceEquals(
+                    $candidateException,
+                    $nextException
+                )
+            ) {
+                break
+            }
+            $candidateException = $nextException
+        }
     }
-    if (
-        -not [string]::Equals(
-            $runnerFailure,
-            'trusted-setsid-missing',
-            [System.StringComparison]::Ordinal
-        )
-    ) {
+    if (-not $runnerFailureObserved) {
         throw 'The runner did not return the fixed trusted-setsid-missing failure.'
     }
     if ([System.IO.File]::Exists($sentinel)) {
