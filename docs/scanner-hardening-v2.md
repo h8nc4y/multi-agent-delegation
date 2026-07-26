@@ -110,6 +110,8 @@
 
 ## Handoff
 
-- 現在: pushed base `eb257d1` の独立 review で検出した child environment / `Get-Variable` / alias・provider・外部script・module load実行境界を実装・契約同期した。最新code treeはWindows PS7 / PS5.1 / Ubuntuのreadiness・full self-test・repository scan、AST / YAML / diff / Gitleaks / applicable generic Semgrep gateを実測済み。PSScriptAnalyzerは未導入のため未確認。
-- commit / push / PR: base `eb257d1` はpush済み。追補treeは対象8ファイルだけをexact stageし、commit / push / PRせず統合担当へ引き継ぐ。
+- 統合状況（2026-07-26確認）: scanner境界強化はPR #3（merge commit `36e4d08`）、Windows PowerShell 5.1のhandle probe安定化はPR #4（merge commit `07d593a`）として`main`へ統合済み。state sync着手前にlocal `main` = `origin/main` = `07d593a`、tracked tree cleanを確認した。
+- 検証証拠: GitHub Actions `Validate` run `30160602927` はcommit `07d593a` に対するWindows / Ubuntu jobが成功した。localではreadinessをPowerShell 7 / Windows PowerShell 5.1で、repository scanをPowerShell 7で実行して成功した。以後の統合状態は最新のdefault branchとGitHub Actionsを正本とし、この項目のcommit / runは2026-07-26時点の証拠baselineとして扱う。
+- 残る未確認事項: PSScriptAnalyzerは未導入。PATH先頭native Git candidateの署名・配布元identity、PID / PGIDが意図したprocessであることのkernel-level identity、aggregate handle増加のhandle type別内訳は未確認。
+- commit / push / PR: 未統合の実装WIPや旧追補treeはない。
 - external cost / OAuth / secret / real data: 使用しない
