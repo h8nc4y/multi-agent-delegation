@@ -2080,7 +2080,7 @@ Assert-FileContains `
     -Description 'missing implementation/helper, helper exception, and isolation failure redaction regressions'
 Assert-FileContains `
     -RelativePath 'scripts/test-macos-fail-closed.ps1' `
-    -Pattern '(?s)Get-PrivateMarkerTrustedSetsidPath.*?trusted-setsid-missing.*?scanner-runtime-failed.*?ExitCode\s+-ne\s+2' `
+    -Pattern '(?s)Get-PrivateMarkerTrustedSetsidPath.*?trusted-setsid-missing.*?Private marker scan failed closed \(integrity: git-probe\)\..*?ExitCode\s+-ne\s+2' `
     -Description 'native macOS unsupported-platform fail-closed contract'
 
 $workflowPath = '.github/workflows/validate.yml'

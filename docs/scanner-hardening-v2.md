@@ -50,7 +50,7 @@
 1. top-level key は `name`、`on`、`permissions`、`jobs` の exact sequence とする。
 2. trigger は `pull_request` と `main` への `push`、permission は top-level `contents: read` だけとし、job-local override を許可しない。
 3. job ID、各 job の direct key、全 step property を exact に検査し、third-party action は full commit SHA pin だけを許可する。
-4. Windows、Ubuntu 24.04、macOS 15の3 jobを固定する。macOS jobはfull scanner成功ではなく、trusted `setsid`不在時にsynthetic targetを起動せず固定診断へ畳むunsupported-platform契約だけを検証する。
+4. Windows、Ubuntu 24.04、macOS 15の3 jobを固定する。macOS jobはfull scanner成功ではなく、trusted `setsid`不在時にsynthetic targetを起動せず、repository rootの最初のbounded Git probeを固定診断 `Private marker scan failed closed (integrity: git-probe).`、空stderr、exit 2へ畳むunsupported-platform契約だけを検証する。
 5. `pull_request_target`、extra trigger、duplicate job、job permission override、mutable action ref の synthetic mutation が validator を通らないことを self-check する。
 
 ### Resource caps
@@ -116,5 +116,5 @@
 - 検証証拠: GitHub Actions `Validate` run `30160602927` はcommit `07d593a` に対するWindows / Ubuntu jobが成功した。localではreadinessをPowerShell 7 / Windows PowerShell 5.1で、repository scanをPowerShell 7で実行して成功した。以後の統合状態は最新のdefault branchとGitHub Actionsを正本とし、この項目のcommit / runは2026-07-26時点の証拠baselineとして扱う。
 - 現在のWIP（2026-07-27確認）: branch `test/macos-ci-validation` のcommit `fd8e194`までをpushし、PR #6でmacOS 15 unsupported-platform CI契約を検証中。localではreadiness、scanner self-test、repository scanをPowerShell 7 / Windows PowerShell 5.1で実行して成功し、Gitleaksとcached `git diff --check`も成功した。Semgrepは対象fileなしでskipされた。各source freezeは独立reviewでP1/P2/P3すべて0だった。
 - 残る未確認事項: PSScriptAnalyzerは未導入。PATH先頭native Git candidateの署名・配布元identity、PID / PGIDが意図したprocessであることのkernel-level identity、aggregate handle増加のhandle type別内訳は未確認。
-- commit / push / PR: 初回run `30211691039` のwrapper exception比較defectは修正済み。2回目run `30211979565` はpublic scanner exact boundaryまで進み、3回目run `30212238159` ではmacOS stdoutだけを`unexpected-shape`へ限定した。同runのWindows PowerShell 5.1 handle probeもsteady-state final growth 5（limit 4）で失敗しており、更新後CIでflakyか回帰かを再確認する。StreamReaderのBOM正規化を避け、cap後も有限childをblockしないbounded raw BaseStream drain修正を0 / 65535 / 65536 / 65537 byte境界と1 MiB pipe fixtureで再freeze・独立reviewし、原因修正後のWindows / Ubuntu / macOS全job成功を統合条件とする。
+- commit / push / PR: 初回run `30211691039` のwrapper exception比較defectは修正済み。2回目run `30211979565` はpublic scanner exact boundaryまで進み、3回目run `30212238159` ではmacOS stdoutだけを`unexpected-shape`へ限定した。同runのWindows PowerShell 5.1 handle probeもsteady-state final growth 5（limit 4）で失敗しており、更新後CIでflakyか回帰かを再確認する。StreamReaderのBOM正規化を避け、cap後も有限childをblockしないbounded raw BaseStream drain修正を0 / 65535 / 65536 / 65537 byte境界と1 MiB pipe fixtureで再freeze・独立reviewした。4回目run `30213839522` はraw capture自体を通過し、安全な分類`stdout-other-fixed-shape`まで絞り込んだ。repository rootでは最初のbounded Git probeがtrusted `setsid`不在で拒否されるため、公開scannerの正しい既存境界はruntime診断でなく固定integrity診断`git-probe`である。テスト期待値をこのexact boundaryへ合わせた後、Windows / Ubuntu / macOS全job成功を統合条件とする。
 - external cost / OAuth / secret / real data: 使用しない

@@ -438,10 +438,13 @@ try {
                 $standardOutputIsStrictUtf8 = $false
             }
         }
-        $runtimeOutputBase = (
-            'Private marker scan failed: scanner-runtime-failed'
+        # repository rootでは最初のbounded Git probeがtrusted setsid不在で
+        # 起動前に拒否される。scannerは曖昧なGit control metadataを通常の
+        # runtime failureへdowngradeせず、既存の固定integrity境界へ畳む。
+        $integrityOutputBase = (
+            'Private marker scan failed closed (integrity: git-probe).'
         )
-        $expectedOutput = $runtimeOutputBase + [Environment]::NewLine
+        $expectedOutput = $integrityOutputBase + [Environment]::NewLine
         $boundaryFailures = New-Object System.Collections.Generic.List[string]
         if ($process.ExitCode -ne 2) {
             $boundaryFailures.Add(
@@ -468,6 +471,10 @@ try {
                 [System.StringComparison]::Ordinal
             )
         ) {
+            $runtimeOutput = (
+                'Private marker scan failed: scanner-runtime-failed' +
+                [Environment]::NewLine
+            )
             $entrypointOutput = (
                 'Private marker scan failed: scanner-entrypoint-failed' +
                 [Environment]::NewLine
@@ -479,6 +486,14 @@ try {
             } elseif (
                 [string]::Equals(
                     $standardOutput,
+                    $runtimeOutput,
+                    [System.StringComparison]::Ordinal
+                )
+            ) {
+                'stdout-runtime-fixed'
+            } elseif (
+                [string]::Equals(
+                    $standardOutput,
                     $entrypointOutput,
                     [System.StringComparison]::Ordinal
                 )
@@ -487,19 +502,19 @@ try {
             } elseif (
                 [string]::Equals(
                     $standardOutput,
-                    ($runtimeOutputBase + "`r`n"),
+                    ($integrityOutputBase + "`r`n"),
                     [System.StringComparison]::Ordinal
                 )
             ) {
-                'stdout-runtime-crlf'
+                'stdout-integrity-crlf'
             } elseif (
                 [string]::Equals(
                     $standardOutput,
-                    $runtimeOutputBase,
+                    $integrityOutputBase,
                     [System.StringComparison]::Ordinal
                 )
             ) {
-                'stdout-runtime-no-newline'
+                'stdout-integrity-no-newline'
             } elseif (
                 [string]::Equals(
                     $standardOutput,
@@ -507,21 +522,21 @@ try {
                     [System.StringComparison]::Ordinal
                 )
             ) {
-                'stdout-runtime-extra-newline'
+                'stdout-integrity-extra-newline'
             } elseif (
                 $standardOutput.StartsWith(
-                    $runtimeOutputBase,
+                    $integrityOutputBase,
                     [System.StringComparison]::Ordinal
                 )
             ) {
-                'stdout-runtime-prefix-extra'
+                'stdout-integrity-prefix-extra'
             } elseif (
                 $standardOutput.Contains(
-                    $runtimeOutputBase,
+                    $integrityOutputBase,
                     [System.StringComparison]::Ordinal
                 )
             ) {
-                'stdout-runtime-embedded-extra'
+                'stdout-integrity-embedded-extra'
             } else {
                 # raw output、長さ、hashを公開せずshape不一致だけを報告する。
                 'stdout-other-fixed-shape'
