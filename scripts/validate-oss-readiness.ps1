@@ -104,7 +104,11 @@ function Test-WindowsHandleProbeLoopContract {
         $initializer.Left -isnot
             [System.Management.Automation.Language.VariableExpressionAst] -or
         -not $initializer.Left.VariablePath.IsUnqualified -or
-        $initializer.Left.VariablePath.UserPath -cne $CounterName -or
+        -not [string]::Equals(
+            $initializer.Left.VariablePath.UserPath,
+            $CounterName,
+            [System.StringComparison]::Ordinal
+        ) -or
         $initializer.Right -isnot
             [System.Management.Automation.Language.CommandExpressionAst] -or
         $initializer.Right.Expression -isnot
@@ -142,8 +146,12 @@ function Test-WindowsHandleProbeLoopContract {
             $iterator.PipelineElements[0].
                 Expression.Child.VariablePath.IsUnqualified
         ) -or
-        $iterator.PipelineElements[0].
-            Expression.Child.VariablePath.UserPath -cne $CounterName
+        -not [string]::Equals(
+            $iterator.PipelineElements[0].
+                Expression.Child.VariablePath.UserPath,
+            $CounterName,
+            [System.StringComparison]::Ordinal
+        )
     ) {
         return $false
     }
@@ -479,7 +487,13 @@ function Test-WindowsHandleProbeContract {
     finally {
         $sha256.Dispose()
     }
-    if ($actualSourceSha256 -cne $expectedSourceSha256) {
+    if (
+        -not [string]::Equals(
+            $actualSourceSha256,
+            $expectedSourceSha256,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
         return $false
     }
 
@@ -498,7 +512,13 @@ function Test-StringSequenceEqual {
         return $false
     }
     for ($index = 0; $index -lt $Left.Count; $index++) {
-        if ($Left[$index] -cne $Right[$index]) {
+        if (
+            -not [string]::Equals(
+                $Left[$index],
+                $Right[$index],
+                [System.StringComparison]::Ordinal
+            )
+        ) {
             return $false
         }
     }
@@ -535,7 +555,13 @@ function Test-WorkflowBoundaryContract {
 
     $jobsIndexes = @()
     for ($index = 0; $index -lt $lines.Count; $index++) {
-        if ($lines[$index] -ceq 'jobs:') {
+        if (
+            [string]::Equals(
+                $lines[$index],
+                'jobs:',
+                [System.StringComparison]::Ordinal
+            )
+        ) {
             $jobsIndexes += $index
         }
     }
@@ -582,7 +608,7 @@ function Test-WorkflowBoundaryContract {
         -not (
             Test-StringSequenceEqual `
                 -Left @($jobNames.ToArray()) `
-                -Right @('validate', 'validate_ubuntu')
+                -Right @('validate', 'validate_ubuntu', 'validate_macos')
         )
     ) {
         return $false
@@ -592,7 +618,7 @@ function Test-WorkflowBoundaryContract {
     }
 
     # third-party action は immutable full commit SHA だけを許可する。
-    # 現 workflow は Windows/Ubuntu 各 1 回の checkout 以外を持たない。
+    # 現 workflow は Windows/Ubuntu/macOS 各 1 回の checkout 以外を持たない。
     $expectedCheckout = (
         'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
     )
@@ -608,12 +634,16 @@ function Test-WorkflowBoundaryContract {
             ) | Out-Null
         }
     }
-    if ($usesValues.Count -ne 2) {
+    if ($usesValues.Count -ne 3) {
         return $false
     }
     foreach ($usesValue in $usesValues) {
         if (
-            $usesValue -cne $expectedCheckout -or
+            -not [string]::Equals(
+                $usesValue,
+                $expectedCheckout,
+                [System.StringComparison]::Ordinal
+            ) -or
             $usesValue -cnotmatch
                 '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$'
         ) {
@@ -834,7 +864,13 @@ function Assert-WorkflowJobSet {
     )
     if ($expectedSequenceMatches) {
         for ($index = 0; $index -lt $ExpectedJobs.Count; $index++) {
-            if ($actualJobs[$index] -cne $ExpectedJobs[$index]) {
+            if (
+                -not [string]::Equals(
+                    $actualJobs[$index],
+                    $ExpectedJobs[$index],
+                    [System.StringComparison]::Ordinal
+                )
+            ) {
                 $expectedSequenceMatches = $false
                 break
             }
@@ -1120,12 +1156,27 @@ function Assert-WorkflowUsesStep {
         [string]$Uses
     )
 
-    $matches = @($Steps | Where-Object { $_.Name -ceq $Name })
+    $matches = @(
+        $Steps |
+            Where-Object {
+                [string]::Equals(
+                    $_.Name,
+                    $Name,
+                    [System.StringComparison]::Ordinal
+                )
+            }
+    )
     if ($matches.Count -ne 1) {
         Add-Failure "Workflow must contain exactly one active step named '$Name' (found $($matches.Count))"
         return
     }
-    if ($matches[0].Uses -cne $Uses) {
+    if (
+        -not [string]::Equals(
+            $matches[0].Uses,
+            $Uses,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
         Add-Failure "Workflow step '$Name' must use '$Uses' (found '$($matches[0].Uses)')"
     }
     if ($matches[0].UsesCount -ne 1 -or
@@ -1146,7 +1197,16 @@ function Assert-WorkflowStep {
         [string]$Run
     )
 
-    $matches = @($Steps | Where-Object { $_.Name -ceq $Name })
+    $matches = @(
+        $Steps |
+            Where-Object {
+                [string]::Equals(
+                    $_.Name,
+                    $Name,
+                    [System.StringComparison]::Ordinal
+                )
+            }
+    )
     if ($matches.Count -ne 1) {
         Add-Failure "Workflow must contain exactly one active step named '$Name' (found $($matches.Count))"
         return
@@ -1164,7 +1224,13 @@ function Assert-WorkflowStep {
     if (-not $step.Shell.Equals($Shell, [System.StringComparison]::OrdinalIgnoreCase)) {
         Add-Failure "Workflow step '$Name' must use shell '$Shell' (found '$($step.Shell)')"
     }
-    if ($step.Run -cne $Run) {
+    if (
+        -not [string]::Equals(
+            $step.Run,
+            $Run,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
         Add-Failure "Workflow step '$Name' must run '$Run' (found '$($step.Run)')"
     }
 }
@@ -1257,6 +1323,7 @@ $requiredFiles = @(
     'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
     'scripts/scan-private-markers-v2.ps1',
+    'scripts/test-macos-fail-closed.ps1',
     'scripts/test-private-marker-handle-stability.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'
@@ -1444,7 +1511,13 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             $zeroRunCase.Before,
             $zeroRunCase.After
         )
-        if ($zeroRunFixture -ceq $windowsHandleProbeSource) {
+        if (
+            [string]::Equals(
+                $zeroRunFixture,
+                $windowsHandleProbeSource,
+                [System.StringComparison]::Ordinal
+            )
+        ) {
             Add-Failure (
                 'Windows handle readiness zero-run fixture setup failed: ' +
                 $zeroRunCase.Name
@@ -1497,7 +1570,11 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             [ref]$limitFixtureParseErrors
         ) | Out-Null
         if (
-            $limitReassignmentFixture -ceq $windowsHandleProbeSource -or
+            [string]::Equals(
+                $limitReassignmentFixture,
+                $windowsHandleProbeSource,
+                [System.StringComparison]::Ordinal
+            ) -or
             $limitFixtureParseErrors.Count -ne 0
         ) {
             Add-Failure (
@@ -1554,7 +1631,11 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             [ref]$runnerFixtureParseErrors
         ) | Out-Null
         if (
-            $runnerSubstitutionFixture -ceq $windowsHandleProbeSource -or
+            [string]::Equals(
+                $runnerSubstitutionFixture,
+                $windowsHandleProbeSource,
+                [System.StringComparison]::Ordinal
+            ) -or
             $runnerFixtureParseErrors.Count -ne 0
         ) {
             Add-Failure (
@@ -1632,7 +1713,11 @@ Microsoft.PowerShell.Utility\Set-Alias `
             [ref]$canonicalSealParseErrors
         ) | Out-Null
         if (
-            $canonicalSealFixture -ceq $windowsHandleProbeSource -or
+            [string]::Equals(
+                $canonicalSealFixture,
+                $windowsHandleProbeSource,
+                [System.StringComparison]::Ordinal
+            ) -or
             $canonicalSealParseErrors.Count -ne 0
         ) {
             Add-Failure (
@@ -1676,7 +1761,11 @@ function Invoke-PrivateMarkerBoundedProcess {
         [ref]$shadowFixtureParseErrors
     ) | Out-Null
     if (
-        $shadowFunctionFixture -ceq $windowsHandleProbeSource -or
+        [string]::Equals(
+            $shadowFunctionFixture,
+            $windowsHandleProbeSource,
+            [System.StringComparison]::Ordinal
+        ) -or
         $shadowFixtureParseErrors.Count -ne 0
     ) {
         Add-Failure (
@@ -1989,12 +2078,16 @@ Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
     -Pattern '(?s)missing-implementation.*?missing-runner.*?throwing-runner.*?isolation-create-failure.*?isolation-remove-failure' `
     -Description 'missing implementation/helper, helper exception, and isolation failure redaction regressions'
+Assert-FileContains `
+    -RelativePath 'scripts/test-macos-fail-closed.ps1' `
+    -Pattern '(?s)Get-PrivateMarkerTrustedSetsidPath.*?trusted-setsid-missing.*?scanner-runtime-failed.*?ExitCode\s+-ne\s+2' `
+    -Description 'native macOS unsupported-platform fail-closed contract'
 
 $workflowPath = '.github/workflows/validate.yml'
 Assert-WorkflowBoundaryContract -RelativePath $workflowPath
 Assert-WorkflowJobSet `
     -RelativePath $workflowPath `
-    -ExpectedJobs @('validate', 'validate_ubuntu')
+    -ExpectedJobs @('validate', 'validate_ubuntu', 'validate_macos')
 Assert-WorkflowJobTimeout `
     -RelativePath $workflowPath `
     -JobName 'validate' `
@@ -2002,6 +2095,10 @@ Assert-WorkflowJobTimeout `
 Assert-WorkflowJobTimeout `
     -RelativePath $workflowPath `
     -JobName 'validate_ubuntu' `
+    -Minutes 25
+Assert-WorkflowJobTimeout `
+    -RelativePath $workflowPath `
+    -JobName 'validate_macos' `
     -Minutes 25
 Assert-WorkflowJobDirectValue `
     -RelativePath $workflowPath `
@@ -2013,6 +2110,11 @@ Assert-WorkflowJobDirectValue `
     -JobName 'validate_ubuntu' `
     -Key 'runs-on' `
     -Value 'ubuntu-24.04'
+Assert-WorkflowJobDirectValue `
+    -RelativePath $workflowPath `
+    -JobName 'validate_macos' `
+    -Key 'runs-on' `
+    -Value 'macos-15'
 
 $workflowSteps = Get-WorkflowSteps `
     -RelativePath $workflowPath `
@@ -2074,10 +2176,36 @@ Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Scan for private markers'
 Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Check whitespace' `
     -Shell 'pwsh' -Run $whitespaceCommand
 
+$macosWorkflowSteps = Get-WorkflowSteps `
+    -RelativePath $workflowPath `
+    -JobName 'validate_macos'
+Assert-WorkflowStepCount `
+    -Steps $macosWorkflowSteps `
+    -JobName 'validate_macos' `
+    -ExpectedCount 4
+$macosWorkflowJobLines = Get-WorkflowJobLines `
+    -RelativePath $workflowPath `
+    -JobName 'validate_macos'
+Assert-WorkflowJobShape `
+    -Lines $macosWorkflowJobLines `
+    -JobName 'validate_macos' `
+    -ExpectedStepCount 4 `
+    -ExpectedShellCount 3 `
+    -ExpectedRunCount 3
+Assert-WorkflowUsesStep -Steps $macosWorkflowSteps -Name 'Check out repository' `
+    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Validate OSS readiness' `
+    -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
+Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Test unsupported macOS fail-closed contract' `
+    -Shell 'pwsh' -Run './scripts/test-macos-fail-closed.ps1'
+Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Check whitespace' `
+    -Shell 'pwsh' -Run $whitespaceCommand
+
 foreach ($powerShellScript in @(
     'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
     'scripts/scan-private-markers-v2.ps1',
+    'scripts/test-macos-fail-closed.ps1',
     'scripts/test-private-marker-handle-stability.ps1',
     'scripts/test-scan-private-markers.ps1',
     'scripts/validate-oss-readiness.ps1'

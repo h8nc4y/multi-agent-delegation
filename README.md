@@ -176,7 +176,9 @@ repository paths you cannot publish, or customer data in public issues.
   mapping for other environments is described in SKILL.md, but exact resume
   semantics differ per tool.
 - CI measures PowerShell 7 and Windows PowerShell 5.1 on Windows, plus
-  PowerShell 7 on Ubuntu 24.04.
+  PowerShell 7 on Ubuntu 24.04. macOS 15 CI verifies only the explicit
+  unsupported-platform fail-closed boundary; it does not run the full scanner
+  suite.
 
 ## Non-Goals
 
@@ -255,7 +257,7 @@ likewise limited to the SHA-256-pinned source prefix and
 `Microsoft.PowerShell.Core\Import-Module` of the sibling runner module. Scanner
 entry/helper/isolation failures return one fixed redacted stdout line, empty
 stderr, and exit code 2. Workflow validation fixes the top-level triggers,
-read-only permission, two job IDs, job-local permission absence, exact steps,
+read-only permission, three job IDs, job-local permission absence, exact steps,
 and full-SHA action pins.
 Every scanner and Git child process has a finite timeout, and each scan has a
 two-minute monotonic deadline. A child operation's budget begins before
@@ -375,6 +377,11 @@ git diff --check
 The GitHub Actions workflow runs validation, the private-marker self-test and
 repository scan, and whitespace checks on Windows and Ubuntu 24.04. Windows
 tests both PowerShell 7 and Windows PowerShell 5.1; Ubuntu tests PowerShell 7.
+Because GitHub-hosted macOS does not provide either trusted `setsid` path, a
+separate macOS 15 job proves that the process runner rejects a synthetic
+target before launch and that the public scanner returns fixed redacted
+stdout, empty stderr, and exit code 2. It does not claim full scanner support
+on macOS.
 Each job has a 25-minute timeout.
 
 ## Contributing

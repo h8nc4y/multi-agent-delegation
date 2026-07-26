@@ -1,0 +1,167 @@
+﻿[CmdletBinding()]
+param()
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# macOSはtrusted `setsid`を標準搭載しない。暗黙のparent-only killへ
+# downgradeせず、target起動前とpublic scanner境界の双方が固定診断で
+# fail closedになることだけをnative runner上で検証する。
+if (-not $IsMacOS) {
+    throw 'This contract test must run on macOS.'
+}
+
+$scriptRoot = $PSScriptRoot
+$repoRoot = Split-Path -Parent $scriptRoot
+$runnerModule = Join-Path $scriptRoot 'private-marker-process-runner.psm1'
+$scanner = Join-Path $scriptRoot 'scan-private-markers.ps1'
+Microsoft.PowerShell.Core\Import-Module $runnerModule -Force -ErrorAction Stop
+
+if (-not [string]::IsNullOrEmpty((Get-PrivateMarkerTrustedSetsidPath))) {
+    throw 'macOS unexpectedly exposed a trusted setsid path; review the POSIX contract.'
+}
+
+$temporaryParent = [System.IO.Path]::GetFullPath(
+    [System.IO.Path]::GetTempPath()
+)
+$temporaryRoot = Join-Path $temporaryParent (
+    'multi-agent-delegation-macos-contract-' +
+    [System.Guid]::NewGuid().ToString('N')
+)
+[System.IO.Directory]::CreateDirectory($temporaryRoot) | Out-Null
+
+try {
+    # synthetic sentinelはrunnerがtargetを一命令も起動していないことを示す。
+    $sentinel = Join-Path $temporaryRoot 'target-ran'
+    $environment = [System.Collections.Generic.Dictionary[string, string]]::new(
+        [System.StringComparer]::Ordinal
+    )
+    $runnerFailure = ''
+    try {
+        [void](Invoke-PrivateMarkerBoundedProcess `
+            -FilePath '/bin/sh' `
+            -Arguments @(
+                '-c',
+                'printf ran > "$1"',
+                'synthetic-runner',
+                $sentinel
+            ) `
+            -WorkingDirectory $repoRoot `
+            -EnvironmentVariables $environment `
+            -TimeoutMilliseconds 5000 `
+            -KillWaitMilliseconds 1000 `
+            -MaxStandardOutputBytes 4096 `
+            -MaxStandardErrorBytes 4096)
+    }
+    catch {
+        $runnerFailure = [string]$_.Exception.Message
+    }
+    if (
+        -not [string]::Equals(
+            $runnerFailure,
+            'trusted-setsid-missing',
+            [System.StringComparison]::Ordinal
+        )
+    ) {
+        throw 'The runner did not return the fixed trusted-setsid-missing failure.'
+    }
+    if ([System.IO.File]::Exists($sentinel)) {
+        throw 'The unsupported-platform runner started the synthetic target.'
+    }
+
+    # public scannerもraw exception/pathを出さず、固定stdout・空stderr・exit 2
+    # へ畳む。async pipe drainでchildのbuffer待ちdeadlockを避ける。
+    $powerShellPath = (
+        [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    )
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $powerShellPath
+    [void]$startInfo.ArgumentList.Add('-NoLogo')
+    [void]$startInfo.ArgumentList.Add('-NoProfile')
+    [void]$startInfo.ArgumentList.Add('-NonInteractive')
+    [void]$startInfo.ArgumentList.Add('-File')
+    [void]$startInfo.ArgumentList.Add($scanner)
+    [void]$startInfo.ArgumentList.Add('-Path')
+    [void]$startInfo.ArgumentList.Add($repoRoot)
+    $startInfo.WorkingDirectory = $repoRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $standardOutputTask = $null
+    $standardErrorTask = $null
+    try {
+        if (-not $process.Start()) {
+            throw 'The scanner contract child did not start.'
+        }
+        $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
+        $standardErrorTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(30000)) {
+            $process.Kill($true)
+            [void]$process.WaitForExit(5000)
+            throw 'The scanner contract child exceeded its bounded timeout.'
+        }
+        $drained = [System.Threading.Tasks.Task]::WaitAll(
+            [System.Threading.Tasks.Task[]]@(
+                $standardOutputTask,
+                $standardErrorTask
+            ),
+            5000
+        )
+        if (-not $drained) {
+            throw 'The scanner contract child pipes did not drain within the bounded timeout.'
+        }
+        $standardOutput = $standardOutputTask.GetAwaiter().GetResult()
+        $standardError = $standardErrorTask.GetAwaiter().GetResult()
+        $expectedOutput = (
+            'Private marker scan failed: scanner-runtime-failed' +
+            [Environment]::NewLine
+        )
+        if (
+            $process.ExitCode -ne 2 -or
+            -not [string]::Equals(
+                $standardOutput,
+                $expectedOutput,
+                [System.StringComparison]::Ordinal
+            ) -or
+            -not [string]::IsNullOrEmpty($standardError)
+        ) {
+            throw 'The public scanner did not preserve its fixed unsupported-platform boundary.'
+        }
+    }
+    finally {
+        if (
+            $null -ne $standardOutputTask -and
+            $standardOutputTask.IsCompleted
+        ) {
+            $standardOutputTask.Dispose()
+        }
+        if (
+            $null -ne $standardErrorTask -and
+            $standardErrorTask.IsCompleted
+        ) {
+            $standardErrorTask.Dispose()
+        }
+        $process.Dispose()
+    }
+}
+finally {
+    # 自分で作成したfixed parent直下の一意directoryだけを再帰削除する。
+    $resolvedTemporaryRoot = [System.IO.Path]::GetFullPath($temporaryRoot)
+    $expectedPrefix = $temporaryParent.TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar
+    ) + [System.IO.Path]::DirectorySeparatorChar
+    if (
+        $resolvedTemporaryRoot.StartsWith(
+            $expectedPrefix,
+            [System.StringComparison]::Ordinal
+        ) -and
+        [System.IO.Directory]::Exists($resolvedTemporaryRoot)
+    ) {
+        [System.IO.Directory]::Delete($resolvedTemporaryRoot, $true)
+    }
+}
+
+Write-Host 'macOS unsupported-platform fail-closed contract passed.'

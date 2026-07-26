@@ -125,6 +125,11 @@ The format loosely follows Keep a Changelog conventions.
   immutable action pins, mutation rejection, and 25-minute job deadlines.
 - Pinned the checkout action to the v5.0.1 commit instead of a mutable major
   tag.
+- Added a native macOS 15 CI job for the explicitly unsupported runner path.
+  It uses only synthetic input to prove that the missing trusted `setsid`
+  boundary rejects the target before launch and that the public scanner emits
+  fixed redacted stdout, empty stderr, and exit code 2. Windows and Ubuntu
+  remain the full scanner-support jobs.
 
 ## 0.1.0 - 2026-07-16
 

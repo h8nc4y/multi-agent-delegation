@@ -3,7 +3,7 @@
 ## 目的と分類
 
 - 分類: Class L（公開用 security scanner、複数 OS の process 境界、Git index/worktree 契約を変更）
-- 目的: scan 対象・実行中 snapshot・child process・診断出力の各境界を fail closed にし、Windows と Ubuntu の実測可能な同一契約へ揃える。
+- 目的: scan 対象・実行中 snapshot・child process・診断出力の各境界を fail closed にし、Windows と Ubuntu の実測可能な同一契約へ揃える。macOS はtrusted `setsid`不在時のunsupported-platform境界をnative runnerで実測する。
 - 非目的: あらゆる secret 形式を検出すること、real credential を fixture に使うこと、外部サービスへデータを送ること。
 
 ## Source of truth
@@ -50,7 +50,8 @@
 1. top-level key は `name`、`on`、`permissions`、`jobs` の exact sequence とする。
 2. trigger は `pull_request` と `main` への `push`、permission は top-level `contents: read` だけとし、job-local override を許可しない。
 3. job ID、各 job の direct key、全 step property を exact に検査し、third-party action は full commit SHA pin だけを許可する。
-4. `pull_request_target`、extra trigger、duplicate job、job permission override、mutable action ref の synthetic mutation が validator を通らないことを self-check する。
+4. Windows、Ubuntu 24.04、macOS 15の3 jobを固定する。macOS jobはfull scanner成功ではなく、trusted `setsid`不在時にsynthetic targetを起動せず固定診断へ畳むunsupported-platform契約だけを検証する。
+5. `pull_request_target`、extra trigger、duplicate job、job permission override、mutable action ref の synthetic mutation が validator を通らないことを self-check する。
 
 ### Resource caps
 
@@ -95,6 +96,7 @@
 - Windows PowerShell 7
 - Windows PowerShell 5.1
 - official PowerShell Ubuntu container + Ubuntu Git 2.43
+- GitHub-hosted macOS 15 + PowerShell 7（trusted `setsid`不在時のfail-closed契約のみ。full scanner supportではない）
 
 ### 最終 gate
 
@@ -112,6 +114,7 @@
 
 - 統合状況（2026-07-26確認）: scanner境界強化はPR #3（merge commit `36e4d08`）、Windows PowerShell 5.1のhandle probe安定化はPR #4（merge commit `07d593a`）として`main`へ統合済み。state sync着手前にlocal `main` = `origin/main` = `07d593a`、tracked tree cleanを確認した。
 - 検証証拠: GitHub Actions `Validate` run `30160602927` はcommit `07d593a` に対するWindows / Ubuntu jobが成功した。localではreadinessをPowerShell 7 / Windows PowerShell 5.1で、repository scanをPowerShell 7で実行して成功した。以後の統合状態は最新のdefault branchとGitHub Actionsを正本とし、この項目のcommit / runは2026-07-26時点の証拠baselineとして扱う。
+- 現在のWIP（2026-07-27確認）: branch `test/macos-ci-validation` でmacOS 15 unsupported-platform CI契約を追加中。旧freezeはstaged tree `67d4e1a`、cached patch object `9aeba62`。localではreadiness、scanner self-test、repository scanをPowerShell 7 / Windows PowerShell 5.1で実行して成功し、Gitleaksとcached `git diff --check`も成功した。Semgrepは対象fileなしでskipされた。
 - 残る未確認事項: PSScriptAnalyzerは未導入。PATH先頭native Git candidateの署名・配布元identity、PID / PGIDが意図したprocessであることのkernel-level identity、aggregate handle増加のhandle type別内訳は未確認。
-- commit / push / PR: 未統合の実装WIPや旧追補treeはない。
+- commit / push / PR: macOS CI WIPは未commit・未push・PR未作成。native macOS 15 jobの実行結果も未確認であり、source再freeze後の独立reviewとGitHub Actions成功を統合条件とする。
 - external cost / OAuth / secret / real data: 使用しない
