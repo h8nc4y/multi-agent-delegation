@@ -87,7 +87,7 @@ The format loosely follows Keep a Changelog conventions.
   and buffers instead of relying on GC. The Windows regression now runs in a
   dedicated script in a fresh instance of the same PowerShell executable,
   after the main self-test has proved raw transport. It bounds aggregate handle
-  growth across a 40-invocation startup window before applying a final limit of
+  growth across an 80-invocation startup window before applying a final limit of
   4 and a peak limit of 12 to a separate 40-run steady-state window. A bounded
   10-by-50 ms quiescence sample records the minimum settled final without
   starting another child or forcing GC. This accounts for observed short-lived

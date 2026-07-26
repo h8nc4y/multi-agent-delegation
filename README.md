@@ -339,7 +339,7 @@ an arbitrary binary fixture first, then compares a native
 Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
 buffers. After the main self-test proves raw byte transport, Windows launches
 a dedicated handle-probe script in a fresh instance of the same PowerShell
-executable. That host measures a forty-invocation startup window with a bounded
+executable. That host measures an eighty-invocation startup window with a bounded
 aggregate handle-growth allowance, then applies a final limit of 4 and a peak
 limit of 12 to a separate forty-run steady-state window. A bounded 10-by-50 ms
 quiescence sample records the minimum settled final without starting another

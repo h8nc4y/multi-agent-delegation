@@ -47,9 +47,9 @@ try {
     $handleProbeArguments = @('/d', '/c', 'exit', '0')
     $handleProbeEnvironment = New-PrivateMarkerChildEnvironment
 
-    # 最初の40回はruntimeの一度限りの初期化を含むstartup window。ここにも上限を
+    # 最初の80回はruntimeの一度限りの初期化を含むstartup window。ここにも上限を
     # 設け、初期化という名目で継続的なrunner所有handle漏れを隠さない。
-    $handleWarmupRuns = 40
+    $handleWarmupRuns = 80
     $handleMeasuredRuns = 40
     $handleStartupGrowthLimit = 16
     # HandleCountはrunner所有handleだけでなく、Windows PowerShell runtimeの

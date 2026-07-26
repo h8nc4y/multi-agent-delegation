@@ -299,6 +299,32 @@ function Test-WindowsHandleSeriesWithinLimits {
     )
 }
 
+function Test-WindowsHandleWindowsWithinLimits {
+    param(
+        [int]$StartupBaseline,
+        [int]$WarmupFinal,
+        [int]$WarmupMaximum,
+        [int]$ObservedFinal,
+        [int]$MeasuredMaximum,
+        [int[]]$QuiescenceSamples
+    )
+
+    # startup 80回全体のcapと、その後40回の厳格な増加を別々に適用する。
+    # call 41-80だけで一度増えてplateauするruntime初期化はstartupへ留まり、
+    # 次の40回でも増える低頻度leakはmeasured final上限で拒否される。
+    return (
+        ($WarmupFinal - $StartupBaseline) -le 16 -and
+        ($WarmupMaximum - $StartupBaseline) -le 16 -and
+        (
+            Test-WindowsHandleSeriesWithinLimits `
+                -Baseline $WarmupFinal `
+                -ObservedFinal $ObservedFinal `
+                -Maximum $MeasuredMaximum `
+                -QuiescenceSamples $QuiescenceSamples
+        )
+    )
+}
+
 function Test-WindowsHandleProbeAstContract {
     param(
         [Parameter(Mandatory = $true)]
@@ -411,7 +437,7 @@ function Test-WindowsHandleProbeAstContract {
     # run数とgrowth上限は、同じTry直下で各1回だけ定数代入し、最初のloopより
     # 前に確定させる。loop直前の0再代入や、evidence直前の40復元を拒否する。
     $constantAssignments = @(
-        [pscustomobject]@{ Name = 'handleWarmupRuns'; Value = 40 },
+        [pscustomobject]@{ Name = 'handleWarmupRuns'; Value = 80 },
         [pscustomobject]@{ Name = 'handleMeasuredRuns'; Value = 40 },
         [pscustomobject]@{ Name = 'handleStartupGrowthLimit'; Value = 16 },
         [pscustomobject]@{
@@ -528,7 +554,7 @@ function Test-WindowsHandleProbeAstContract {
 
     $prefixContract = (
         '(?s)' +
-        '\$handleWarmupRuns\s*=\s*40.*?' +
+        '\$handleWarmupRuns\s*=\s*80.*?' +
         '\$handleMeasuredRuns\s*=\s*40.*?' +
         '\$handleStartupGrowthLimit\s*=\s*16.*?' +
         '\$handleMeasuredFinalGrowthLimit\s*=\s*4.*?' +
@@ -603,7 +629,7 @@ function Test-WindowsHandleProbeContract {
     # source全体をSHA-256で封印する。Set-Variable、outer wrapper、偽evidence等の
     # AST上は合法な追記も、個別deny-listへ依存せず必ずreview対象に戻す。
     $expectedSourceSha256 = (
-        'b2d0bba27f39fcf8769eb1f479a86173156ca48f44d9d33cda3fc644ee01eee6'
+        '0a93f2ae4254bb4f002d825e8b4b6f00075a66de7d7c9c46b4ab8a633ab674e0'
     )
     $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -1670,17 +1696,27 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
         }
     }
 
-    # headerを変えずlimitだけ0へ再代入する変異も各windowでrejectする。
-    # evidence直前に40へ戻して表示値だけ正規化しても、代入数検査で失敗する。
+    # headerを変えずlimitを再代入・短縮・緩和する変異もrejectする。
+    # evidence直前に80へ戻して表示値だけ正規化しても、代入数検査で失敗する。
     $windowsHandleLimitReassignmentCases = @(
         [pscustomobject]@{
             Name = 'startup'
-            Before = '$handleWarmupRuns = 40'
+            Before = '$handleWarmupRuns = 80'
             After = (
-                '$handleWarmupRuns = 40' +
+                '$handleWarmupRuns = 80' +
                 "`n    " +
                 '$handleWarmupRuns = 0'
             )
+        },
+        [pscustomobject]@{
+            Name = 'startup shortened'
+            Before = '$handleWarmupRuns = 80'
+            After = '$handleWarmupRuns = 40'
+        },
+        [pscustomobject]@{
+            Name = 'startup growth relaxed'
+            Before = '$handleStartupGrowthLimit = 16'
+            After = '$handleStartupGrowthLimit = 17'
         },
         [pscustomobject]@{
             Name = 'steady-state'
@@ -1833,9 +1869,9 @@ Microsoft.PowerShell.Utility\Set-Alias `
     $canonicalSealMutationCases = @(
         [pscustomobject]@{
             Name = 'runtime limit mutation'
-            Before = '$handleWarmupRuns = 40'
+            Before = '$handleWarmupRuns = 80'
             After = (
-                '$handleWarmupRuns = 40' +
+                '$handleWarmupRuns = 80' +
                 "`n    " +
                 'Set-Variable -Name handleWarmupRuns -Value 0'
             )
@@ -2040,40 +2076,58 @@ function Invoke-PrivateMarkerBoundedProcess {
     }
 }
 
-# transientだけがsettleしてpassし、1回ごとのleakと低頻度だが持続するleak、
-# およびpeak上限超過がfailする。source ASTと同じ閾値の独立negative control。
+# call 41-80で一度だけ増えるplateauとmeasured transientだけがpassし、
+# 1回ごとのleak、次の40回でも増える低頻度leak、peak超過がfailする。
+# source ASTと同じstartup16/final4/peak12の独立negative control。
 $transientHandleSeries = @(
     105, 104, 103, 102, 101, 100, 100, 100, 100, 100
 )
-$persistentHandleSeries = @(105, 105, 105, 105, 105, 105, 105, 105, 105, 105)
-$onePerCallHandleSeries = @(140, 140, 140, 140, 140, 140, 140, 140, 140, 140)
+$plateauHandleSeries = @(105, 105, 105, 105, 105, 105, 105, 105, 105, 105)
+$onePerCallHandleSeries = @(220, 220, 220, 220, 220, 220, 220, 220, 220, 220)
 if (
     -not (
-        Test-WindowsHandleSeriesWithinLimits `
-            -Baseline 100 `
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 105 `
+            -WarmupMaximum 109 `
             -ObservedFinal 105 `
-            -Maximum 109 `
+            -MeasuredMaximum 105 `
+            -QuiescenceSamples $plateauHandleSeries
+    ) -or
+    -not (
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 100 `
+            -WarmupMaximum 100 `
+            -ObservedFinal 105 `
+            -MeasuredMaximum 109 `
             -QuiescenceSamples $transientHandleSeries
     ) -or
     (
-        Test-WindowsHandleSeriesWithinLimits `
-            -Baseline 100 `
-            -ObservedFinal 140 `
-            -Maximum 140 `
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 180 `
+            -WarmupMaximum 180 `
+            -ObservedFinal 220 `
+            -MeasuredMaximum 220 `
             -QuiescenceSamples $onePerCallHandleSeries
     ) -or
     (
-        Test-WindowsHandleSeriesWithinLimits `
-            -Baseline 100 `
-            -ObservedFinal 105 `
-            -Maximum 105 `
-            -QuiescenceSamples $persistentHandleSeries
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 110 `
+            -WarmupMaximum 110 `
+            -ObservedFinal 115 `
+            -MeasuredMaximum 115 `
+            -QuiescenceSamples @(115, 115, 115, 115, 115, 115, 115, 115, 115, 115)
     ) -or
     (
-        Test-WindowsHandleSeriesWithinLimits `
-            -Baseline 100 `
+        Test-WindowsHandleWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupFinal 100 `
+            -WarmupMaximum 100 `
             -ObservedFinal 100 `
-            -Maximum 113 `
+            -MeasuredMaximum 113 `
             -QuiescenceSamples @(100, 100, 100, 100, 100, 100, 100, 100, 100, 100)
     )
 ) {
@@ -2087,7 +2141,7 @@ if (
 # validator自身のAST契約が弱体化すると、production runnerを一度も呼ばない検査が
 # readinessを通過できるため、最小のnegative controlを同じ場所で実行する。
 $windowsHandleProbeNoOpFixture = @'
-$handleWarmupRuns = 40
+$handleWarmupRuns = 80
 $handleMeasuredRuns = 40
 $handleStartupGrowthLimit = 16
 $handleMeasuredFinalGrowthLimit = 4
@@ -2126,7 +2180,7 @@ if (
 # runner呼出しとhandle更新を各loop直後へ逃がした場合も、token順だけなら
 # positiveに見える。AST extent検査がbody所属を要求していることを明示する。
 $windowsHandleProbeScopeEscapeFixture = @'
-$handleWarmupRuns = 40
+$handleWarmupRuns = 80
 $handleMeasuredRuns = 40
 $handleStartupGrowthLimit = 16
 $handleMeasuredFinalGrowthLimit = 4
