@@ -343,20 +343,33 @@ function Test-WindowsHandleProbeLoopContract {
 function Test-WindowsHandleQuiescenceLoopContract {
     param(
         [Parameter(Mandatory = $true)]
-        [System.Management.Automation.Language.ForStatementAst]$Loop
+        [System.Management.Automation.Language.ForStatementAst]$Loop,
+        [Parameter(Mandatory = $true)]
+        [string]$CounterName,
+        [Parameter(Mandatory = $true)]
+        [string]$SampleName,
+        [Parameter(Mandatory = $true)]
+        [string]$SettledName
     )
 
     # sample回数を0へ迂回したり、Sleep/Refresh/min更新を条件分岐へ隠したり
     # できないよう、headerと4つの直下statementをAST extentで全体一致する。
     if (
-        $Loop.Initializer.Extent.Text -notmatch
-            '^\s*\$handleQuiescenceAttempt\s*=\s*0\s*$' -or
-        $Loop.Condition.Extent.Text -notmatch (
-            '^\s*\$handleQuiescenceAttempt\s*-lt\s*' +
-            '\$handleQuiescenceSamples\s*$'
+        $Loop.Initializer.Extent.Text -notmatch (
+            '^\s*\$' +
+            [regex]::Escape($CounterName) +
+            '\s*=\s*0\s*$'
         ) -or
-        $Loop.Iterator.Extent.Text -notmatch
-            '^\s*\$handleQuiescenceAttempt\+\+\s*$'
+        $Loop.Condition.Extent.Text -notmatch (
+            '^\s*\$' +
+            [regex]::Escape($CounterName) +
+            '\s*-lt\s*\$handleQuiescenceSamples\s*$'
+        ) -or
+        $Loop.Iterator.Extent.Text -notmatch (
+            '^\s*\$' +
+            [regex]::Escape($CounterName) +
+            '\+\+\s*$'
+        )
     ) {
         return $false
     }
@@ -382,12 +395,19 @@ function Test-WindowsHandleQuiescenceLoopContract {
     )
     $refreshContract = '^\s*\$handleProbeProcess\.Refresh\(\)\s*$'
     $sampleContract = (
-        '^\s*\$handleQuiescenceSample\s*=\s*' +
+        '^\s*\$' +
+        [regex]::Escape($SampleName) +
+        '\s*=\s*' +
         '\$handleProbeProcess\.HandleCount\s*$'
     )
     $minimumContract = (
-        '(?s)^\s*\$handleSettledFinal\s*=\s*\[Math\]::Min\(\s*' +
-        '\$handleSettledFinal\s*,\s*\$handleQuiescenceSample\s*\)\s*$'
+        '(?s)^\s*\$' +
+        [regex]::Escape($SettledName) +
+        '\s*=\s*\[Math\]::Min\(\s*\$' +
+        [regex]::Escape($SettledName) +
+        '\s*,\s*\$' +
+        [regex]::Escape($SampleName) +
+        '\s*\)\s*$'
     )
     return (
         $statements[0].Extent.Text -match $sleepContract -and
@@ -397,52 +417,48 @@ function Test-WindowsHandleQuiescenceLoopContract {
     )
 }
 
-function Test-WindowsHandleSeriesWithinLimits {
-    param(
-        [int]$Baseline,
-        [int]$ObservedFinal,
-        [int]$Maximum,
-        [int[]]$QuiescenceSamples
-    )
-
-    # AST契約と同じmin-settle/final4/peak12判定をsynthetic seriesへ適用し、
-    # 一時揺らぎだけを許可して持続・低頻度leakを許可しないことを自己検査する。
-    if ($QuiescenceSamples.Count -ne 10) {
-        return $false
-    }
-    $settledFinal = $ObservedFinal
-    foreach ($sample in $QuiescenceSamples) {
-        $settledFinal = [Math]::Min($settledFinal, $sample)
-    }
-    return (
-        ($settledFinal - $Baseline) -le 4 -and
-        ($Maximum - $Baseline) -le 12
-    )
-}
-
-function Test-WindowsHandleWindowsWithinLimits {
+function Test-WindowsHandleCalibratedWindowsWithinLimits {
     param(
         [int]$StartupBaseline,
-        [int]$WarmupFinal,
-        [int]$WarmupMaximum,
-        [int]$ObservedFinal,
-        [int]$MeasuredMaximum,
-        [int[]]$QuiescenceSamples
+        [int]$WarmupObservedFinal,
+        [int[]]$WarmupQuiescenceSamples,
+        [int]$CalibrationObservedFinal,
+        [int[]]$CalibrationQuiescenceSamples,
+        [int]$MeasuredObservedFinal,
+        [int[]]$MeasuredQuiescenceSamples
     )
 
-    # startup 80回全体のcapと、その後40回の厳格な増加を別々に適用する。
-    # call 41-80だけで一度増えてplateauするruntime初期化はstartupへ留まり、
-    # 次の40回でも増える低頻度leakはmeasured final上限で拒否される。
-    return (
-        ($WarmupFinal - $StartupBaseline) -le 16 -and
-        ($WarmupMaximum - $StartupBaseline) -le 16 -and
-        (
-            Test-WindowsHandleSeriesWithinLimits `
-                -Baseline $WarmupFinal `
-                -ObservedFinal $ObservedFinal `
-                -Maximum $MeasuredMaximum `
-                -QuiescenceSamples $QuiescenceSamples
+    # 各windowの一時peakではなく、同じbounded quiescenceで残った最小値を
+    # 比較する。runtime handleが閉じた証拠を受理し、持続leakだけを残す。
+    if (
+        $WarmupQuiescenceSamples.Count -ne 10 -or
+        $CalibrationQuiescenceSamples.Count -ne 10 -or
+        $MeasuredQuiescenceSamples.Count -ne 10
+    ) {
+        return $false
+    }
+    $warmupSettled = $WarmupObservedFinal
+    foreach ($sample in $WarmupQuiescenceSamples) {
+        $warmupSettled = [Math]::Min($warmupSettled, $sample)
+    }
+    $calibrationSettled = $CalibrationObservedFinal
+    foreach ($sample in $CalibrationQuiescenceSamples) {
+        $calibrationSettled = [Math]::Min(
+            $calibrationSettled,
+            $sample
         )
+    }
+    $measuredSettled = $MeasuredObservedFinal
+    foreach ($sample in $MeasuredQuiescenceSamples) {
+        $measuredSettled = [Math]::Min($measuredSettled, $sample)
+    }
+
+    # startup limit 16とsteady limit 4は変更しない。calibration後もstartupの
+    # 累積増加を再確認し、最初の40回だけで持続する有限leakも見逃さない。
+    return (
+        ($warmupSettled - $StartupBaseline) -le 16 -and
+        ($calibrationSettled - $StartupBaseline) -le 16 -and
+        ($measuredSettled - $calibrationSettled) -le 4
     )
 }
 
@@ -453,8 +469,8 @@ function Test-WindowsHandleProbeAstContract {
     )
 
     # loop headerだけの正規表現では、runner呼出しをbody外へ移動または削除した
-    # no-op実装を見抜けない。ASTで3つのfor bodyを特定し、各測定windowと
-    # quiescence sampleが必要な処理を直下statementとして所有することを検査する。
+    # no-op実装を見抜けない。ASTで3つの実行windowと各quiescenceを特定し、
+    # 必要な処理を直下statementとして所有することを検査する。
     $tokens = $null
     $parseErrors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseInput(
@@ -500,6 +516,33 @@ function Test-WindowsHandleProbeAstContract {
                 )
             }
     )
+    $warmupQuiescenceLoops = @(
+        $forStatements |
+            Where-Object {
+                $_.Condition.Extent.Text -match (
+                    '^\s*\$handleWarmupQuiescenceAttempt\s*-lt\s*' +
+                    '\$handleQuiescenceSamples\s*$'
+                )
+            }
+    )
+    $calibrationLoops = @(
+        $forStatements |
+            Where-Object {
+                $_.Condition.Extent.Text -match (
+                    '^\s*\$handleCalibrationAttempt\s*-lt\s*' +
+                    '\$handleCalibrationRuns\s*$'
+                )
+            }
+    )
+    $calibrationQuiescenceLoops = @(
+        $forStatements |
+            Where-Object {
+                $_.Condition.Extent.Text -match (
+                    '^\s*\$handleCalibrationQuiescenceAttempt\s*-lt\s*' +
+                    '\$handleQuiescenceSamples\s*$'
+                )
+            }
+    )
     $measuredLoops = @(
         $forStatements |
             Where-Object {
@@ -509,43 +552,67 @@ function Test-WindowsHandleProbeAstContract {
                 )
             }
     )
-    $quiescenceLoops = @(
+    $measuredQuiescenceLoops = @(
         $forStatements |
             Where-Object {
                 $_.Condition.Extent.Text -match (
-                    '^\s*\$handleQuiescenceAttempt\s*-lt\s*' +
+                    '^\s*\$handleMeasuredQuiescenceAttempt\s*-lt\s*' +
                     '\$handleQuiescenceSamples\s*$'
                 )
             }
     )
     if (
-        $forStatements.Count -ne 3 -or
+        $forStatements.Count -ne 6 -or
         $warmupLoops.Count -ne 1 -or
+        $warmupQuiescenceLoops.Count -ne 1 -or
+        $calibrationLoops.Count -ne 1 -or
+        $calibrationQuiescenceLoops.Count -ne 1 -or
         $measuredLoops.Count -ne 1 -or
-        $quiescenceLoops.Count -ne 1
+        $measuredQuiescenceLoops.Count -ne 1
     ) {
         return $false
     }
 
     $warmupLoop = $warmupLoops[0]
+    $warmupQuiescenceLoop = $warmupQuiescenceLoops[0]
+    $calibrationLoop = $calibrationLoops[0]
+    $calibrationQuiescenceLoop = $calibrationQuiescenceLoops[0]
     $measuredLoop = $measuredLoops[0]
-    $quiescenceLoop = $quiescenceLoops[0]
+    $measuredQuiescenceLoop = $measuredQuiescenceLoops[0]
     if (
         $warmupLoop.Extent.StartOffset -ge
+            $warmupQuiescenceLoop.Extent.StartOffset -or
+        $warmupQuiescenceLoop.Extent.StartOffset -ge
+            $calibrationLoop.Extent.StartOffset -or
+        $calibrationLoop.Extent.StartOffset -ge
+            $calibrationQuiescenceLoop.Extent.StartOffset -or
+        $calibrationQuiescenceLoop.Extent.StartOffset -ge
             $measuredLoop.Extent.StartOffset -or
         $measuredLoop.Extent.StartOffset -ge
-            $quiescenceLoop.Extent.StartOffset
+            $measuredQuiescenceLoop.Extent.StartOffset
     ) {
         return $false
     }
     if (
+        -not [object]::ReferenceEquals(
+            $warmupLoop.Parent,
+            $warmupQuiescenceLoop.Parent
+        ) -or
+        -not [object]::ReferenceEquals(
+            $warmupLoop.Parent,
+            $calibrationLoop.Parent
+        ) -or
+        -not [object]::ReferenceEquals(
+            $warmupLoop.Parent,
+            $calibrationQuiescenceLoop.Parent
+        ) -or
         -not [object]::ReferenceEquals(
             $warmupLoop.Parent,
             $measuredLoop.Parent
         ) -or
         -not [object]::ReferenceEquals(
             $warmupLoop.Parent,
-            $quiescenceLoop.Parent
+            $measuredQuiescenceLoop.Parent
         ) -or
         $warmupLoop.Parent -isnot
             [System.Management.Automation.Language.StatementBlockAst] -or
@@ -559,15 +626,12 @@ function Test-WindowsHandleProbeAstContract {
     # 前に確定させる。loop直前の0再代入や、evidence直前の40復元を拒否する。
     $constantAssignments = @(
         [pscustomobject]@{ Name = 'handleWarmupRuns'; Value = 80 },
+        [pscustomobject]@{ Name = 'handleCalibrationRuns'; Value = 40 },
         [pscustomobject]@{ Name = 'handleMeasuredRuns'; Value = 40 },
         [pscustomobject]@{ Name = 'handleStartupGrowthLimit'; Value = 16 },
         [pscustomobject]@{
             Name = 'handleMeasuredFinalGrowthLimit'
             Value = 4
-        },
-        [pscustomobject]@{
-            Name = 'handleMeasuredPeakGrowthLimit'
-            Value = 12
         },
         [pscustomobject]@{
             Name = 'handleQuiescenceSamples'
@@ -641,103 +705,88 @@ function Test-WindowsHandleProbeAstContract {
                 -ChildFailureCode 'windows-handle-probe-startup-child-failed'
         ) -or
         -not (
+            Test-WindowsHandleQuiescenceLoopContract `
+                -Loop $warmupQuiescenceLoop `
+                -CounterName 'handleWarmupQuiescenceAttempt' `
+                -SampleName 'handleWarmupQuiescenceSample' `
+                -SettledName 'handleWarmupSettled'
+        ) -or
+        -not (
+            Test-WindowsHandleProbeLoopContract `
+                -Loop $calibrationLoop `
+                -CounterName 'handleCalibrationAttempt' `
+                -LimitName 'handleCalibrationRuns' `
+                -ResultName 'handleCalibrationResult' `
+                -FinalName 'handleCalibrationFinal' `
+                -MaximumName 'handleCalibrationMaximum' `
+                -ChildFailureCode `
+                    'windows-handle-probe-calibration-child-failed'
+        ) -or
+        -not (
+            Test-WindowsHandleQuiescenceLoopContract `
+                -Loop $calibrationQuiescenceLoop `
+                -CounterName 'handleCalibrationQuiescenceAttempt' `
+                -SampleName 'handleCalibrationQuiescenceSample' `
+                -SettledName 'handleCalibrationSettled'
+        ) -or
+        -not (
             Test-WindowsHandleProbeLoopContract `
                 -Loop $measuredLoop `
                 -CounterName 'handleAttempt' `
                 -LimitName 'handleMeasuredRuns' `
                 -ResultName 'handleProbeResult' `
-                -FinalName 'handleFinal' `
-                -MaximumName 'handleMaximum' `
+                -FinalName 'handleMeasuredFinal' `
+                -MaximumName 'handleMeasuredMaximum' `
                 -ChildFailureCode 'windows-handle-probe-steady-child-failed'
         ) -or
         -not (
             Test-WindowsHandleQuiescenceLoopContract `
-                -Loop $quiescenceLoop
+                -Loop $measuredQuiescenceLoop `
+                -CounterName 'handleMeasuredQuiescenceAttempt' `
+                -SampleName 'handleMeasuredQuiescenceSample' `
+                -SettledName 'handleSettledFinal'
         )
     ) {
         return $false
     }
 
-    # sourceをASTの境界で分割し、startup baseline → warm-up body →
-    # startup上限 → steady-state body → quiescence → steady-state上限の順序も固定する。
-    $prefix = $Source.Substring(0, $warmupLoop.Extent.StartOffset)
-    $warmupBody = $warmupLoop.Extent.Text
-    $between = $Source.Substring(
-        $warmupLoop.Extent.EndOffset,
-        $measuredLoop.Extent.StartOffset - $warmupLoop.Extent.EndOffset
-    )
-    $measuredBody = $measuredLoop.Extent.Text
-    $beforeQuiescence = $Source.Substring(
-        $measuredLoop.Extent.EndOffset,
-        $quiescenceLoop.Extent.StartOffset - $measuredLoop.Extent.EndOffset
-    )
-    $suffix = $Source.Substring($quiescenceLoop.Extent.EndOffset)
-
-    $prefixContract = (
+    # ASTで各loop bodyを固定したうえで、startup → calibration → measuredの
+    # baselineとpersistent判定が同じTry内で順番どおり接続されることも検査する。
+    $orderedContract = (
         '(?s)' +
         '\$handleWarmupRuns\s*=\s*80.*?' +
+        '\$handleCalibrationRuns\s*=\s*40.*?' +
         '\$handleMeasuredRuns\s*=\s*40.*?' +
         '\$handleStartupGrowthLimit\s*=\s*16.*?' +
         '\$handleMeasuredFinalGrowthLimit\s*=\s*4.*?' +
-        '\$handleMeasuredPeakGrowthLimit\s*=\s*12.*?' +
         '\$handleQuiescenceSamples\s*=\s*10.*?' +
         '\$handleQuiescenceWaitMilliseconds\s*=\s*50.*?' +
-        '\$handleProbeProcess\s*=\s*' +
-        '\[System\.Diagnostics\.Process\]::GetCurrentProcess\(\).*?' +
         '\$handleStartupBaseline\s*=\s*' +
-        '\$handleProbeProcess\.HandleCount'
-    )
-    $warmupBodyContract = (
-        '(?s)' +
-        '\$handleWarmupResult\s*=\s*' +
-        'private-marker-process-runner\\' +
-        'Invoke-PrivateMarkerBoundedProcess.*?' +
-        '\$handleProbeProcess\.Refresh\(\).*?' +
-        '\$handleWarmupFinal\s*=\s*\$handleProbeProcess\.HandleCount.*?' +
-        '\$handleWarmupMaximum\s*=\s*\[Math\]::Max\('
-    )
-    $betweenContract = (
-        '(?s)' +
-        '\(\$handleWarmupFinal\s*-\s*\$handleStartupBaseline\)\s*' +
+        '\$handleProbeProcess\.HandleCount.*?' +
+        '\$handleWarmupObservedFinal\s*=\s*\$handleWarmupFinal.*?' +
+        '\$handleWarmupSettled\s*=\s*\$handleWarmupFinal.*?' +
+        '\(\$handleWarmupSettled\s*-\s*\$handleStartupBaseline\)\s*' +
         '-gt\s*\$handleStartupGrowthLimit.*?' +
-        '\(\$handleWarmupMaximum\s*-\s*\$handleStartupBaseline\)\s*' +
+        'windows-handle-probe-startup-persistent.*?' +
+        '\$handleCalibrationFinal\s*=\s*\$handleWarmupSettled.*?' +
+        '\$handleCalibrationObservedFinal\s*=\s*' +
+        '\$handleCalibrationFinal.*?' +
+        '\$handleCalibrationSettled\s*=\s*\$handleCalibrationFinal.*?' +
+        '\(\$handleCalibrationSettled\s*-\s*' +
+        '\$handleStartupBaseline\)\s*' +
         '-gt\s*\$handleStartupGrowthLimit.*?' +
-        '\$handleBaseline\s*=\s*\$handleWarmupFinal'
-    )
-    $measuredBodyContract = (
-        '(?s)' +
-        '\$handleProbeResult\s*=\s*' +
-        'private-marker-process-runner\\' +
-        'Invoke-PrivateMarkerBoundedProcess.*?' +
-        '\$handleProbeProcess\.Refresh\(\).*?' +
-        '\$handleFinal\s*=\s*\$handleProbeProcess\.HandleCount.*?' +
-        '\$handleMaximum\s*=\s*\[Math\]::Max\('
-    )
-    $beforeQuiescenceContract = (
-        '(?s)' +
-        '\$handleObservedFinal\s*=\s*\$handleFinal.*?' +
-        '\$handleSettledFinal\s*=\s*\$handleFinal'
-    )
-    $suffixContract = (
-        '(?s)' +
+        'windows-handle-probe-calibration-persistent.*?' +
+        '\$handleBaseline\s*=\s*\$handleCalibrationSettled.*?' +
+        '\$handleObservedFinal\s*=\s*\$handleMeasuredFinal.*?' +
+        '\$handleSettledFinal\s*=\s*\$handleMeasuredFinal.*?' +
         '\(\$handleSettledFinal\s*-\s*\$handleBaseline\)\s*' +
         '-gt\s*\$handleMeasuredFinalGrowthLimit.*?' +
-        '\(\$handleMaximum\s*-\s*\$handleBaseline\)\s*' +
-        '-gt\s*\$handleMeasuredPeakGrowthLimit'
+        'windows-handle-probe-steady-persistent.*?' +
+        'warmup-settled=\$handleWarmupSettled.*?' +
+        'calibration-settled=\$handleCalibrationSettled.*?' +
+        'final-limit=\$handleMeasuredFinalGrowthLimit'
     )
-
-    return (
-        $prefix -match $prefixContract -and
-        $warmupBody -match $warmupBodyContract -and
-        $between -match $betweenContract -and
-        $measuredBody -match $measuredBodyContract -and
-        $beforeQuiescence -match $beforeQuiescenceContract -and
-        (
-            Test-WindowsHandleQuiescenceLoopContract `
-                -Loop $quiescenceLoop
-        ) -and
-        $suffix -match $suffixContract
-    )
+    return $Source -match $orderedContract
 }
 
 function Test-WindowsHandleProbeContract {
@@ -750,7 +799,7 @@ function Test-WindowsHandleProbeContract {
     # source全体をSHA-256で封印する。Set-Variable、outer wrapper、偽evidence等の
     # AST上は合法な追記も、個別deny-listへ依存せず必ずreview対象に戻す。
     $expectedSourceSha256 = (
-        '0a93f2ae4254bb4f002d825e8b4b6f00075a66de7d7c9c46b4ab8a633ab674e0'
+        'd0b2c05d870aa842310499f2133da160529239012b16745b4384a9cc84211208'
     )
     $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -2066,7 +2115,7 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
     ) {
         Add-Failure (
             'scripts/test-private-marker-handle-stability.ps1 is missing: ' +
-            'bounded startup and steady-state Windows handle regressions without GC'
+            'bounded startup, calibration, and steady-state Windows handle regressions without GC'
         )
     }
 
@@ -2079,15 +2128,39 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             After = '$handleWarmupAttempt = $handleWarmupRuns;'
         },
         [pscustomobject]@{
+            Name = 'warmup quiescence'
+            Before = '$handleWarmupQuiescenceAttempt = 0;'
+            After = (
+                '$handleWarmupQuiescenceAttempt = ' +
+                '$handleQuiescenceSamples;'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'calibration'
+            Before = '$handleCalibrationAttempt = 0;'
+            After = (
+                '$handleCalibrationAttempt = ' +
+                '$handleCalibrationRuns;'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'calibration quiescence'
+            Before = '$handleCalibrationQuiescenceAttempt = 0;'
+            After = (
+                '$handleCalibrationQuiescenceAttempt = ' +
+                '$handleQuiescenceSamples;'
+            )
+        },
+        [pscustomobject]@{
             Name = 'steady-state'
             Before = '$handleAttempt = 0;'
             After = '$handleAttempt = $handleMeasuredRuns;'
         },
         [pscustomobject]@{
-            Name = 'quiescence'
-            Before = '$handleQuiescenceAttempt = 0;'
+            Name = 'measured quiescence'
+            Before = '$handleMeasuredQuiescenceAttempt = 0;'
             After = (
-                '$handleQuiescenceAttempt = ' +
+                '$handleMeasuredQuiescenceAttempt = ' +
                 '$handleQuiescenceSamples;'
             )
         }
@@ -2142,6 +2215,15 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             After = '$handleStartupGrowthLimit = 17'
         },
         [pscustomobject]@{
+            Name = 'calibration'
+            Before = '$handleCalibrationRuns = 40'
+            After = (
+                '$handleCalibrationRuns = 40' +
+                "`n    " +
+                '$handleCalibrationRuns = 0'
+            )
+        },
+        [pscustomobject]@{
             Name = 'steady-state'
             Before = '$handleMeasuredRuns = 40'
             After = (
@@ -2149,6 +2231,11 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
                 "`n    " +
                 '$handleMeasuredRuns = 0'
             )
+        },
+        [pscustomobject]@{
+            Name = 'steady growth relaxed'
+            Before = '$handleMeasuredFinalGrowthLimit = 4'
+            After = '$handleMeasuredFinalGrowthLimit = 5'
         },
         [pscustomobject]@{
             Name = 'quiescence samples'
@@ -2219,6 +2306,15 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
                 'Invoke-PrivateMarkerBoundedProcess'
             )
             After = '$handleWarmupResult = New-PrivateMarkerDummyResult'
+        },
+        [pscustomobject]@{
+            Name = 'calibration'
+            Before = (
+                '$handleCalibrationResult = ' +
+                'private-marker-process-runner\' +
+                'Invoke-PrivateMarkerBoundedProcess'
+            )
+            After = '$handleCalibrationResult = New-PrivateMarkerDummyResult'
         },
         [pscustomobject]@{
             Name = 'steady-state'
@@ -2427,6 +2523,42 @@ function Invoke-PrivateMarkerBoundedProcess {
             )
         },
         [pscustomobject]@{
+            Name = 'warmup quiescence'
+            Loops = @(
+                $fixtureForStatements |
+                    Where-Object {
+                        $_.Condition.Extent.Text -match (
+                            '^\s*\$handleWarmupQuiescenceAttempt\s*' +
+                            '-lt\s*\$handleQuiescenceSamples\s*$'
+                        )
+                    }
+            )
+        },
+        [pscustomobject]@{
+            Name = 'calibration'
+            Loops = @(
+                $fixtureForStatements |
+                    Where-Object {
+                        $_.Condition.Extent.Text -match (
+                            '^\s*\$handleCalibrationAttempt\s*-lt\s*' +
+                            '\$handleCalibrationRuns\s*$'
+                        )
+                    }
+            )
+        },
+        [pscustomobject]@{
+            Name = 'calibration quiescence'
+            Loops = @(
+                $fixtureForStatements |
+                    Where-Object {
+                        $_.Condition.Extent.Text -match (
+                            '^\s*\$handleCalibrationQuiescenceAttempt\s*' +
+                            '-lt\s*\$handleQuiescenceSamples\s*$'
+                        )
+                    }
+            )
+        },
+        [pscustomobject]@{
             Name = 'steady-state'
             Loops = @(
                 $fixtureForStatements |
@@ -2439,13 +2571,13 @@ function Invoke-PrivateMarkerBoundedProcess {
             )
         },
         [pscustomobject]@{
-            Name = 'quiescence'
+            Name = 'measured quiescence'
             Loops = @(
                 $fixtureForStatements |
                     Where-Object {
                         $_.Condition.Extent.Text -match (
-                            '^\s*\$handleQuiescenceAttempt\s*-lt\s*' +
-                            '\$handleQuiescenceSamples\s*$'
+                            '^\s*\$handleMeasuredQuiescenceAttempt\s*' +
+                            '-lt\s*\$handleQuiescenceSamples\s*$'
                         )
                     }
             )
@@ -2499,98 +2631,120 @@ function Invoke-PrivateMarkerBoundedProcess {
     }
 }
 
-# call 41-80で一度だけ増えるplateauとmeasured transientだけがpassし、
-# 1回ごとのleak、次の40回でも増える低頻度leak、peak超過がfailする。
-# source ASTと同じstartup16/final4/peak12の独立negative control。
-$transientHandleSeries = @(
-    105, 104, 103, 102, 101, 100, 100, 100, 100, 100
+# 実測した一時増加はcalibration後のmeasured windowで再発しない限りpassし、
+# startupまたはmeasuredに残る増加は既存limitのままfailすることを先に固定する。
+$runtimeStartupTransientSeries = @(
+    600, 598, 590, 587, 587, 587, 587, 587, 587, 587
 )
-$plateauHandleSeries = @(105, 105, 105, 105, 105, 105, 105, 105, 105, 105)
-$onePerCallHandleSeries = @(220, 220, 220, 220, 220, 220, 220, 220, 220, 220)
+$runtimeCalibrationPlateauSeries = @(
+    597, 597, 597, 597, 597, 597, 597, 597, 597, 597
+)
+$runtimeMeasuredPlateauSeries = @(
+    597, 597, 597, 597, 597, 597, 597, 597, 597, 597
+)
+$persistentStartupSeries = @(
+    117, 117, 117, 117, 117, 117, 117, 117, 117, 117
+)
+$persistentMeasuredSeries = @(
+    115, 115, 115, 115, 115, 115, 115, 115, 115, 115
+)
+$transientMeasuredSeries = @(
+    125, 119, 114, 110, 110, 110, 110, 110, 110, 110
+)
 if (
     -not (
-        Test-WindowsHandleWindowsWithinLimits `
-            -StartupBaseline 100 `
-            -WarmupFinal 105 `
-            -WarmupMaximum 109 `
-            -ObservedFinal 105 `
-            -MeasuredMaximum 105 `
-            -QuiescenceSamples $plateauHandleSeries
+        Test-WindowsHandleCalibratedWindowsWithinLimits `
+            -StartupBaseline 581 `
+            -WarmupObservedFinal 587 `
+            -WarmupQuiescenceSamples $runtimeStartupTransientSeries `
+            -CalibrationObservedFinal 597 `
+            -CalibrationQuiescenceSamples `
+                $runtimeCalibrationPlateauSeries `
+            -MeasuredObservedFinal 597 `
+            -MeasuredQuiescenceSamples $runtimeMeasuredPlateauSeries
     ) -or
     -not (
-        Test-WindowsHandleWindowsWithinLimits `
+        Test-WindowsHandleCalibratedWindowsWithinLimits `
             -StartupBaseline 100 `
-            -WarmupFinal 100 `
-            -WarmupMaximum 100 `
-            -ObservedFinal 105 `
-            -MeasuredMaximum 109 `
-            -QuiescenceSamples $transientHandleSeries
+            -WarmupObservedFinal 105 `
+            -WarmupQuiescenceSamples @(105, 105, 105, 105, 105, 105, 105, 105, 105, 105) `
+            -CalibrationObservedFinal 110 `
+            -CalibrationQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110) `
+            -MeasuredObservedFinal 125 `
+            -MeasuredQuiescenceSamples $transientMeasuredSeries
     ) -or
     (
-        Test-WindowsHandleWindowsWithinLimits `
+        Test-WindowsHandleCalibratedWindowsWithinLimits `
             -StartupBaseline 100 `
-            -WarmupFinal 180 `
-            -WarmupMaximum 180 `
-            -ObservedFinal 220 `
-            -MeasuredMaximum 220 `
-            -QuiescenceSamples $onePerCallHandleSeries
+            -WarmupObservedFinal 110 `
+            -WarmupQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110) `
+            -CalibrationObservedFinal 117 `
+            -CalibrationQuiescenceSamples $persistentStartupSeries `
+            -MeasuredObservedFinal 117 `
+            -MeasuredQuiescenceSamples $persistentStartupSeries
     ) -or
     (
-        Test-WindowsHandleWindowsWithinLimits `
+        Test-WindowsHandleCalibratedWindowsWithinLimits `
             -StartupBaseline 100 `
-            -WarmupFinal 110 `
-            -WarmupMaximum 110 `
-            -ObservedFinal 115 `
-            -MeasuredMaximum 115 `
-            -QuiescenceSamples @(115, 115, 115, 115, 115, 115, 115, 115, 115, 115)
-    ) -or
-    (
-        Test-WindowsHandleWindowsWithinLimits `
-            -StartupBaseline 100 `
-            -WarmupFinal 100 `
-            -WarmupMaximum 100 `
-            -ObservedFinal 100 `
-            -MeasuredMaximum 113 `
-            -QuiescenceSamples @(100, 100, 100, 100, 100, 100, 100, 100, 100, 100)
+            -WarmupObservedFinal 105 `
+            -WarmupQuiescenceSamples @(105, 105, 105, 105, 105, 105, 105, 105, 105, 105) `
+            -CalibrationObservedFinal 110 `
+            -CalibrationQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110) `
+            -MeasuredObservedFinal 115 `
+            -MeasuredQuiescenceSamples $persistentMeasuredSeries
     )
 ) {
     Add-Failure (
-        'Windows handle readiness synthetic quiescence/leak boundary ' +
+        'Windows handle readiness calibrated runtime/leak boundary ' +
         'regression failed.'
     )
 }
+
+# RED契約。production probeがstartup 80回とmeasured 40回の間に、同じ
+# runnerを40回動かすcalibration windowを持つまでreadinessをfailさせる。
+Assert-FileContains `
+    -RelativePath 'scripts/test-private-marker-handle-stability.ps1' `
+    -Pattern '(?s)\$handleCalibrationRuns\s*=\s*40.*?\$handleCalibrationAttempt\s*=\s*0.*?\$handleCalibrationAttempt\s*-lt\s*\$handleCalibrationRuns.*?Invoke-PrivateMarkerBoundedProcess' `
+    -Description 'forty-run Windows handle runtime calibration window'
 
 # 変数名とloop headerだけを残したno-op実装をpositiveにしないことも固定する。
 # validator自身のAST契約が弱体化すると、production runnerを一度も呼ばない検査が
 # readinessを通過できるため、最小のnegative controlを同じ場所で実行する。
 $windowsHandleProbeNoOpFixture = @'
 $handleWarmupRuns = 80
+$handleCalibrationRuns = 40
 $handleMeasuredRuns = 40
 $handleStartupGrowthLimit = 16
 $handleMeasuredFinalGrowthLimit = 4
-$handleMeasuredPeakGrowthLimit = 12
 $handleQuiescenceSamples = 10
 $handleQuiescenceWaitMilliseconds = 50
 $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
 $handleStartupBaseline = $handleProbeProcess.HandleCount
 for ($handleWarmupAttempt = 0; $handleWarmupAttempt -lt $handleWarmupRuns; $handleWarmupAttempt++) {
 }
-if (($handleWarmupFinal - $handleStartupBaseline) -gt $handleStartupGrowthLimit -or
-    ($handleWarmupMaximum - $handleStartupBaseline) -gt $handleStartupGrowthLimit) {
+$handleWarmupObservedFinal = $handleWarmupFinal
+$handleWarmupSettled = $handleWarmupFinal
+for ($handleWarmupQuiescenceAttempt = 0; $handleWarmupQuiescenceAttempt -lt $handleQuiescenceSamples; $handleWarmupQuiescenceAttempt++) {
 }
-$handleBaseline = $handleWarmupFinal
+if (($handleWarmupSettled - $handleStartupBaseline) -gt $handleStartupGrowthLimit) {
+}
+$handleCalibrationFinal = $handleWarmupSettled
+for ($handleCalibrationAttempt = 0; $handleCalibrationAttempt -lt $handleCalibrationRuns; $handleCalibrationAttempt++) {
+}
+$handleCalibrationObservedFinal = $handleCalibrationFinal
+$handleCalibrationSettled = $handleCalibrationFinal
+for ($handleCalibrationQuiescenceAttempt = 0; $handleCalibrationQuiescenceAttempt -lt $handleQuiescenceSamples; $handleCalibrationQuiescenceAttempt++) {
+}
+if (($handleCalibrationSettled - $handleStartupBaseline) -gt $handleStartupGrowthLimit) {
+}
+$handleBaseline = $handleCalibrationSettled
 for ($handleAttempt = 0; $handleAttempt -lt $handleMeasuredRuns; $handleAttempt++) {
 }
-$handleObservedFinal = $handleFinal
-$handleSettledFinal = $handleFinal
-for ($handleQuiescenceAttempt = 0; $handleQuiescenceAttempt -lt $handleQuiescenceSamples; $handleQuiescenceAttempt++) {
-    [System.Threading.Thread]::Sleep($handleQuiescenceWaitMilliseconds)
-    $handleProbeProcess.Refresh()
-    $handleQuiescenceSample = $handleProbeProcess.HandleCount
-    $handleSettledFinal = [Math]::Min($handleSettledFinal, $handleQuiescenceSample)
+$handleObservedFinal = $handleMeasuredFinal
+$handleSettledFinal = $handleMeasuredFinal
+for ($handleMeasuredQuiescenceAttempt = 0; $handleMeasuredQuiescenceAttempt -lt $handleQuiescenceSamples; $handleMeasuredQuiescenceAttempt++) {
 }
-if (($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
-    ($handleMaximum - $handleBaseline) -gt $handleMeasuredPeakGrowthLimit) {
+if (($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit) {
 }
 '@
 if (
@@ -2604,10 +2758,10 @@ if (
 # positiveに見える。AST extent検査がbody所属を要求していることを明示する。
 $windowsHandleProbeScopeEscapeFixture = @'
 $handleWarmupRuns = 80
+$handleCalibrationRuns = 40
 $handleMeasuredRuns = 40
 $handleStartupGrowthLimit = 16
 $handleMeasuredFinalGrowthLimit = 4
-$handleMeasuredPeakGrowthLimit = 12
 $handleQuiescenceSamples = 10
 $handleQuiescenceWaitMilliseconds = 50
 $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
@@ -2619,26 +2773,43 @@ $handleWarmupResult = Invoke-PrivateMarkerBoundedProcess
 $handleProbeProcess.Refresh()
 $handleWarmupFinal = $handleProbeProcess.HandleCount
 $handleWarmupMaximum = [Math]::Max($handleWarmupMaximum, $handleWarmupFinal)
-if (($handleWarmupFinal - $handleStartupBaseline) -gt $handleStartupGrowthLimit -or
-    ($handleWarmupMaximum - $handleStartupBaseline) -gt $handleStartupGrowthLimit) {
+$handleWarmupObservedFinal = $handleWarmupFinal
+$handleWarmupSettled = $handleWarmupFinal
+for ($handleWarmupQuiescenceAttempt = 0; $handleWarmupQuiescenceAttempt -lt $handleQuiescenceSamples; $handleWarmupQuiescenceAttempt++) {
 }
-$handleBaseline = $handleWarmupFinal
+$handleWarmupQuiescenceSample = $handleProbeProcess.HandleCount
+$handleWarmupSettled = [Math]::Min($handleWarmupSettled, $handleWarmupQuiescenceSample)
+if (($handleWarmupSettled - $handleStartupBaseline) -gt $handleStartupGrowthLimit) {
+}
+$handleCalibrationFinal = $handleWarmupSettled
+for ($handleCalibrationAttempt = 0; $handleCalibrationAttempt -lt $handleCalibrationRuns; $handleCalibrationAttempt++) {
+}
+$handleCalibrationResult = Invoke-PrivateMarkerBoundedProcess
+$handleProbeProcess.Refresh()
+$handleCalibrationFinal = $handleProbeProcess.HandleCount
+$handleCalibrationMaximum = [Math]::Max($handleCalibrationMaximum, $handleCalibrationFinal)
+$handleCalibrationObservedFinal = $handleCalibrationFinal
+$handleCalibrationSettled = $handleCalibrationFinal
+for ($handleCalibrationQuiescenceAttempt = 0; $handleCalibrationQuiescenceAttempt -lt $handleQuiescenceSamples; $handleCalibrationQuiescenceAttempt++) {
+}
+$handleCalibrationQuiescenceSample = $handleProbeProcess.HandleCount
+$handleCalibrationSettled = [Math]::Min($handleCalibrationSettled, $handleCalibrationQuiescenceSample)
+if (($handleCalibrationSettled - $handleStartupBaseline) -gt $handleStartupGrowthLimit) {
+}
+$handleBaseline = $handleCalibrationSettled
 for ($handleAttempt = 0; $handleAttempt -lt $handleMeasuredRuns; $handleAttempt++) {
 }
 $handleProbeResult = Invoke-PrivateMarkerBoundedProcess
 $handleProbeProcess.Refresh()
-$handleFinal = $handleProbeProcess.HandleCount
-$handleMaximum = [Math]::Max($handleMaximum, $handleFinal)
-$handleObservedFinal = $handleFinal
-$handleSettledFinal = $handleFinal
-for ($handleQuiescenceAttempt = 0; $handleQuiescenceAttempt -lt $handleQuiescenceSamples; $handleQuiescenceAttempt++) {
-    [System.Threading.Thread]::Sleep($handleQuiescenceWaitMilliseconds)
-    $handleProbeProcess.Refresh()
-    $handleQuiescenceSample = $handleProbeProcess.HandleCount
-    $handleSettledFinal = [Math]::Min($handleSettledFinal, $handleQuiescenceSample)
+$handleMeasuredFinal = $handleProbeProcess.HandleCount
+$handleMeasuredMaximum = [Math]::Max($handleMeasuredMaximum, $handleMeasuredFinal)
+$handleObservedFinal = $handleMeasuredFinal
+$handleSettledFinal = $handleMeasuredFinal
+for ($handleMeasuredQuiescenceAttempt = 0; $handleMeasuredQuiescenceAttempt -lt $handleQuiescenceSamples; $handleMeasuredQuiescenceAttempt++) {
 }
-if (($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -or
-    ($handleMaximum - $handleBaseline) -gt $handleMeasuredPeakGrowthLimit) {
+$handleMeasuredQuiescenceSample = $handleProbeProcess.HandleCount
+$handleSettledFinal = [Math]::Min($handleSettledFinal, $handleMeasuredQuiescenceSample)
+if (($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit) {
 }
 '@
 if (

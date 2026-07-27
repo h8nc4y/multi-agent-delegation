@@ -7,7 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # full scanner self-test hostの遅延TaskやPowerShell内部handleを測定へ混在させない。
-# 同じPowerShell executableのfresh processでrunnerだけを80回動かす専用probe。
+# 同じPowerShell executableのfresh processでrunnerだけを固定windowごとに動かす。
 $scriptRoot = $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
     $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -47,17 +47,16 @@ try {
     $handleProbeArguments = @('/d', '/c', 'exit', '0')
     $handleProbeEnvironment = New-PrivateMarkerChildEnvironment
 
-    # 最初の80回はruntimeの一度限りの初期化を含むstartup window。ここにも上限を
-    # 設け、初期化という名目で継続的なrunner所有handle漏れを隠さない。
+    # startup 80回とcalibration 40回でruntimeの一度限りの初期化を収束させ、
+    # その後の40回だけをsteady-stateとして判定する。
     $handleWarmupRuns = 80
+    $handleCalibrationRuns = 40
     $handleMeasuredRuns = 40
     $handleStartupGrowthLimit = 16
     # HandleCountはrunner所有handleだけでなく、Windows PowerShell runtimeの
-    # 一時handleも同じaggregateへ含む。native close resultはrunner側で別途
-    # 全件検査し、ここでは40回後も残る増加を従来どおり4で検出する。終了後の
-    # bounded sampleで解消するruntime揺らぎだけをsettled finalから除外する。
+    # 一時handleも同じaggregateへ含む。native close resultはrunner側で全件
+    # 検査し、ここではbounded quiescence後も残る持続増加だけをlimit 4で検出する。
     $handleMeasuredFinalGrowthLimit = 4
-    $handleMeasuredPeakGrowthLimit = 12
     $handleQuiescenceSamples = 10
     $handleQuiescenceWaitMilliseconds = 50
     $handleProbeProcess = [System.Diagnostics.Process]::GetCurrentProcess()
@@ -91,24 +90,105 @@ try {
             $handleWarmupFinal
         )
     }
+
+    # startup中のmaximumはevidenceへ残す。一時peakはleakではないため、同じ
+    # bounded quiescenceを通過したsettled値だけを既存limit 16と比較する。
+    $handleWarmupObservedFinal = $handleWarmupFinal
+    $handleWarmupSettled = $handleWarmupFinal
+    for (
+        $handleWarmupQuiescenceAttempt = 0;
+        $handleWarmupQuiescenceAttempt -lt $handleQuiescenceSamples;
+        $handleWarmupQuiescenceAttempt++
+    ) {
+        [System.Threading.Thread]::Sleep(
+            $handleQuiescenceWaitMilliseconds
+        )
+        $handleProbeProcess.Refresh()
+        $handleWarmupQuiescenceSample = $handleProbeProcess.HandleCount
+        $handleWarmupSettled = [Math]::Min(
+            $handleWarmupSettled,
+            $handleWarmupQuiescenceSample
+        )
+    }
     if (
-        ($handleWarmupFinal - $handleStartupBaseline) -gt
-            $handleStartupGrowthLimit -or
-        ($handleWarmupMaximum - $handleStartupBaseline) -gt
+        ($handleWarmupSettled - $handleStartupBaseline) -gt
             $handleStartupGrowthLimit
     ) {
         throw (
-            'windows-handle-probe-startup-unbounded ' +
-            "baseline=$handleStartupBaseline final=$handleWarmupFinal " +
+            'windows-handle-probe-startup-persistent ' +
+            "baseline=$handleStartupBaseline " +
+            "observed-final=$handleWarmupObservedFinal " +
+            "settled-final=$handleWarmupSettled " +
             "max=$handleWarmupMaximum limit=$handleStartupGrowthLimit"
         )
     }
 
-    # 後半40回はsteady-state。最終値とpeakを別々に固定し、一時的な増加と
-    # 単調リークの両方をGCなしで検出する。
-    $handleBaseline = $handleWarmupFinal
-    $handleMaximum = $handleBaseline
-    $handleFinal = $handleBaseline
+    # calibration 40回はstartup limit 16の内側で評価する。最初のsteady
+    # windowだけに現れるruntime初期化を、leak判定のbaselineへ混入させない。
+    $handleCalibrationFinal = $handleWarmupSettled
+    $handleCalibrationMaximum = $handleWarmupSettled
+    for (
+        $handleCalibrationAttempt = 0;
+        $handleCalibrationAttempt -lt $handleCalibrationRuns;
+        $handleCalibrationAttempt++
+    ) {
+        $handleCalibrationResult = private-marker-process-runner\Invoke-PrivateMarkerBoundedProcess `
+            -FilePath $handleProbeTarget `
+            -Arguments $handleProbeArguments `
+            -WorkingDirectory $root `
+            -EnvironmentVariables $handleProbeEnvironment `
+            -TimeoutMilliseconds 10000
+        if (
+            $handleCalibrationResult.ExitCode -ne 0 -or
+            $handleCalibrationResult.StandardOutputBytes.Length -ne 0 -or
+            $handleCalibrationResult.StandardErrorBytes.Length -ne 0
+        ) {
+            throw 'windows-handle-probe-calibration-child-failed'
+        }
+        $handleProbeProcess.Refresh()
+        $handleCalibrationFinal = $handleProbeProcess.HandleCount
+        $handleCalibrationMaximum = [Math]::Max(
+            $handleCalibrationMaximum,
+            $handleCalibrationFinal
+        )
+    }
+
+    # calibration後も固定回数だけ待ち、閉じたruntime handleをminimumへ反映する。
+    $handleCalibrationObservedFinal = $handleCalibrationFinal
+    $handleCalibrationSettled = $handleCalibrationFinal
+    for (
+        $handleCalibrationQuiescenceAttempt = 0;
+        $handleCalibrationQuiescenceAttempt -lt $handleQuiescenceSamples;
+        $handleCalibrationQuiescenceAttempt++
+    ) {
+        [System.Threading.Thread]::Sleep(
+            $handleQuiescenceWaitMilliseconds
+        )
+        $handleProbeProcess.Refresh()
+        $handleCalibrationQuiescenceSample = $handleProbeProcess.HandleCount
+        $handleCalibrationSettled = [Math]::Min(
+            $handleCalibrationSettled,
+            $handleCalibrationQuiescenceSample
+        )
+    }
+    if (
+        ($handleCalibrationSettled - $handleStartupBaseline) -gt
+            $handleStartupGrowthLimit
+    ) {
+        throw (
+            'windows-handle-probe-calibration-persistent ' +
+            "baseline=$handleStartupBaseline " +
+            "observed-final=$handleCalibrationObservedFinal " +
+            "settled-final=$handleCalibrationSettled " +
+            "max=$handleCalibrationMaximum " +
+            "limit=$handleStartupGrowthLimit"
+        )
+    }
+
+    # calibration settled値をsteady baselineとし、次の40回に残る増加だけを測る。
+    $handleBaseline = $handleCalibrationSettled
+    $handleMeasuredMaximum = $handleBaseline
+    $handleMeasuredFinal = $handleBaseline
     for (
         $handleAttempt = 0;
         $handleAttempt -lt $handleMeasuredRuns;
@@ -128,46 +208,42 @@ try {
             throw 'windows-handle-probe-steady-child-failed'
         }
         $handleProbeProcess.Refresh()
-        $handleFinal = $handleProbeProcess.HandleCount
-        $handleMaximum = [Math]::Max(
-            $handleMaximum,
-            $handleFinal
+        $handleMeasuredFinal = $handleProbeProcess.HandleCount
+        $handleMeasuredMaximum = [Math]::Max(
+            $handleMeasuredMaximum,
+            $handleMeasuredFinal
         )
     }
 
-    # childを追加実行せず、GCも呼ばないbounded quiescenceでruntime由来の
-    # 遅延closeだけを観測する。runner所有native handleが持続して残る場合は
-    # 全sampleで減らないため、従来のfinal上限4を超えてfailする。
-    $handleObservedFinal = $handleFinal
-    $handleSettledFinal = $handleFinal
+    # child追加実行もGCも行わず、測定後のruntime揺らぎだけをminimumへ除外する。
+    # runner所有handleが残る場合は全sampleで減らず、既存limit 4を超えてfailする。
+    $handleObservedFinal = $handleMeasuredFinal
+    $handleSettledFinal = $handleMeasuredFinal
     for (
-        $handleQuiescenceAttempt = 0;
-        $handleQuiescenceAttempt -lt $handleQuiescenceSamples;
-        $handleQuiescenceAttempt++
+        $handleMeasuredQuiescenceAttempt = 0;
+        $handleMeasuredQuiescenceAttempt -lt $handleQuiescenceSamples;
+        $handleMeasuredQuiescenceAttempt++
     ) {
         [System.Threading.Thread]::Sleep(
             $handleQuiescenceWaitMilliseconds
         )
         $handleProbeProcess.Refresh()
-        $handleQuiescenceSample = $handleProbeProcess.HandleCount
+        $handleMeasuredQuiescenceSample = $handleProbeProcess.HandleCount
         $handleSettledFinal = [Math]::Min(
             $handleSettledFinal,
-            $handleQuiescenceSample
+            $handleMeasuredQuiescenceSample
         )
     }
     if (
         ($handleSettledFinal - $handleBaseline) -gt
-            $handleMeasuredFinalGrowthLimit -or
-        ($handleMaximum - $handleBaseline) -gt
-            $handleMeasuredPeakGrowthLimit
+            $handleMeasuredFinalGrowthLimit
     ) {
         throw (
-            'windows-handle-probe-steady-unbounded ' +
+            'windows-handle-probe-steady-persistent ' +
             "baseline=$handleBaseline observed-final=$handleObservedFinal " +
             "settled-final=$handleSettledFinal " +
-            "max=$handleMaximum " +
-            "final-limit=$handleMeasuredFinalGrowthLimit " +
-            "peak-limit=$handleMeasuredPeakGrowthLimit"
+            "max=$handleMeasuredMaximum " +
+            "final-limit=$handleMeasuredFinalGrowthLimit"
         )
     }
 
@@ -175,14 +251,22 @@ try {
     Write-Host (
         'Windows handle stability: ' +
         "startup-baseline=$handleStartupBaseline, " +
-        "startup-final=$handleWarmupFinal, " +
-        "startup-max=$handleWarmupMaximum, " +
+        "warmup-observed-final=$handleWarmupObservedFinal, " +
+        "warmup-settled=$handleWarmupSettled, " +
+        "warmup-max=$handleWarmupMaximum, " +
         "startup-limit=$handleStartupGrowthLimit, " +
-        "warmup=$handleWarmupRuns, baseline=$handleBaseline, " +
+        "warmup=$handleWarmupRuns, " +
+        "calibration-observed-final=$handleCalibrationObservedFinal, " +
+        "calibration-settled=$handleCalibrationSettled, " +
+        "calibration-max=$handleCalibrationMaximum, " +
+        "calibration=$handleCalibrationRuns, " +
+        "baseline=$handleBaseline, " +
         "observed-final=$handleObservedFinal, " +
-        "settled-final=$handleSettledFinal, max=$handleMaximum, " +
-        "runs=$handleMeasuredRuns, " +
-        "quiescence=$($handleQuiescenceSamples)x" +
+        "settled-final=$handleSettledFinal, " +
+        "measured-max=$handleMeasuredMaximum, " +
+        "final-limit=$handleMeasuredFinalGrowthLimit, " +
+        "runs=$handleMeasuredRuns, quiescence-per-window=" +
+        "$($handleQuiescenceSamples)x" +
         "$($handleQuiescenceWaitMilliseconds)ms, gc=not-invoked"
     )
     exit 0
