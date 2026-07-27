@@ -145,8 +145,10 @@ repository paths you cannot publish, or customer data in public issues.
 まま成功に見える完了通知が返る）と「無言失敗」（実行環境差で成功したフリになる）
 を防ぐための、司令塔エージェント向けの規律です。
 
-- 委譲プロンプトの必須文言（再委譲禁止・成果物パスと受け入れ条件・変更ファイル
-  一覧の報告・書式制約）
+- 委譲プロンプトの必須文言（再委譲禁止・排他的 checkout または隔離 worktree の
+  絶対パス・成果物の絶対パス・受け入れ条件・変更ファイル一覧の報告・書式制約）
+- 編集前に checkout の排他的所有と未割当 WIP の不在を確認し、競合時は変更せず
+  排他的 checkout または隔離 worktree を割り当てる
 - 完了通知の実在検証（`git status --porcelain` / ファイル実在確認）
 - 同一エージェント resume によるリカバリ（新規起動より安くて速い）
 - 実行環境差（WSL / Git Bash / PowerShell / sandbox）の切り分け
@@ -162,6 +164,12 @@ repository paths you cannot publish, or customer data in public issues.
   tokens, or real user data involved, and no destructive commands.
 - Never paste tokens, credentials, private logs, or customer data into
   delegation prompts, ledgers, or public issues.
+- Every delegated editor must be the exclusive writer for its checkout.
+  If unassigned existing WIP or another writer is present, stop without
+  changing it and continue only after the orchestrator assigns an exclusive
+  checkout or isolated worktree and task branch. A resumed agent may continue
+  its own explicitly assigned WIP. See
+  [delegation contract hardening](docs/delegation-contract-hardening.md).
 - A completion notice is a claim, not evidence. Report unverified items as
   unverified.
 

@@ -50,7 +50,9 @@ function Assert-FileContains {
         return
     }
 
-    $content = Get-Content -LiteralPath $filePath -Raw
+    # 公開MarkdownはUTF-8 BOMなしのため、Windows PowerShell 5.1のANSI既定値へ
+    # 委ねず明示的にUTF-8として読む。
+    $content = Get-Content -LiteralPath $filePath -Raw -Encoding UTF8
     if ($content -notmatch $Pattern) {
         Add-Failure "$RelativePath is missing: $Description"
     }
@@ -69,9 +71,128 @@ function Assert-FileDoesNotContain {
         return
     }
 
-    $content = Get-Content -LiteralPath $filePath -Raw
+    # negative契約もpositive契約と同じdecode境界で評価し、host差を作らない。
+    $content = Get-Content -LiteralPath $filePath -Raw -Encoding UTF8
     if ($content -match $Pattern) {
         Add-Failure "$RelativePath contains forbidden content: $Description"
+    }
+}
+
+function Test-ContainsExactContract {
+    param(
+        [string]$Content,
+        [string]$Expected
+    )
+
+    $normalizedContent = [regex]::Replace($Content, '\s+', ' ').Trim()
+    $normalizedExpected = [regex]::Replace($Expected, '\s+', ' ').Trim()
+    $firstIndex = $normalizedContent.IndexOf(
+        $normalizedExpected,
+        [System.StringComparison]::Ordinal
+    )
+    return (
+        $firstIndex -ge 0 -and
+        $firstIndex -eq $normalizedContent.LastIndexOf(
+            $normalizedExpected,
+            [System.StringComparison]::Ordinal
+        )
+    )
+}
+
+function Assert-FileContainsExactContract {
+    param(
+        [string]$RelativePath,
+        [string]$Expected,
+        [string]$Description
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot inspect missing file: $RelativePath ($Description)"
+        return
+    }
+
+    # Markdownの折返しだけを無視し、契約を構成する語句と順序は完全一致で固定する。
+    # 部分regexでは危険な動詞だけを反転しても通るため、意味単位のblock全体を比較する。
+    $content = Get-Content -LiteralPath $filePath -Raw -Encoding UTF8
+    if (-not (Test-ContainsExactContract -Content $content -Expected $Expected)) {
+        Add-Failure "$RelativePath is missing exact contract: $Description"
+    }
+}
+
+function Assert-FileContractMutationRejected {
+    param(
+        [string]$RelativePath,
+        [string]$Expected,
+        [string]$Needle,
+        [string]$Replacement,
+        [string]$Description
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure "Cannot mutate missing file: $RelativePath ($Description)"
+        return
+    }
+
+    $content = Get-Content -LiteralPath $filePath -Raw -Encoding UTF8
+    $normalizedContent = [regex]::Replace($content, '\s+', ' ').Trim()
+    $normalizedExpected = [regex]::Replace($Expected, '\s+', ' ').Trim()
+    $normalizedNeedle = [regex]::Replace($Needle, '\s+', ' ').Trim()
+    $normalizedReplacement = (
+        [regex]::Replace($Replacement, '\s+', ' ').Trim()
+    )
+
+    # anchorはfile全体でなく検証対象block内に限定し、将来の無関係な同語追加で
+    # negative fixtureが壊れないようにする。
+    $contractIndex = $normalizedContent.IndexOf(
+        $normalizedExpected,
+        [System.StringComparison]::Ordinal
+    )
+    if (
+        $contractIndex -lt 0 -or
+        $contractIndex -ne $normalizedContent.LastIndexOf(
+            $normalizedExpected,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
+        Add-Failure (
+            "$RelativePath mutation contract must occur exactly once: " +
+            $Description
+        )
+        return
+    }
+
+    $needleIndex = $normalizedExpected.IndexOf(
+        $normalizedNeedle,
+        [System.StringComparison]::Ordinal
+    )
+    if (
+        $needleIndex -lt 0 -or
+        $needleIndex -ne $normalizedExpected.LastIndexOf(
+            $normalizedNeedle,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
+        Add-Failure (
+            "$RelativePath mutation anchor must occur once in contract: " +
+            $Description
+        )
+        return
+    }
+
+    # 実fileを変更せずmemory上で危険な意味へ反転し、本番matcherが拒否することを
+    # 検証する。これによりnegative fixture自体も全hostのreadinessで常時実行される。
+    $mutationIndex = $contractIndex + $needleIndex
+    $mutated = (
+        $normalizedContent.Substring(0, $mutationIndex) +
+        $normalizedReplacement +
+        $normalizedContent.Substring(
+            $mutationIndex + $normalizedNeedle.Length
+        )
+    )
+    if (Test-ContainsExactContract -Content $mutated -Expected $Expected) {
+        Add-Failure "$RelativePath accepts semantic mutation: $Description"
     }
 }
 
@@ -1424,7 +1545,8 @@ function Test-SkillFrontmatter {
         return
     }
 
-    $lines = Get-Content -LiteralPath $skillPath
+    # frontmatterも本文と同じUTF-8境界で読み、hostごとのANSI既定値を使わない。
+    $lines = Get-Content -LiteralPath $skillPath -Encoding UTF8
     if ($lines.Count -lt 4 -or $lines[0] -ne '---') {
         Add-Failure 'SKILL.md must start with YAML frontmatter.'
         return
@@ -1470,6 +1592,7 @@ $requiredFiles = @(
     'README.md',
     'SECURITY.md',
     'SKILL.md',
+    'docs/delegation-contract-hardening.md',
     'docs/SKILL.ja.md',
     'docs/scanner-hardening-v2.md',
     'examples/delegation-prompt-template.md',
@@ -1495,6 +1618,306 @@ Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Security' -De
 Assert-FileContains -RelativePath 'README.md' -Pattern 'CONTRIBUTING\.md' -Description 'link to CONTRIBUTING.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'SECURITY\.md' -Description 'link to SECURITY.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/SKILL\.ja\.md' -Description 'link to the Japanese skill version'
+# 単独委譲でもshared checkoutへ複数writerが入らないよう、正本・翻訳・利用者向け
+# fixtureのすべてに編集前のownership gateを必須化する。
+$skillAbsolutePathsContract = @'
+2. The absolute path of the exclusive checkout / worktree, the absolute
+   expected artifact path(s), and the acceptance criteria: what must exist for
+   the task to count as done.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillAbsolutePathsContract `
+    -Description 'canonical absolute checkout and artifact paths'
+
+$skillOwnershipClause = @'
+5. "Checkout ownership: before editing, inspect the current branch and
+   `git status --porcelain`. If existing WIP is present and was not explicitly
+   assigned to you, another writer is using the same checkout, or ownership is
+   unclear, do not edit, commit, push, or merge. Report the conflict to the
+   orchestrator. Use an exclusive checkout or isolated worktree and task
+   branch before continuing."
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillOwnershipClause `
+    -Description 'mandatory pre-edit checkout ownership clause'
+
+$skillResumeContract = @'
+The ownership clause prevents a different failure: two agents editing one
+checkout can overwrite or absorb each other's WIP and make the measured diff
+disagree with either completion report. Pre-existing WIP not explicitly
+assigned to the delegated agent must not be stashed, reset, deleted, or
+included in the delegated task's commit. A resumed agent may continue its own
+explicitly assigned WIP in the same thread.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillResumeContract `
+    -Description 'assigned-WIP resume exception'
+
+$skillSafetyContract = @'
+- A delegated writer must have an exclusive checkout or isolated worktree.
+  If another writer, unassigned existing WIP, or unclear ownership is
+  detected, the agent reports the conflict without modifying Git state or
+  files.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillSafetyContract `
+    -Description 'canonical fail-closed writer safety condition'
+
+$skillCompletionContract = @'
+- The agent recorded its initial branch/status and had exclusive checkout
+  ownership before editing; unassigned pre-existing WIP was not altered or
+  absorbed.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillCompletionContract `
+    -Description 'canonical ownership completion evidence'
+
+$japaneseAbsolutePathsContract = @'
+2. 排他的 checkout / worktree の絶対パス、成果物の絶対パス、受け入れ条件
+   （何が存在すれば完了か）
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseAbsolutePathsContract `
+    -Description 'Japanese absolute checkout and artifact paths'
+
+$japaneseOwnershipClause = @'
+5. **「checkout の所有権: 編集前に現在 branch と `git status --porcelain` を確認する。
+   明示的に割り当てられていない既存 WIP、同じ checkout の別 writer、または
+   所有権不明を検出した場合は、編集、commit、push、merge を行わず司令塔へ競合を
+   報告する。続行前に排他的な checkout または隔離 worktree と task branch を
+   割り当てること」**
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseOwnershipClause `
+    -Description 'Japanese pre-edit checkout ownership clause'
+
+$japaneseResumeContract = @'
+所有権の条項が防ぐ別の失敗: 2体の agent が同じ checkout を編集すると、互いの WIP を上書きしたり混入したりして、実測 diff と各完了報告が一致しなくなる。
+委譲先へ明示的に割り当てられていない既存 WIP を stash、reset、削除、または委譲 task の commit へ含めてはならない。
+同一 thread で resume した agent は、自身へ明示的に割り当て済みの WIP を継続できる。
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseResumeContract `
+    -Description 'Japanese assigned-WIP resume exception'
+
+$japaneseSafetyContract = @'
+- 委譲先 writer は排他的な checkout または隔離 worktree を所有する。別 writer、
+  未割当の既存 WIP、所有権不明を検出した場合は、Git state と file を変更せず競合を
+  報告する。
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseSafetyContract `
+    -Description 'Japanese fail-closed writer safety condition'
+
+$japaneseCompletionContract = @'
+- 編集前の branch/status と checkout の排他的所有を記録済みで、未割当の既存 WIP を
+  変更も混入もしていない。
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseCompletionContract `
+    -Description 'Japanese ownership completion evidence'
+
+$englishTemplateContract = @'
+Target checkout / worktree (absolute path): <exclusive-checkout-path>
+(assigned exclusively to you)
+Work branch: <branch-name> (use or create it only in the assigned checkout /
+worktree; do not commit to the default branch)
+
+Checkout ownership [MANDATORY]:
+- Before editing, report the current branch and run
+  `git status --porcelain`.
+- You must be the exclusive writer for this checkout. If existing WIP is
+  present and was not explicitly assigned to you, another writer is using the
+  checkout, or ownership is unclear, stop and report the conflict. Do not
+  edit, commit, push, or merge.
+- Do not stash, reset, delete, or absorb unassigned pre-existing WIP. Continue
+  only in the exclusive checkout or isolated worktree and task branch assigned
+  to you.
+
+Deliverables and acceptance criteria [MANDATORY] (use absolute artifact
+paths):
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateContract `
+    -Description 'English synthetic checkout ownership template'
+
+$japaneseTemplateContract = @'
+対象 checkout / worktree（絶対パス）: <exclusive-checkout-path>
+（あなた専用として割当済み）
+作業ブランチ: <branch-name>（割当済み checkout / worktree 内だけで使用または
+作成し、デフォルトブランチへ直接コミットしない）
+
+checkout の所有権【必須】:
+- 編集前に現在 branch を報告し、`git status --porcelain` を実行する。
+- この checkout の排他的 writer であること。明示的に割り当てられていない既存 WIP、
+  同じ checkout の別 writer、または所有権不明を検出した場合は停止して競合を報告し、
+  編集、commit、push、merge を行わない。
+- 未割当の既存 WIP を stash、reset、削除、自分の commit へ混入しない。割り当て
+  られた排他的 checkout または隔離 worktree と task branch でのみ続行する。
+
+成果物と受け入れ条件【必須】（成果物も絶対パスで指定）:
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $japaneseTemplateContract `
+    -Description 'Japanese synthetic checkout ownership template'
+
+$verificationChecklistContract = @'
+## 0. Existing WIP and writer ownership
+
+- [ ] The agent recorded its initial branch and `git status --porcelain`
+      before editing.
+- [ ] The agent was the exclusive writer for its checkout, or used an
+      orchestrator-assigned isolated worktree and task branch.
+- [ ] The agent did not stash, reset, delete, or absorb unassigned
+      pre-existing WIP.
+- [ ] If ownership was unclear or another writer was present, the agent
+      stopped without editing, committing, pushing, or merging.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationChecklistContract `
+    -Description 'orchestrator ownership verification checklist'
+
+$readmeSafetyContract = @'
+- Every delegated editor must be the exclusive writer for its checkout.
+  If unassigned existing WIP or another writer is present, stop without
+  changing it and continue only after the orchestrator assigns an exclusive
+  checkout or isolated worktree and task branch. A resumed agent may continue
+  its own explicitly assigned WIP. See
+  [delegation contract hardening](docs/delegation-contract-hardening.md).
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'README.md' `
+    -Expected $readmeSafetyContract `
+    -Description 'public shared-checkout safety summary'
+
+$readmeJapaneseContract = @'
+- 委譲プロンプトの必須文言（再委譲禁止・排他的 checkout または隔離 worktree の
+  絶対パス・成果物の絶対パス・受け入れ条件・変更ファイル一覧の報告・書式制約）
+- 編集前に checkout の排他的所有と未割当 WIP の不在を確認し、競合時は変更せず
+  排他的 checkout または隔離 worktree を割り当てる
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'README.md' `
+    -Expected $readmeJapaneseContract `
+    -Description 'Japanese public shared-checkout summary'
+
+# reviewerが指摘した意味反転をmemory上のsynthetic fixtureとして固定し、部分一致への
+# 退行をPowerShell 7 / 5.1の両hostで拒否する。
+Assert-FileContractMutationRejected `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillAbsolutePathsContract `
+    -Needle 'the absolute' `
+    -Replacement 'the relative' `
+    -Description 'canonical absolute artifact path weakened'
+Assert-FileContractMutationRejected `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillOwnershipClause `
+    -Needle 'Use an exclusive checkout or isolated worktree' `
+    -Replacement 'Use the shared checkout or any worktree' `
+    -Description 'canonical exclusive continuation reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillResumeContract `
+    -Needle 'A resumed agent may continue its own' `
+    -Replacement 'A resumed agent must abandon its own' `
+    -Description 'canonical assigned-WIP resume exception reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseAbsolutePathsContract `
+    -Needle '成果物の絶対パス' `
+    -Replacement '成果物の相対パス' `
+    -Description 'Japanese absolute artifact path weakened'
+Assert-FileContractMutationRejected `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseOwnershipClause `
+    -Needle '行わず司令塔へ競合を' `
+    -Replacement '行いながら司令塔へ競合を' `
+    -Description 'Japanese conflict stop reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseResumeContract `
+    -Needle '継続できる。' `
+    -Replacement '継続できない。' `
+    -Description 'Japanese assigned-WIP resume exception reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateContract `
+    -Needle '(assigned exclusively to you)' `
+    -Replacement '(shared with other writers)' `
+    -Description 'English template exclusive assignment reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateContract `
+    -Needle 'stop and report the conflict.' `
+    -Replacement 'continue while reporting the conflict.' `
+    -Description 'English template conflict stop reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateContract `
+    -Needle 'only in the exclusive checkout or isolated worktree' `
+    -Replacement 'in any shared checkout or worktree' `
+    -Description 'English template exclusive continuation reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateContract `
+    -Needle 'use absolute artifact' `
+    -Replacement 'use relative artifact' `
+    -Description 'English template absolute artifact path weakened'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $japaneseTemplateContract `
+    -Needle '排他的 writer' `
+    -Replacement '共有 writer' `
+    -Description 'Japanese template exclusive writer reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $japaneseTemplateContract `
+    -Needle '編集、commit、push、merge を行わない。' `
+    -Replacement '編集、commit、push、merge を続ける。' `
+    -Description 'Japanese template conflict stop reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationChecklistContract `
+    -Needle 'The agent recorded its initial branch and' `
+    -Replacement 'The agent skipped its initial branch and' `
+    -Description 'initial branch and status evidence removed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationChecklistContract `
+    -Needle 'stopped without editing, committing, pushing, or merging.' `
+    -Replacement 'continued while editing, committing, pushing, and merging.' `
+    -Description 'checklist conflict stop reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'README.md' `
+    -Expected $readmeSafetyContract `
+    -Needle 'stop without' `
+    -Replacement 'continue while' `
+    -Description 'public fail-closed wording reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'README.md' `
+    -Expected $readmeSafetyContract `
+    -Needle 'A resumed agent may continue' `
+    -Replacement 'A resumed agent must discard' `
+    -Description 'public assigned-WIP resume exception reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'README.md' `
+    -Expected $readmeJapaneseContract `
+    -Needle '排他的 checkout または隔離 worktree の' `
+    -Replacement '排他的 worktree の' `
+    -Description 'Japanese summary over-restricted to worktree'
 Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.local' -Description 'ignore local private marker files'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?im)do not.*public|private|security' -Description 'private vulnerability reporting guidance'
@@ -2406,20 +2829,25 @@ $workflowSteps = Get-WorkflowSteps `
 Assert-WorkflowStepCount `
     -Steps $workflowSteps `
     -JobName 'validate' `
-    -ExpectedCount 6
+    -ExpectedCount 7
 $workflowJobLines = Get-WorkflowJobLines `
     -RelativePath $workflowPath `
     -JobName 'validate'
 Assert-WorkflowJobShape `
     -Lines $workflowJobLines `
     -JobName 'validate' `
-    -ExpectedStepCount 6 `
-    -ExpectedShellCount 5 `
-    -ExpectedRunCount 5
+    -ExpectedStepCount 7 `
+    -ExpectedShellCount 6 `
+    -ExpectedRunCount 6
 Assert-WorkflowUsesStep -Steps $workflowSteps -Name 'Check out repository' `
     -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
 Assert-WorkflowStep -Steps $workflowSteps -Name 'Validate OSS readiness' `
     -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
+Assert-WorkflowStep `
+    -Steps $workflowSteps `
+    -Name 'Validate OSS readiness (Windows PowerShell 5.1)' `
+    -Shell 'powershell' `
+    -Run './scripts/validate-oss-readiness.ps1'
 Assert-WorkflowStep -Steps $workflowSteps -Name 'Test private marker scan (PowerShell 7)' `
     -Shell 'pwsh' -Run './scripts/test-scan-private-markers.ps1'
 Assert-WorkflowStep -Steps $workflowSteps -Name 'Test private marker scan (Windows PowerShell 5.1)' `

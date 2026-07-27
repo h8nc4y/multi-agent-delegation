@@ -8,6 +8,15 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Added a mandatory pre-edit checkout-ownership gate to the canonical skill,
+  Japanese translation, synthetic delegation template, and completion
+  checklist. A delegated writer now fails closed on unassigned existing WIP,
+  another writer, or unclear ownership and continues only in an exclusive
+  checkout or isolated worktree and task branch. A resumed agent can continue
+  its own explicitly assigned WIP. Repository validation uses exact semantic
+  blocks plus in-memory negative fixtures, reads BOM-less Markdown explicitly
+  as UTF-8 on Windows PowerShell 5.1 and PowerShell 7, and runs readiness under
+  both hosts in Windows CI.
 - Replaced ambient child-environment cloning with an exact minimal boundary:
   OS-derived `SystemRoot` on Windows and no ambient values on POSIX. Git adds
   only fixed `GIT_*`, `GCM_INTERACTIVE=Never`, and locale `C` controls; the

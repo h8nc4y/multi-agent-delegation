@@ -6,7 +6,8 @@ description: >-
   idles instead of working, when a completion notice arrives but no artifacts
   exist (git status shows no changes), when execution-environment differences
   (WSL / Git Bash / PowerShell / sandbox) fake success silently, or before
-  writing any delegation prompt. Canonical source for mandatory
+  writing any delegation prompt, especially when multiple writers could share
+  one checkout containing WIP. Canonical source for mandatory
   delegation-prompt clauses, artifact verification of completion notices,
   resume-based recovery, and ledger-as-spec parallel delegation. Symptom
   keywords: silent failure, no-op delegation, "delegated and waiting",
@@ -57,17 +58,31 @@ Include all of these in every delegation prompt:
 1. "Re-delegation to other agents is forbidden. Execute the work yourself
    with your file-edit and shell tools (Read/Edit/Write/Bash or this
    environment's equivalents)."
-2. The absolute path(s) of the expected artifacts and the acceptance
-   criteria: what must exist for the task to count as done.
+2. The absolute path of the exclusive checkout / worktree, the absolute
+   expected artifact path(s), and the acceptance criteria: what must exist for
+   the task to count as done.
 3. "Your completion report must include the list of changed files."
 4. Any format constraints that must not be broken (encoding such as UTF-8
    without BOM, append-only versus overwrite, newline policy).
+5. "Checkout ownership: before editing, inspect the current branch and
+   `git status --porcelain`. If existing WIP is present and was not explicitly
+   assigned to you, another writer is using the same checkout, or ownership is
+   unclear, do not edit, commit, push, or merge. Report the conflict to the
+   orchestrator. Use an exclusive checkout or isolated worktree and task
+   branch before continuing."
 
 Observed failure this prevents: given a large task, a background subagent may
 spawn its own child agent, reply that it delegated and will wait, and then
 terminate. The orchestrator receives a successful-looking completion notice
 while the git working tree is unchanged — and tokens were spent twice, once by
 the idle parent and once by the orphaned child.
+
+The ownership clause prevents a different failure: two agents editing one
+checkout can overwrite or absorb each other's WIP and make the measured diff
+disagree with either completion report. Pre-existing WIP not explicitly
+assigned to the delegated agent must not be stashed, reset, deleted, or
+included in the delegated task's commit. A resumed agent may continue its own
+explicitly assigned WIP in the same thread.
 
 ### 2. Verify every completion notice (never trust the text)
 
@@ -163,6 +178,10 @@ rule it was adding, and fixed that unprompted.
   task touches no secrets, tokens, or real user data and transmits nothing
   externally, and (c) no destructive commands (bulk deletion, force push) are
   involved. Otherwise the orchestrator does the work directly.
+- A delegated writer must have an exclusive checkout or isolated worktree.
+  If another writer, unassigned existing WIP, or unclear ownership is
+  detected, the agent reports the conflict without modifying Git state or
+  files.
 - Recovery re-instruction at most once in the normal path (section 3); if
   the resumed attempt also no-ops, the orchestrator takes over. Set a hard
   stop rule: after three attempts at the same failure class, stop and report
@@ -174,6 +193,9 @@ rule it was adding, and fixed that unprompted.
 
 - Artifacts exist exactly as the acceptance criteria describe (path, content,
   encoding).
+- The agent recorded its initial branch/status and had exclusive checkout
+  ownership before editing; unassigned pre-existing WIP was not altered or
+  absorbed.
 - The `git status --porcelain` diff matches expectations, with nothing extra.
 - The subagent's report and the measured reality agree; any discrepancy has
   been root-caused.

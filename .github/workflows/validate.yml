@@ -25,6 +25,10 @@ jobs:
         shell: pwsh
         run: ./scripts/validate-oss-readiness.ps1
 
+      - name: Validate OSS readiness (Windows PowerShell 5.1)
+        shell: powershell
+        run: ./scripts/validate-oss-readiness.ps1
+
       - name: Test private marker scan (PowerShell 7)
         shell: pwsh
         run: ./scripts/test-scan-private-markers.ps1
