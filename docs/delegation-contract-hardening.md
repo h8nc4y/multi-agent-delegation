@@ -38,14 +38,14 @@ ledger mode では「1 repository = 1 agent」と隔離 worktree を要求する
 
 ## Handoff
 
-- **状態**：初回独立レビューのP1 1件、P2 3件、P3 1件を修正し、統合前の独立再review段階。
+- **状態**：初回独立レビューのP1 1件、P2 3件、P3 1件を修正し、最終freezeの独立cross-reviewでP0 / P1 / P2 / P3すべて0、clearance YESを確認した。PR #8をmerge commit `41c7936`で`main`へ統合済み。
 - **RED**：旧契約を通す baseline から新しい assertions だけを追加した状態で validator を実行し、SKILL、翻訳、bilingual template、checklist、README の5 artifact不足を exit 1 で確認した。
 - **契約検証**：部分regexを15個のexact semantic blockへ置換し、意味を反転する17件のin-memory synthetic mutationをPowerShell 7とWindows PowerShell 5.1の両hostで拒否した。
 - **host互換性**：独立レビューでWindows PowerShell 5.1のBOMなしUTF-8 MarkdownがANSI decodeされる問題を検出したため、validatorの内容読込とfrontmatter読込を明示的なUTF-8へ変更し、PowerShell 7とWindows PowerShell 5.1のreadinessを再実行して成功した。
-- **CI**：Windows jobへWindows PowerShell 5.1のreadiness stepを追加し、validatorでjob shapeとstep契約を固定した。
+- **CI**：Windows jobへWindows PowerShell 5.1のreadiness stepを追加し、validatorでjob shapeとstep契約を固定した。PR #8のGitHub Actions run `30237036286`ではWindows、Ubuntu、macOSの3 jobがすべて成功し、Windows PowerShell 5.1のreadiness stepも成功した。
 - **scanner regression**：修正後のPowerShell 7 self-testは184.21秒、Windows PowerShell 5.1 self-testは158.10秒で成功し、repository scanも19.75秒で成功した。
-- **security scan**：修正後のGitleaksはworking tree 676.08 KBと履歴20 commitsで0 findingsだった。
+- **security scan**：修正後のGitleaksはworking tree 676.08 KB、履歴20 commits、最終staged差分31.07 KBで0 findingsだった。commit時のglobal Gitleaks hookも成功した。
 - **Semgrep**：local 5 rulesはexit 0だったが、対象言語fileがないためtargets 0であり、PowerShellとMarkdownのcoverageには数えない。
 - **hygiene**：変更fileのUTF-8 / LF / NUL不在と `git diff --check` は成功した。
-- **外部境界**：外部 agent 送信、secret / OAuth / credential、実データ、production、公開、費用は使用しない。
-- **残作業**：独立再review、commit、PR、CI、merge、base再検証、cleanup。
+- **外部境界**：公開GitHub repositoryのPR #8作成とmerge以外に、外部 agent 送信、secret / OAuth / credential、実データ、production、deploy、費用は使用していない。
+- **残作業**：機能実装、独立review、PR CI、mergeは完了。handoff同期後に`main`の一致、clean tree、readinessを再確認する。
