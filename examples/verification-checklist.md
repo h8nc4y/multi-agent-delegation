@@ -4,6 +4,17 @@ Run this checklist every time a subagent reports completion, before acting on
 the report or passing "done" upstream. A completion notice is a claim, not
 evidence.
 
+## 0. Existing WIP and writer ownership
+
+- [ ] The agent recorded its initial branch and `git status --porcelain`
+      before editing.
+- [ ] The agent was the exclusive writer for its checkout, or used an
+      orchestrator-assigned isolated worktree and task branch.
+- [ ] The agent did not stash, reset, delete, or absorb unassigned
+      pre-existing WIP.
+- [ ] If ownership was unclear or another writer was present, the agent
+      stopped without editing, committing, pushing, or merging.
+
 ## 1. Artifact existence (always)
 
 - [ ] Every artifact path from the acceptance criteria exists.
