@@ -40,7 +40,8 @@
 
 ## Handoff
 
-- **状態**：GREEN実装、final full regression、security / hygieneを完了し、独立review前のsource freeze段階。
+- **状態**：GREEN実装、final full regression、security / hygiene、独立review、PR CI、mergeを完了した。
+  PR #10をmerge commit `7791a20`で`main`へ統合済み。
 - **RED**：calibration 40回を必須化するvalidatorをproduction変更前に実行し、現行probeの不足だけをexit 1で確認した。
 - **実装**：warmup、calibration、measuredの各window後に同じ10回、50 msのbounded quiescenceを追加した。
   startup limit 16とsteady final limit 4は変更していない。
@@ -58,6 +59,9 @@
 - **hygiene**：変更6 filesはstrict UTF-8、LF、NUL不在だった。
   Windows PowerShell 5.1で実行する3 scriptsは既存どおりUTF-8 BOMを保持した。
   `git diff --check`も成功した。
-- **外部境界**：synthetic/local検証と既存GitHub Actionsだけを使う。
-  secret、OAuth、credential、実データ、production、deploy、費用操作は対象外とする。
-- **残作業**：独立review、PR、3 OS CI、merge、`main`再検証、cleanup。
+- **review**：最終freezeの独立reviewでP0 / P1 / P2 / P3はいずれも0、clearance YESを確認した。
+  reviewerはfreeze一致、80 / 40 / 40の契約、settle順序、limit 16 / 4、no GC / retry / skip、native runner不変を確認し、変更を加えていない。
+- **CI**：PR #10のGitHub Actions run `30240567525`はWindows、Ubuntu、macOSの3 jobsが初回ですべて成功した。
+  Windows jobでは両PowerShellのreadinessとfull self-test、repository scan、whitespaceが成功した。
+- **外部境界**：公開GitHub repositoryのPR #10作成とmerge以外に、外部 agent送信、secret、OAuth、credential、実データ、production、deploy、費用操作は使用していない。
+- **残作業**：handoff同期後に`main`のpost-merge CI、一致、clean tree、readiness、branch cleanupを確認する。
