@@ -95,14 +95,16 @@ The format loosely follows Keep a Changelog conventions.
 - Explicitly dispose Windows and POSIX success-path pump Tasks, pipe streams,
   and buffers instead of relying on GC. The Windows regression now runs in a
   dedicated script in a fresh instance of the same PowerShell executable,
-  after the main self-test has proved raw transport. It bounds aggregate handle
-  growth across an 80-invocation startup window before applying a final limit of
-  4 and a peak limit of 12 to a separate 40-run steady-state window. A bounded
-  10-by-50 ms quiescence sample records the minimum settled final without
-  starting another child or forcing GC. This accounts for observed short-lived
-  Windows PowerShell runtime handles; runner-owned native handle closes remain
-  checked individually, and sustained per-call growth still fails. The POSIX
-  40-run no-GC file-descriptor regression remains unchanged.
+  after the main self-test has proved raw transport. It measures an
+  80-invocation startup window, a 40-invocation runtime calibration window, and
+  a separate 40-run steady-state window. Each window uses the same bounded
+  10-by-50 ms no-GC quiescence sample. The startup limit remains 16 through
+  calibration, and the steady-state final limit remains 4. Window maxima remain
+  evidence, while only growth that survives quiescence is classified as a
+  leak. This separates delayed one-time Windows PowerShell runtime
+  initialization from sustained growth without weakening the runner's
+  individual native-handle close checks. The POSIX 40-run no-GC
+  file-descriptor regression remains unchanged.
 - Seal the dedicated Windows handle probe's canonical UTF-8 source with
   SHA-256, while retaining a separate AST contract and parse-valid negative
   fixtures for zero-run loops, runtime limit mutation, control-flow arguments,

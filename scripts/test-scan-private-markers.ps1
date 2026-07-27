@@ -5349,10 +5349,16 @@ exit 0
             (
                 '^Windows handle stability: ' +
                 '(?<Evidence>startup-baseline=[0-9]+, ' +
-                'startup-final=[0-9]+, startup-max=[0-9]+, ' +
-                'startup-limit=16, warmup=80, baseline=[0-9]+, ' +
+                'warmup-observed-final=[0-9]+, ' +
+                'warmup-settled=[0-9]+, warmup-max=[0-9]+, ' +
+                'startup-limit=16, warmup=80, ' +
+                'calibration-observed-final=[0-9]+, ' +
+                'calibration-settled=[0-9]+, ' +
+                'calibration-max=[0-9]+, calibration=40, ' +
+                'baseline=[0-9]+, ' +
                 'observed-final=[0-9]+, settled-final=[0-9]+, ' +
-                'max=[0-9]+, runs=40, quiescence=10x50ms, ' +
+                'measured-max=[0-9]+, final-limit=4, runs=40, ' +
+                'quiescence-per-window=10x50ms, ' +
                 'gc=not-invoked)$'
             ),
             [System.Text.RegularExpressions.RegexOptions]::CultureInvariant,
