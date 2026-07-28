@@ -70,6 +70,13 @@ Include all of these in every delegation prompt:
    unclear, do not edit, commit, push, or merge. Report the conflict to the
    orchestrator. Use an exclusive checkout or isolated worktree and task
    branch before continuing."
+6. "Completion verification baseline: before editing, record the current
+   branch, the full OID from `git rev-parse --verify HEAD`, and all output from
+   `git --no-optional-locks status --porcelain=v1 --untracked-files=all`. For
+   non-Git artifacts and explicitly assigned dirty-resume artifacts, also
+   record existence, byte size, and SHA-256. Use read-only Git commands only;
+   never use `git write-tree` or another command that mutates the index,
+   working tree, or object database to create the baseline."
 
 Observed failure this prevents: given a large task, a background subagent may
 spawn its own child agent, reply that it delegated and will wait, and then
@@ -86,9 +93,30 @@ explicitly assigned WIP in the same thread.
 
 ### 2. Verify every completion notice (never trust the text)
 
-- For file-changing tasks, run
-  `git -C <repo> --no-optional-locks status --porcelain`
-  or check that the artifact paths exist and their modification times moved.
+- Before editing begins, retain the verification baseline from section 1. If
+  `HEAD` does not exist yet, record the repository as unborn instead of
+  inventing an OID. Never read or hash unassigned WIP; its presence is the
+  ownership conflict that must stop the delegation.
+- After the completion notice, the orchestrator independently re-measures the
+  final branch, full HEAD OID, `git diff --name-status
+  <baseline>..<final> --`, current `git --no-optional-locks status
+  --porcelain=v1 --untracked-files=all`, and the acceptance artifact's
+  existence, content, byte size, and SHA-256. For an existing baseline HEAD,
+  `git merge-base --is-ancestor <baseline> <final>` must exit 0; the same
+  branch name is not proof that history was preserved.
+- Combine the evidence. An unchanged HEAD plus unchanged initial-to-final
+  porcelain and assigned artifact state is a no-op even when the artifact
+  already exists. An empty final porcelain is valid when HEAD changed, the
+  baseline is an ancestor of final HEAD, the baseline-to-final diff contains
+  only assigned paths, and the artifact content passes acceptance. Rewritten or
+  divergent history is a scope violation even when its diff is assigned-only.
+  For an explicitly assigned dirty resume, compare the initial and final
+  artifact states because the same porcelain path may appear at both times.
+  Any unassigned path in the initial/final porcelain or committed diff is a
+  scope violation, not successful work.
+- For a non-Git file-changing task, compare the final artifact with its
+  pre-edit existence, byte size, and SHA-256, then inspect its content against
+  acceptance. Existence or modification time alone is not completion evidence.
 - Do not report "done" upstream based on the notice text alone. Anything you
   could not verify must be reported as unverified.
 
@@ -196,7 +224,12 @@ rule it was adding, and fixed that unprompted.
 - The agent recorded its initial branch/status and had exclusive checkout
   ownership before editing; unassigned pre-existing WIP was not altered or
   absorbed.
-- The `git status --porcelain` diff matches expectations, with nothing extra.
+- The pre-edit baseline includes the full HEAD OID, full porcelain output, and
+  required artifact state; baseline collection used read-only commands only.
+- Final HEAD/diff/current porcelain and artifact content were independently
+  re-measured. Existing baseline HEAD is an ancestor of final HEAD, at least one
+  assigned initial-to-final delta exists, and no unassigned path was altered or
+  absorbed.
 - The subagent's report and the measured reality agree; any discrepancy has
   been root-caused.
 - In ledger mode: ticked ledger entries match the changes that were actually

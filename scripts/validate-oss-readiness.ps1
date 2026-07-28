@@ -1,6 +1,10 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$Path = ''
+    [string]$Path = '',
+
+    # hostile-environment probeが同じhelper定義を別processで読むための内部seam。
+    # 通常validationでは指定せず、定義後に副作用なくreturnする。
+    [switch]$InternalDefinitionsOnly
 )
 
 Set-StrictMode -Version Latest
@@ -17,6 +21,13 @@ if ([string]::IsNullOrWhiteSpace($Path)) {
 
 $root = (Resolve-Path -LiteralPath $Path).Path
 $failures = New-Object System.Collections.Generic.List[string]
+$processRunnerModule = Join-Path `
+    $scriptRoot `
+    'private-marker-process-runner.psm1'
+if (-not (Test-Path -LiteralPath $processRunnerModule -PathType Leaf)) {
+    throw 'process-runner-module-missing'
+}
+Import-Module -Name $processRunnerModule -Force -ErrorAction Stop
 
 function Add-Failure {
     param([string]$Message)
@@ -193,6 +204,1576 @@ function Assert-FileContractMutationRejected {
     )
     if (Test-ContainsExactContract -Content $mutated -Expected $Expected) {
         Add-Failure "$RelativePath accepts semantic mutation: $Description"
+    }
+}
+
+function Resolve-SyntheticGitExecutable {
+    param([string]$CandidatePath = '')
+
+    if ([string]::IsNullOrWhiteSpace($CandidatePath)) {
+        $commands = @(
+            Get-Command `
+                -Name 'git' `
+                -CommandType Application `
+                -ErrorAction Stop
+        )
+        if ($commands.Count -lt 1) {
+            throw 'synthetic-git-executable-missing'
+        }
+        $CandidatePath = [string]$commands[0].Source
+    }
+
+    if (-not [System.IO.Path]::IsPathRooted($CandidatePath)) {
+        throw 'synthetic-git-executable-not-absolute'
+    }
+    $resolvedPath = [System.IO.Path]::GetFullPath($CandidatePath)
+    if (-not [System.IO.File]::Exists($resolvedPath)) {
+        throw 'synthetic-git-executable-missing'
+    }
+    $leaf = [System.IO.Path]::GetFileName($resolvedPath)
+    $expectedLeaf = if (
+        [Environment]::OSVersion.Platform -eq
+            [System.PlatformID]::Win32NT
+    ) {
+        'git.exe'
+    } else {
+        'git'
+    }
+    if (
+        -not [string]::Equals(
+            $leaf,
+            $expectedLeaf,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        throw 'synthetic-git-executable-name-invalid'
+    }
+    return $resolvedPath
+}
+
+function Initialize-SyntheticGitControlRoot {
+    param([string]$SafeRoot)
+
+    foreach ($directoryName in @('hooks', 'template')) {
+        [System.IO.Directory]::CreateDirectory(
+            (Join-Path $SafeRoot $directoryName)
+        ) | Out-Null
+    }
+    foreach ($fileName in @(
+        'global.config',
+        'system.config',
+        'attributes',
+        'excludes'
+    )) {
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $SafeRoot $fileName) `
+            -Content ''
+    }
+}
+
+function New-SyntheticGitChildEnvironment {
+    param([string]$SafeRoot)
+
+    # production scannerと同じfixed minimal child environmentから始める。
+    # ambient GIT_*, HOME, credential, loader, profiler値は列挙も継承もしない。
+    $environment = New-PrivateMarkerChildEnvironment
+    $environment['GIT_CONFIG_NOSYSTEM'] = '1'
+    $environment['GIT_ATTR_NOSYSTEM'] = '1'
+    $environment['GIT_CONFIG_GLOBAL'] = Join-Path $SafeRoot 'global.config'
+    $environment['GIT_CONFIG_SYSTEM'] = Join-Path $SafeRoot 'system.config'
+    $environment['GIT_TERMINAL_PROMPT'] = '0'
+    $environment['GIT_OPTIONAL_LOCKS'] = '0'
+    $environment['GIT_NO_LAZY_FETCH'] = '1'
+    $environment['GIT_NO_REPLACE_OBJECTS'] = '1'
+    $environment['GIT_PROTOCOL_FROM_USER'] = '0'
+    $environment['GCM_INTERACTIVE'] = 'Never'
+    $environment['LC_ALL'] = 'C'
+    $environment['LANG'] = 'C'
+    return $environment
+}
+
+function Get-SyntheticGitArguments {
+    param(
+        [object]$Context,
+        [string[]]$Arguments
+    )
+
+    # repository local configをinit templateから隔離し、hook、signing、
+    # attributes/filter、credential、network protocolをcommand lineで固定する。
+    return @(
+        '--no-pager',
+        '--no-replace-objects',
+        '--no-optional-locks',
+        '-c', ('core.hooksPath=' + (Join-Path $Context.SafeRoot 'hooks')),
+        '-c', (
+            'core.attributesFile=' +
+                (Join-Path $Context.SafeRoot 'attributes')
+        ),
+        '-c', (
+            'core.excludesFile=' +
+                (Join-Path $Context.SafeRoot 'excludes')
+        ),
+        '-c', (
+            'init.templateDir=' +
+                (Join-Path $Context.SafeRoot 'template')
+        ),
+        '-c', 'core.fsmonitor=false',
+        '-c', 'core.untrackedCache=false',
+        '-c', 'commit.gpgsign=false',
+        '-c', 'tag.gpgsign=false',
+        '-c', 'credential.helper=',
+        '-c', 'credential.interactive=never',
+        '-c', 'protocol.allow=never',
+        '-c', 'protocol.file.allow=never',
+        '-c', 'protocol.ext.allow=never',
+        '-c', 'protocol.http.allow=never',
+        '-c', 'protocol.https.allow=never',
+        '-c', 'protocol.ssh.allow=never',
+        '-c', 'protocol.git.allow=never',
+        '-C', $Context.RepositoryPath
+    ) + $Arguments
+}
+
+function New-SyntheticGitContext {
+    param(
+        [string]$RepositoryPath,
+        [string]$SafeRoot,
+        [string]$GitExecutablePath
+    )
+
+    return [pscustomobject]@{
+        RepositoryPath = [System.IO.Path]::GetFullPath($RepositoryPath)
+        SafeRoot = [System.IO.Path]::GetFullPath($SafeRoot)
+        GitExecutablePath = Resolve-SyntheticGitExecutable `
+            -CandidatePath $GitExecutablePath
+    }
+}
+
+function Invoke-SyntheticGitRaw {
+    param(
+        [object]$Context,
+        [string[]]$Arguments
+    )
+
+    if (
+        -not [System.IO.Directory]::Exists($Context.RepositoryPath) -or
+        -not [System.IO.Directory]::Exists($Context.SafeRoot)
+    ) {
+        throw 'synthetic-git-context-invalid'
+    }
+
+    # full executable path、exact environment、byte-bounded process treeを使い、
+    # native failure、timeout、stderr、decode failureをfail closedにする。
+    $result = Invoke-PrivateMarkerBoundedProcess `
+        -FilePath $Context.GitExecutablePath `
+        -Arguments (
+            Get-SyntheticGitArguments `
+                -Context $Context `
+                -Arguments $Arguments
+        ) `
+        -WorkingDirectory $Context.RepositoryPath `
+        -EnvironmentVariables (
+            New-SyntheticGitChildEnvironment -SafeRoot $Context.SafeRoot
+        ) `
+        -TimeoutMilliseconds 20000 `
+        -KillWaitMilliseconds 5000 `
+        -MaxStandardOutputBytes 1MB `
+        -MaxStandardErrorBytes 256KB
+    return $result
+}
+
+function Invoke-SyntheticGit {
+    param(
+        [object]$Context,
+        [string[]]$Arguments
+    )
+
+    $result = Invoke-SyntheticGitRaw `
+        -Context $Context `
+        -Arguments $Arguments
+    if (
+        $result.ExitCode -ne 0 -or
+        $result.StandardErrorBytes.Length -ne 0
+    ) {
+        throw 'synthetic-git-command-failed'
+    }
+
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+    try {
+        $output = $strictUtf8.GetString($result.StandardOutputBytes)
+    }
+    catch {
+        throw 'synthetic-git-output-invalid'
+    }
+    $output = $output.Replace("`r`n", "`n")
+    if ($output.EndsWith("`n", [System.StringComparison]::Ordinal)) {
+        $output = $output.Substring(0, $output.Length - 1)
+    }
+    if ($output.Length -eq 0) {
+        return @()
+    }
+    return @($output -split "`n")
+}
+
+function Test-SyntheticBaselineIsAncestor {
+    param(
+        [object]$Context,
+        [string]$BaselineHead,
+        [string]$FinalHead
+    )
+
+    # merge-baseの0/1だけをbool evidenceへ変換する。その他のexit、
+    # stdout/stderr、timeoutはhistory判定不能としてfail closedにする。
+    $result = Invoke-SyntheticGitRaw `
+        -Context $Context `
+        -Arguments @(
+            'merge-base',
+            '--is-ancestor',
+            $BaselineHead,
+            $FinalHead
+        )
+    if (
+        $result.StandardOutputBytes.Length -ne 0 -or
+        $result.StandardErrorBytes.Length -ne 0 -or
+        ($result.ExitCode -ne 0 -and $result.ExitCode -ne 1)
+    ) {
+        throw 'synthetic-git-ancestry-check-failed'
+    }
+    return $result.ExitCode -eq 0
+}
+
+function Write-SyntheticUtf8Text {
+    param(
+        [string]$Path,
+        [string]$Content
+    )
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Content, $encoding)
+}
+
+function Get-SyntheticArtifactState {
+    param(
+        [string]$RepositoryPath,
+        [string]$RelativePath
+    )
+
+    $artifactPath = Join-Path $RepositoryPath $RelativePath
+    if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
+        return [pscustomobject]@{
+            Exists = $false
+            Length = 0L
+            Sha256 = ''
+        }
+    }
+
+    $bytes = [System.IO.File]::ReadAllBytes($artifactPath)
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = (
+            $sha256.ComputeHash($bytes) |
+                ForEach-Object { $_.ToString('x2') }
+        ) -join ''
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
+    return [pscustomobject]@{
+        Exists = $true
+        Length = [long]$bytes.Length
+        Sha256 = $digest
+    }
+}
+
+function Get-SyntheticCompletionSnapshot {
+    param(
+        [object]$Context,
+        [string[]]$ArtifactPaths
+    )
+
+    # baseline/final snapshotはread-only Git commandだけで構成する。
+    # write-treeやindex mutationを検証の近道として使用しない。
+    $branch = @(
+        Invoke-SyntheticGit `
+            -Context $Context `
+            -Arguments @('branch', '--show-current')
+    ) -join "`n"
+    $head = @(
+        Invoke-SyntheticGit `
+            -Context $Context `
+            -Arguments @('rev-parse', '--verify', 'HEAD')
+    ) -join "`n"
+    $porcelain = @(
+        Invoke-SyntheticGit `
+            -Context $Context `
+            -Arguments @(
+                'status',
+                '--porcelain=v1',
+                '--untracked-files=all'
+            )
+    )
+
+    $artifacts = @{}
+    foreach ($artifactPath in $ArtifactPaths) {
+        $artifacts[$artifactPath] = Get-SyntheticArtifactState `
+            -RepositoryPath $Context.RepositoryPath `
+            -RelativePath $artifactPath
+    }
+
+    return [pscustomobject]@{
+        Branch = $branch
+        Head = $head
+        Porcelain = @($porcelain)
+        Artifacts = $artifacts
+    }
+}
+
+function Get-SyntheticCommittedPaths {
+    param(
+        [object]$Context,
+        [string]$BaselineHead,
+        [string]$FinalHead
+    )
+
+    if (
+        [string]::Equals(
+            $BaselineHead,
+            $FinalHead,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
+        return @()
+    }
+
+    $range = "$BaselineHead..$FinalHead"
+    $nameStatus = @(
+        Invoke-SyntheticGit `
+            -Context $Context `
+            -Arguments @(
+                'diff',
+                '--name-status',
+                '--no-renames',
+                $range,
+                '--'
+            )
+    )
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $nameStatus) {
+        $fields = @($line -split "`t")
+        if ($fields.Count -lt 2) {
+            throw 'synthetic-git-name-status-invalid'
+        }
+        $paths.Add($fields[$fields.Count - 1]) | Out-Null
+    }
+    return @($paths)
+}
+
+function Get-SyntheticPorcelainPaths {
+    param([string[]]$Porcelain)
+
+    $paths = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $Porcelain) {
+        # fixtureはrenameを使わず、porcelain v1の通常pathだけを対象にする。
+        # public契約では司令塔がraw出力を独立確認する。
+        if ($line.Length -lt 4) {
+            throw 'synthetic-git-porcelain-invalid'
+        }
+        $paths.Add($line.Substring(3)) | Out-Null
+    }
+    return @($paths)
+}
+
+function Test-SyntheticArtifactChanged {
+    param(
+        [object]$Initial,
+        [object]$Final
+    )
+
+    return (
+        $Initial.Exists -ne $Final.Exists -or
+        $Initial.Length -ne $Final.Length -or
+        -not [string]::Equals(
+            $Initial.Sha256,
+            $Final.Sha256,
+            [System.StringComparison]::Ordinal
+        )
+    )
+}
+
+function Test-BaselineAwareCompletionDecision {
+    param(
+        [object]$Initial,
+        [object]$Final,
+        [string[]]$CommittedPaths,
+        [string[]]$AssignedPaths,
+        [Parameter(Mandatory = $true)]
+        [bool]$BaselineIsAncestor,
+        [bool]$AcceptanceSatisfied
+    )
+
+    if (-not $AcceptanceSatisfied) {
+        return $false
+    }
+    if (-not $BaselineIsAncestor) {
+        return $false
+    }
+    if (
+        -not [string]::Equals(
+            $Initial.Branch,
+            $Final.Branch,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
+        return $false
+    }
+
+    $assigned = New-Object 'System.Collections.Generic.HashSet[string]' (
+        [System.StringComparer]::Ordinal
+    )
+    foreach ($assignedPath in $AssignedPaths) {
+        $assigned.Add($assignedPath) | Out-Null
+    }
+
+    # initial/final porcelainとbaseline→final commit差分の全pathを割当境界へ
+    # containし、未割当WIPの変更・stage・commit・吸収を成功へ昇格させない。
+    $scopePaths = New-Object System.Collections.Generic.List[string]
+    foreach (
+        $porcelainPath in Get-SyntheticPorcelainPaths `
+            -Porcelain @($Initial.Porcelain)
+    ) {
+        $scopePaths.Add($porcelainPath) | Out-Null
+    }
+    foreach (
+        $porcelainPath in Get-SyntheticPorcelainPaths `
+            -Porcelain @($Final.Porcelain)
+    ) {
+        $scopePaths.Add($porcelainPath) | Out-Null
+    }
+    foreach ($committedPath in $CommittedPaths) {
+        $scopePaths.Add($committedPath) | Out-Null
+    }
+    foreach ($scopePath in $scopePaths) {
+        if (-not $assigned.Contains($scopePath)) {
+            return $false
+        }
+    }
+
+    $headChanged = -not [string]::Equals(
+        $Initial.Head,
+        $Final.Head,
+        [System.StringComparison]::Ordinal
+    )
+    $hasCommittedDelta = (
+        $headChanged -and
+        @($CommittedPaths).Count -gt 0
+    )
+
+    # dirty resumeではporcelainのstatus/path表示が同じまま変化し得るため、
+    # assigned artifactのinitial→final byte stateを独立したdelta証拠にする。
+    $hasArtifactDelta = $false
+    foreach ($assignedPath in $AssignedPaths) {
+        if (
+            -not $Initial.Artifacts.ContainsKey($assignedPath) -or
+            -not $Final.Artifacts.ContainsKey($assignedPath)
+        ) {
+            return $false
+        }
+        if (
+            Test-SyntheticArtifactChanged `
+                -Initial $Initial.Artifacts[$assignedPath] `
+                -Final $Final.Artifacts[$assignedPath]
+        ) {
+            $hasArtifactDelta = $true
+        }
+    }
+
+    return ($hasCommittedDelta -or $hasArtifactDelta)
+}
+
+function Test-NonGitArtifactCompletionDecision {
+    param(
+        [object]$Initial,
+        [object]$Final,
+        [bool]$AcceptanceSatisfied
+    )
+
+    # 非Git成果物も「現在ある」ではなく、開始前に記録したbyte stateとの
+    # 差分と受け入れ条件の両方を満たした場合だけ完了へ昇格する。
+    if (-not $AcceptanceSatisfied) {
+        return $false
+    }
+    return Test-SyntheticArtifactChanged -Initial $Initial -Final $Final
+}
+
+function Test-SyntheticByteArrayEqual {
+    param(
+        [byte[]]$Left,
+        [byte[]]$Right
+    )
+
+    if ($Left.Length -ne $Right.Length) {
+        return $false
+    }
+    for ($index = 0; $index -lt $Left.Length; $index++) {
+        if ($Left[$index] -ne $Right[$index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-SyntheticDirectoryState {
+    param([string]$DirectoryPath)
+
+    $records = New-Object System.Collections.Generic.List[string]
+    if ([System.IO.Directory]::Exists($DirectoryPath)) {
+        $rootPath = [System.IO.Path]::GetFullPath($DirectoryPath).TrimEnd(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+        foreach (
+            $filePath in @(
+                [System.IO.Directory]::GetFiles(
+                    $rootPath,
+                    '*',
+                    [System.IO.SearchOption]::AllDirectories
+                ) | Sort-Object
+            )
+        ) {
+            $relativePath = $filePath.Substring($rootPath.Length + 1)
+            $state = Get-SyntheticArtifactState `
+                -RepositoryPath $rootPath `
+                -RelativePath $relativePath
+            $records.Add(
+                (
+                    '{0}:{1}:{2}:{3}' -f
+                        $relativePath.Length,
+                        $relativePath,
+                        $state.Length,
+                        $state.Sha256
+                )
+            ) | Out-Null
+        }
+    }
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $bytes = $encoding.GetBytes(($records -join "`n"))
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = (
+            $sha256.ComputeHash($bytes) |
+                ForEach-Object { $_.ToString('x2') }
+        ) -join ''
+    }
+    finally {
+        $sha256.Dispose()
+    }
+    return [pscustomobject]@{
+        Count = $records.Count
+        Sha256 = $digest
+    }
+}
+
+function Test-SyntheticDirectoryStateEqual {
+    param(
+        [object]$Left,
+        [object]$Right
+    )
+
+    return (
+        $Left.Count -eq $Right.Count -and
+        [string]::Equals(
+            $Left.Sha256,
+            $Right.Sha256,
+            [System.StringComparison]::Ordinal
+        )
+    )
+}
+
+function Resolve-SyntheticPowerShellExecutable {
+    $process = [System.Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $candidatePath = [string]$process.MainModule.FileName
+    }
+    finally {
+        $process.Dispose()
+    }
+    if (
+        -not [System.IO.Path]::IsPathRooted($candidatePath) -or
+        -not [System.IO.File]::Exists($candidatePath)
+    ) {
+        throw 'synthetic-powershell-executable-invalid'
+    }
+    $leaf = [System.IO.Path]::GetFileName($candidatePath)
+    if ($leaf -notmatch '^(?i:pwsh|powershell)(?:\.exe)?$') {
+        throw 'synthetic-powershell-executable-invalid'
+    }
+    return [System.IO.Path]::GetFullPath($candidatePath)
+}
+
+function New-SyntheticProbeHarnessEnvironment {
+    param(
+        [string]$HarnessRoot,
+        [string]$PowerShellPath,
+        [string]$GitPath
+    )
+
+    # hostile GIT_*をprocess-globalへ書かず、別PowerShell processだけへ渡す。
+    # harness自体もfixed local pathだけを持ち、profileやcredentialを継承しない。
+    $syntheticIsWindows = (
+        [Environment]::OSVersion.Platform -eq
+            [System.PlatformID]::Win32NT
+    )
+    $comparer = if ($syntheticIsWindows) {
+        [System.StringComparer]::OrdinalIgnoreCase
+    } else {
+        [System.StringComparer]::Ordinal
+    }
+    $environment = New-Object `
+        'System.Collections.Generic.Dictionary[string,string]' `
+        $comparer
+    $homeRoot = Join-Path $HarnessRoot 'home'
+    $tempRoot = Join-Path $HarnessRoot 'temp'
+    [System.IO.Directory]::CreateDirectory($homeRoot) | Out-Null
+    [System.IO.Directory]::CreateDirectory($tempRoot) | Out-Null
+    $environment['HOME'] = $homeRoot
+    $environment['LC_ALL'] = 'C'
+    $environment['LANG'] = 'C'
+    $environment['POWERSHELL_TELEMETRY_OPTOUT'] = '1'
+    $environment['DOTNET_CLI_TELEMETRY_OPTOUT'] = '1'
+
+    $pathEntries = New-Object System.Collections.Generic.List[string]
+    foreach ($executablePath in @($PowerShellPath, $GitPath)) {
+        $parent = [System.IO.Path]::GetDirectoryName($executablePath)
+        if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            $pathEntries.Add($parent) | Out-Null
+        }
+    }
+    if ($syntheticIsWindows) {
+        $systemDirectory = [Environment]::SystemDirectory
+        $windowsRoot = [System.IO.Directory]::GetParent($systemDirectory)
+        if ($null -eq $windowsRoot) {
+            throw 'synthetic-harness-environment-invalid'
+        }
+        $runtimeDirectory = (
+            [System.Runtime.InteropServices.RuntimeEnvironment]::
+                GetRuntimeDirectory()
+        )
+        foreach ($entry in @($systemDirectory, $runtimeDirectory)) {
+            $pathEntries.Add($entry) | Out-Null
+        }
+        $environment['SystemRoot'] = $windowsRoot.FullName
+        $environment['WINDIR'] = $windowsRoot.FullName
+        $environment['ComSpec'] = Join-Path $systemDirectory 'cmd.exe'
+        $environment['PATHEXT'] = '.COM;.EXE;.BAT;.CMD'
+        $environment['TEMP'] = $tempRoot
+        $environment['TMP'] = $tempRoot
+        $environment['USERPROFILE'] = $homeRoot
+        $environment['APPDATA'] = Join-Path $homeRoot 'AppData\Roaming'
+        $environment['LOCALAPPDATA'] = Join-Path $homeRoot 'AppData\Local'
+        [System.IO.Directory]::CreateDirectory(
+            $environment['APPDATA']
+        ) | Out-Null
+        [System.IO.Directory]::CreateDirectory(
+            $environment['LOCALAPPDATA']
+        ) | Out-Null
+    } else {
+        foreach ($entry in @('/usr/bin', '/bin', '/usr/sbin', '/sbin')) {
+            if ([System.IO.Directory]::Exists($entry)) {
+                $pathEntries.Add($entry) | Out-Null
+            }
+        }
+        $environment['TMPDIR'] = $tempRoot
+        $environment['DOTNET_CLI_HOME'] = $homeRoot
+    }
+    $environment['PATH'] = @($pathEntries | Select-Object -Unique) -join (
+        [System.IO.Path]::PathSeparator
+    )
+    return $environment
+}
+
+function Invoke-SyntheticHermeticChildProbe {
+    param(
+        [object]$Context,
+        [System.Collections.IDictionary]$HarnessEnvironment
+    )
+
+    $powerShellPath = Resolve-SyntheticPowerShellExecutable
+    $probeScript = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$VerbosePreference = 'SilentlyContinue'
+$DebugPreference = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+. $env:SYNTHETIC_VALIDATOR_PATH `
+    -Path $env:SYNTHETIC_VALIDATOR_ROOT `
+    -InternalDefinitionsOnly
+$context = [pscustomobject]@{
+    RepositoryPath = $env:SYNTHETIC_GIT_REPOSITORY
+    SafeRoot = $env:SYNTHETIC_GIT_SAFE_ROOT
+    GitExecutablePath = $env:SYNTHETIC_GIT_EXECUTABLE
+}
+Invoke-SyntheticGit `
+    -Context $context `
+    -Arguments @('add', '--', '.gitattributes', 'evidence.txt') |
+    Out-Null
+$success = [System.Text.Encoding]::UTF8.GetBytes(
+    "synthetic-git-hermetic-probe-passed`n"
+)
+$stdout = [Console]::OpenStandardOutput()
+$stdout.Write($success, 0, $success.Length)
+$stdout.Flush()
+'@
+    $encodedProbe = [Convert]::ToBase64String(
+        [System.Text.Encoding]::Unicode.GetBytes($probeScript)
+    )
+    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive')
+    if (
+        [Environment]::OSVersion.Platform -eq
+            [System.PlatformID]::Win32NT
+    ) {
+        $arguments += @('-ExecutionPolicy', 'Bypass')
+    }
+    $arguments += @('-EncodedCommand', $encodedProbe)
+
+    $HarnessEnvironment['SYNTHETIC_VALIDATOR_PATH'] = Join-Path `
+        $scriptRoot `
+        'validate-oss-readiness.ps1'
+    $HarnessEnvironment['SYNTHETIC_VALIDATOR_ROOT'] = $root
+    $HarnessEnvironment['SYNTHETIC_GIT_REPOSITORY'] = (
+        $Context.RepositoryPath
+    )
+    $HarnessEnvironment['SYNTHETIC_GIT_SAFE_ROOT'] = $Context.SafeRoot
+    $HarnessEnvironment['SYNTHETIC_GIT_EXECUTABLE'] = (
+        $Context.GitExecutablePath
+    )
+
+    try {
+        $result = Invoke-PrivateMarkerBoundedProcess `
+            -FilePath $powerShellPath `
+            -Arguments $arguments `
+            -WorkingDirectory $Context.RepositoryPath `
+            -EnvironmentVariables $HarnessEnvironment `
+            -TimeoutMilliseconds 60000 `
+            -KillWaitMilliseconds 5000 `
+            -MaxStandardOutputBytes 16KB `
+            -MaxStandardErrorBytes 64KB
+    }
+    catch {
+        Add-Failure 'synthetic Git hostile-environment child failed closed'
+        return $false
+    }
+
+    $expectedOutput = [System.Text.Encoding]::UTF8.GetBytes(
+        "synthetic-git-hermetic-probe-passed`n"
+    )
+    if (
+        $result.ExitCode -ne 0 -or
+        $result.StandardErrorBytes.Length -ne 0 -or
+        -not (
+            Test-SyntheticByteArrayEqual `
+                -Left $result.StandardOutputBytes `
+                -Right $expectedOutput
+        )
+    ) {
+        Add-Failure (
+            'synthetic Git hostile-environment child result was not exact ' +
+            (
+                '(exit={0}, stdout-bytes={1}, stderr-bytes={2})' -f
+                    $result.ExitCode,
+                    $result.StandardOutputBytes.Length,
+                    $result.StandardErrorBytes.Length
+            )
+        )
+        return $false
+    }
+    return $true
+}
+
+function Initialize-SyntheticBaselineRepository {
+    param(
+        [object]$Context,
+        [string]$ArtifactPath,
+        [string]$InitialContent = "pre-existing`n"
+    )
+
+    Invoke-SyntheticGit `
+        -Context $Context `
+        -Arguments @('init', '--quiet') |
+        Out-Null
+    Invoke-SyntheticGit `
+        -Context $Context `
+        -Arguments @('config', 'user.name', 'Synthetic Fixture') |
+        Out-Null
+    Invoke-SyntheticGit `
+        -Context $Context `
+        -Arguments @('config', 'user.email', 'fixture.invalid') |
+        Out-Null
+    Write-SyntheticUtf8Text `
+        -Path (Join-Path $Context.RepositoryPath $ArtifactPath) `
+        -Content $InitialContent
+    Invoke-SyntheticGit `
+        -Context $Context `
+        -Arguments @('add', '--', $ArtifactPath) |
+        Out-Null
+    Invoke-SyntheticGit `
+        -Context $Context `
+        -Arguments @(
+            'commit',
+            '--quiet',
+            '--no-verify',
+            '-m',
+            'fixture H0'
+        ) |
+        Out-Null
+}
+
+function Remove-SyntheticFixtureDirectory {
+    param([string]$DirectoryPath)
+
+    if (-not [System.IO.Directory]::Exists($DirectoryPath)) {
+        return
+    }
+
+    # Git for Windowsはloose objectをread-onlyで作る。合成fixture配下の
+    # 既知fileだけをnormalへ戻してから、生成したrootを1回で削除する。
+    foreach (
+        $filePath in [System.IO.Directory]::GetFiles(
+            $DirectoryPath,
+            '*',
+            [System.IO.SearchOption]::AllDirectories
+        )
+    ) {
+        [System.IO.File]::SetAttributes(
+            $filePath,
+            [System.IO.FileAttributes]::Normal
+        )
+    }
+    [System.IO.Directory]::Delete($DirectoryPath, $true)
+}
+
+function Assert-BaselineAwareCompletionSemanticFixtures {
+    $tempBase = [System.IO.Path]::GetTempPath()
+    $fixtureRoot = [System.IO.Path]::Combine(
+        $tempBase,
+        'multi-agent-delegation-completion-' +
+            [System.Guid]::NewGuid().ToString('N')
+    )
+    $hostileRoot = $fixtureRoot + '-hostile'
+    $controlRoot = Join-Path $fixtureRoot 'git-controls'
+    $mainRoot = Join-Path $fixtureRoot 'main'
+    $nonGitRoot = Join-Path $fixtureRoot 'non-git'
+    $artifactPath = 'evidence.txt'
+    $unassignedPath = 'owner-wip.txt'
+    $semanticStage = 'setup'
+
+    try {
+        [System.IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null
+        [System.IO.Directory]::CreateDirectory($hostileRoot) | Out-Null
+        [System.IO.Directory]::CreateDirectory($controlRoot) | Out-Null
+        [System.IO.Directory]::CreateDirectory($mainRoot) | Out-Null
+        Initialize-SyntheticGitControlRoot -SafeRoot $controlRoot
+        $gitExecutable = Resolve-SyntheticGitExecutable
+        $mainContext = New-SyntheticGitContext `
+            -RepositoryPath $mainRoot `
+            -SafeRoot $controlRoot `
+            -GitExecutablePath $gitExecutable
+
+        # H0には受け入れ条件と同名のartifactを先に置き、no-opを実在だけで
+        # 成功扱いできないcaseを作る。
+        Initialize-SyntheticBaselineRepository `
+            -Context $mainContext `
+            -ArtifactPath $artifactPath
+
+        $noOpInitial = Get-SyntheticCompletionSnapshot `
+            -Context $mainContext `
+            -ArtifactPaths @($artifactPath)
+        $noOpFinal = Get-SyntheticCompletionSnapshot `
+            -Context $mainContext `
+            -ArtifactPaths @($artifactPath)
+        $noOpPaths = Get-SyntheticCommittedPaths `
+            -Context $mainContext `
+            -BaselineHead $noOpInitial.Head `
+            -FinalHead $noOpFinal.Head
+        $noOpAncestor = Test-SyntheticBaselineIsAncestor `
+            -Context $mainContext `
+            -BaselineHead $noOpInitial.Head `
+            -FinalHead $noOpFinal.Head
+        if (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $noOpInitial `
+                -Final $noOpFinal `
+                -CommittedPaths $noOpPaths `
+                -AssignedPaths @($artifactPath) `
+                -BaselineIsAncestor $noOpAncestor `
+                -AcceptanceSatisfied $true
+        ) {
+            Add-Failure (
+                'baseline completion fixture accepts unchanged ' +
+                'pre-existing artifact'
+            )
+        }
+
+        $semanticStage = 'main-acceptance'
+        # 成果物に差分があっても受け入れ条件が偽なら完了にしない。
+        $rejectedArtifact = Get-SyntheticArtifactState `
+            -RepositoryPath $mainRoot `
+            -RelativePath $artifactPath
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $mainRoot $artifactPath) `
+            -Content "acceptance rejected`n"
+        $rejectedArtifactFinal = Get-SyntheticArtifactState `
+            -RepositoryPath $mainRoot `
+            -RelativePath $artifactPath
+        if (
+            Test-NonGitArtifactCompletionDecision `
+                -Initial $rejectedArtifact `
+                -Final $rejectedArtifactFinal `
+                -AcceptanceSatisfied $false
+        ) {
+            Add-Failure (
+                'baseline completion fixture ignores failed acceptance'
+            )
+        }
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $mainRoot $artifactPath) `
+            -Content "pre-existing`n"
+
+        $semanticStage = 'main-commit'
+        # H0から期待pathだけをC1へcommitし、final porcelainが空でも成功する
+        # committed-delta caseを作る。
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $mainRoot $artifactPath) `
+            -Content "accepted C1`n"
+        Invoke-SyntheticGit `
+            -Context $mainContext `
+            -Arguments @('add', '--', $artifactPath) | Out-Null
+        Invoke-SyntheticGit `
+            -Context $mainContext `
+            -Arguments @(
+                'commit',
+                '--quiet',
+                '--no-verify',
+                '-m',
+                'fixture C1'
+            ) |
+            Out-Null
+        $commitFinal = Get-SyntheticCompletionSnapshot `
+            -Context $mainContext `
+            -ArtifactPaths @($artifactPath)
+        $commitPaths = Get-SyntheticCommittedPaths `
+            -Context $mainContext `
+            -BaselineHead $noOpInitial.Head `
+            -FinalHead $commitFinal.Head
+        $commitAncestor = Test-SyntheticBaselineIsAncestor `
+            -Context $mainContext `
+            -BaselineHead $noOpInitial.Head `
+            -FinalHead $commitFinal.Head
+        if (
+            -not (
+                Test-BaselineAwareCompletionDecision `
+                    -Initial $noOpInitial `
+                    -Final $commitFinal `
+                    -CommittedPaths $commitPaths `
+                    -AssignedPaths @($artifactPath) `
+                    -BaselineIsAncestor $commitAncestor `
+                    -AcceptanceSatisfied $true
+            )
+        ) {
+            Add-Failure (
+                'baseline completion fixture rejects clean committed delta'
+            )
+        }
+        if (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $noOpInitial `
+                -Final $commitFinal `
+                -CommittedPaths $commitPaths `
+                -AssignedPaths @($artifactPath) `
+                -BaselineIsAncestor $commitAncestor `
+                -AcceptanceSatisfied $false
+        ) {
+            Add-Failure (
+                'baseline completion fixture accepts failed Git acceptance'
+            )
+        }
+
+        $semanticStage = 'dirty-resume'
+        # 同一threadのassigned dirty resumeでは、porcelain pathが同じままでも
+        # artifact digestのinitial→final変化を証拠にする。
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $mainRoot $artifactPath) `
+            -Content "assigned draft 1`n"
+        $dirtyInitial = Get-SyntheticCompletionSnapshot `
+            -Context $mainContext `
+            -ArtifactPaths @($artifactPath)
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $mainRoot $artifactPath) `
+            -Content "assigned draft 2`n"
+        $dirtyFinal = Get-SyntheticCompletionSnapshot `
+            -Context $mainContext `
+            -ArtifactPaths @($artifactPath)
+        $dirtyPaths = Get-SyntheticCommittedPaths `
+            -Context $mainContext `
+            -BaselineHead $dirtyInitial.Head `
+            -FinalHead $dirtyFinal.Head
+        $dirtyAncestor = Test-SyntheticBaselineIsAncestor `
+            -Context $mainContext `
+            -BaselineHead $dirtyInitial.Head `
+            -FinalHead $dirtyFinal.Head
+        if (
+            -not (
+                Test-BaselineAwareCompletionDecision `
+                    -Initial $dirtyInitial `
+                    -Final $dirtyFinal `
+                    -CommittedPaths $dirtyPaths `
+                    -AssignedPaths @($artifactPath) `
+                    -BaselineIsAncestor $dirtyAncestor `
+                    -AcceptanceSatisfied $true
+            )
+        ) {
+            Add-Failure (
+                'baseline completion fixture rejects assigned dirty delta'
+            )
+        }
+
+        $semanticStage = 'scope-commit'
+        # scope guardの3入力を別repositoryへ分け、1 guardだけで他2件が
+        # 偶然GREENになることを防ぐ。
+        $scopeCommitRoot = Join-Path $fixtureRoot 'scope-commit'
+        [System.IO.Directory]::CreateDirectory($scopeCommitRoot) | Out-Null
+        $scopeCommitContext = New-SyntheticGitContext `
+            -RepositoryPath $scopeCommitRoot `
+            -SafeRoot $controlRoot `
+            -GitExecutablePath $gitExecutable
+        Initialize-SyntheticBaselineRepository `
+            -Context $scopeCommitContext `
+            -ArtifactPath $artifactPath
+        $scopeCommitInitial = Get-SyntheticCompletionSnapshot `
+            -Context $scopeCommitContext `
+            -ArtifactPaths @($artifactPath)
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $scopeCommitRoot $artifactPath) `
+            -Content "assigned commit delta`n"
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $scopeCommitRoot $unassignedPath) `
+            -Content "unassigned commit delta`n"
+        Invoke-SyntheticGit `
+            -Context $scopeCommitContext `
+            -Arguments @('add', '--', $artifactPath, $unassignedPath) |
+            Out-Null
+        Invoke-SyntheticGit `
+            -Context $scopeCommitContext `
+            -Arguments @(
+                'commit',
+                '--quiet',
+                '--no-verify',
+                '-m',
+                'fixture unassigned commit'
+            ) |
+            Out-Null
+        $scopeCommitFinal = Get-SyntheticCompletionSnapshot `
+            -Context $scopeCommitContext `
+            -ArtifactPaths @($artifactPath)
+        $scopeCommitPaths = Get-SyntheticCommittedPaths `
+            -Context $scopeCommitContext `
+            -BaselineHead $scopeCommitInitial.Head `
+            -FinalHead $scopeCommitFinal.Head
+        $scopeCommitAncestor = Test-SyntheticBaselineIsAncestor `
+            -Context $scopeCommitContext `
+            -BaselineHead $scopeCommitInitial.Head `
+            -FinalHead $scopeCommitFinal.Head
+        if (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $scopeCommitInitial `
+                -Final $scopeCommitFinal `
+                -CommittedPaths $scopeCommitPaths `
+                -AssignedPaths @($artifactPath) `
+                -BaselineIsAncestor $scopeCommitAncestor `
+                -AcceptanceSatisfied $true
+        ) {
+            Add-Failure (
+                'baseline completion fixture accepts unassigned committed path'
+            )
+        }
+
+        $semanticStage = 'scope-final'
+        $scopeFinalRoot = Join-Path $fixtureRoot 'scope-final'
+        [System.IO.Directory]::CreateDirectory($scopeFinalRoot) | Out-Null
+        $scopeFinalContext = New-SyntheticGitContext `
+            -RepositoryPath $scopeFinalRoot `
+            -SafeRoot $controlRoot `
+            -GitExecutablePath $gitExecutable
+        Initialize-SyntheticBaselineRepository `
+            -Context $scopeFinalContext `
+            -ArtifactPath $artifactPath
+        $scopeFinalInitial = Get-SyntheticCompletionSnapshot `
+            -Context $scopeFinalContext `
+            -ArtifactPaths @($artifactPath)
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $scopeFinalRoot $artifactPath) `
+            -Content "assigned final delta`n"
+        Invoke-SyntheticGit `
+            -Context $scopeFinalContext `
+            -Arguments @('add', '--', $artifactPath) |
+            Out-Null
+        Invoke-SyntheticGit `
+            -Context $scopeFinalContext `
+            -Arguments @(
+                'commit',
+                '--quiet',
+                '--no-verify',
+                '-m',
+                'fixture assigned final'
+            ) |
+            Out-Null
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $scopeFinalRoot $unassignedPath) `
+            -Content "unassigned final porcelain`n"
+        $scopeFinalOnly = Get-SyntheticCompletionSnapshot `
+            -Context $scopeFinalContext `
+            -ArtifactPaths @($artifactPath)
+        $scopeFinalPaths = Get-SyntheticCommittedPaths `
+            -Context $scopeFinalContext `
+            -BaselineHead $scopeFinalInitial.Head `
+            -FinalHead $scopeFinalOnly.Head
+        $scopeFinalAncestor = Test-SyntheticBaselineIsAncestor `
+            -Context $scopeFinalContext `
+            -BaselineHead $scopeFinalInitial.Head `
+            -FinalHead $scopeFinalOnly.Head
+        if (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $scopeFinalInitial `
+                -Final $scopeFinalOnly `
+                -CommittedPaths $scopeFinalPaths `
+                -AssignedPaths @($artifactPath) `
+                -BaselineIsAncestor $scopeFinalAncestor `
+                -AcceptanceSatisfied $true
+        ) {
+            Add-Failure (
+                'baseline completion fixture accepts unassigned final porcelain'
+            )
+        }
+
+        $semanticStage = 'scope-initial'
+        $scopeInitialRoot = Join-Path $fixtureRoot 'scope-initial'
+        [System.IO.Directory]::CreateDirectory($scopeInitialRoot) | Out-Null
+        $scopeInitialContext = New-SyntheticGitContext `
+            -RepositoryPath $scopeInitialRoot `
+            -SafeRoot $controlRoot `
+            -GitExecutablePath $gitExecutable
+        Initialize-SyntheticBaselineRepository `
+            -Context $scopeInitialContext `
+            -ArtifactPath $artifactPath
+        $initialOnlyPath = Join-Path $scopeInitialRoot $unassignedPath
+        Write-SyntheticUtf8Text `
+            -Path $initialOnlyPath `
+            -Content "unassigned initial porcelain`n"
+        $scopeInitialOnly = Get-SyntheticCompletionSnapshot `
+            -Context $scopeInitialContext `
+            -ArtifactPaths @($artifactPath)
+        # controlled fixture setup removes the synthetic unassigned file so
+        # only the initial-porcelain guard can reject the final decision.
+        [System.IO.File]::Delete($initialOnlyPath)
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $scopeInitialRoot $artifactPath) `
+            -Content "assigned initial delta`n"
+        Invoke-SyntheticGit `
+            -Context $scopeInitialContext `
+            -Arguments @('add', '--', $artifactPath) |
+            Out-Null
+        Invoke-SyntheticGit `
+            -Context $scopeInitialContext `
+            -Arguments @(
+                'commit',
+                '--quiet',
+                '--no-verify',
+                '-m',
+                'fixture assigned initial'
+            ) |
+            Out-Null
+        $scopeInitialFinal = Get-SyntheticCompletionSnapshot `
+            -Context $scopeInitialContext `
+            -ArtifactPaths @($artifactPath)
+        $scopeInitialPaths = Get-SyntheticCommittedPaths `
+            -Context $scopeInitialContext `
+            -BaselineHead $scopeInitialOnly.Head `
+            -FinalHead $scopeInitialFinal.Head
+        $scopeInitialAncestor = Test-SyntheticBaselineIsAncestor `
+            -Context $scopeInitialContext `
+            -BaselineHead $scopeInitialOnly.Head `
+            -FinalHead $scopeInitialFinal.Head
+        if (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $scopeInitialOnly `
+                -Final $scopeInitialFinal `
+                -CommittedPaths $scopeInitialPaths `
+                -AssignedPaths @($artifactPath) `
+                -BaselineIsAncestor $scopeInitialAncestor `
+                -AcceptanceSatisfied $true
+        ) {
+            Add-Failure (
+                'baseline completion fixture accepts unassigned initial porcelain'
+            )
+        }
+
+        $semanticStage = 'divergent-history'
+        $divergentRoot = Join-Path $fixtureRoot 'divergent-history'
+        [System.IO.Directory]::CreateDirectory($divergentRoot) | Out-Null
+        $divergentContext = New-SyntheticGitContext `
+            -RepositoryPath $divergentRoot `
+            -SafeRoot $controlRoot `
+            -GitExecutablePath $gitExecutable
+        Initialize-SyntheticBaselineRepository `
+            -Context $divergentContext `
+            -ArtifactPath $artifactPath `
+            -InitialContent "parent P0`n"
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $divergentRoot $artifactPath) `
+            -Content "baseline H0`n"
+        Invoke-SyntheticGit `
+            -Context $divergentContext `
+            -Arguments @('add', '--', $artifactPath) |
+            Out-Null
+        Invoke-SyntheticGit `
+            -Context $divergentContext `
+            -Arguments @(
+                'commit',
+                '--quiet',
+                '--no-verify',
+                '-m',
+                'fixture baseline H0'
+            ) |
+            Out-Null
+        $divergentInitial = Get-SyntheticCompletionSnapshot `
+            -Context $divergentContext `
+            -ArtifactPaths @($artifactPath)
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $divergentRoot $artifactPath) `
+            -Content "discarded forward C1`n"
+        Invoke-SyntheticGit `
+            -Context $divergentContext `
+            -Arguments @('add', '--', $artifactPath) |
+            Out-Null
+        Invoke-SyntheticGit `
+            -Context $divergentContext `
+            -Arguments @(
+                'commit',
+                '--quiet',
+                '--no-verify',
+                '-m',
+                'fixture discarded C1'
+            ) |
+            Out-Null
+        $divergentParent = @(
+            Invoke-SyntheticGit `
+                -Context $divergentContext `
+                -Arguments @(
+                    'rev-parse',
+                    '--verify',
+                    ($divergentInitial.Head + '^')
+                )
+        ) -join "`n"
+        $historySentinelPath = Join-Path `
+            $hostileRoot `
+            'divergent-history.sentinel'
+        Write-SyntheticUtf8Text `
+            -Path $historySentinelPath `
+            -Content "external history sentinel`n"
+        $historySentinelBefore = Get-SyntheticArtifactState `
+            -RepositoryPath $hostileRoot `
+            -RelativePath 'divergent-history.sentinel'
+
+        # synthetic branchだけをP0へrewindし、同名branchにassigned-only C2を作る。
+        # このreset自体が完了契約で拒否すべきhistory破壊caseである。
+        Invoke-SyntheticGit `
+            -Context $divergentContext `
+            -Arguments @('reset', '--hard', '--quiet', $divergentParent) |
+            Out-Null
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $divergentRoot $artifactPath) `
+            -Content "divergent assigned C2`n"
+        Invoke-SyntheticGit `
+            -Context $divergentContext `
+            -Arguments @('add', '--', $artifactPath) |
+            Out-Null
+        Invoke-SyntheticGit `
+            -Context $divergentContext `
+            -Arguments @(
+                'commit',
+                '--quiet',
+                '--no-verify',
+                '-m',
+                'fixture divergent C2'
+            ) |
+            Out-Null
+        $divergentFinal = Get-SyntheticCompletionSnapshot `
+            -Context $divergentContext `
+            -ArtifactPaths @($artifactPath)
+        $divergentPaths = Get-SyntheticCommittedPaths `
+            -Context $divergentContext `
+            -BaselineHead $divergentInitial.Head `
+            -FinalHead $divergentFinal.Head
+        $divergentAncestor = Test-SyntheticBaselineIsAncestor `
+            -Context $divergentContext `
+            -BaselineHead $divergentInitial.Head `
+            -FinalHead $divergentFinal.Head
+        $historySentinelAfter = Get-SyntheticArtifactState `
+            -RepositoryPath $hostileRoot `
+            -RelativePath 'divergent-history.sentinel'
+        if ($divergentAncestor) {
+            Add-Failure (
+                'baseline completion fixture failed to create divergent history'
+            )
+        }
+        if (
+            -not (
+                Test-BaselineAwareCompletionDecision `
+                    -Initial $divergentInitial `
+                    -Final $divergentFinal `
+                    -CommittedPaths $divergentPaths `
+                    -AssignedPaths @($artifactPath) `
+                    -BaselineIsAncestor $true `
+                    -AcceptanceSatisfied $true
+            )
+        ) {
+            Add-Failure (
+                'divergent fixture did not isolate the ancestry guard'
+            )
+        }
+        if (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $divergentInitial `
+                -Final $divergentFinal `
+                -CommittedPaths $divergentPaths `
+                -AssignedPaths @($artifactPath) `
+                -BaselineIsAncestor $divergentAncestor `
+                -AcceptanceSatisfied $true
+        ) {
+            Add-Failure (
+                'baseline completion fixture accepts divergent history'
+            )
+        }
+        if (
+            Test-SyntheticArtifactChanged `
+                -Initial $historySentinelBefore `
+                -Final $historySentinelAfter
+        ) {
+            Add-Failure (
+                'divergent history fixture changed external sentinel'
+            )
+        }
+
+        $semanticStage = 'hermetic-setup'
+        # ambient redirectとglobal filterを別PowerShell childへだけ注入し、
+        # hermetic Git childが外部index/object sentinelを変更しないと証明する。
+        $hermeticRoot = Join-Path $fixtureRoot 'hermetic'
+        $externalBareRoot = Join-Path $hostileRoot 'external-bare.git'
+        [System.IO.Directory]::CreateDirectory($hermeticRoot) | Out-Null
+        [System.IO.Directory]::CreateDirectory($externalBareRoot) | Out-Null
+        $hermeticContext = New-SyntheticGitContext `
+            -RepositoryPath $hermeticRoot `
+            -SafeRoot $controlRoot `
+            -GitExecutablePath $gitExecutable
+        $externalBareContext = New-SyntheticGitContext `
+            -RepositoryPath $externalBareRoot `
+            -SafeRoot $controlRoot `
+            -GitExecutablePath $gitExecutable
+        Invoke-SyntheticGit `
+            -Context $hermeticContext `
+            -Arguments @('init', '--quiet') |
+            Out-Null
+        Invoke-SyntheticGit `
+            -Context $externalBareContext `
+            -Arguments @('init', '--bare', '--quiet') |
+            Out-Null
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $hermeticRoot '.gitattributes') `
+            -Content "*.txt filter=sentinel`n"
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $hermeticRoot $artifactPath) `
+            -Content "hermetic redirect probe`n"
+
+        $hostileIndexPath = Join-Path $hostileRoot 'redirect-index.sentinel'
+        Write-SyntheticUtf8Text `
+            -Path $hostileIndexPath `
+            -Content "external index sentinel`n"
+        $redirectIndexBefore = Get-SyntheticArtifactState `
+            -RepositoryPath $hostileRoot `
+            -RelativePath 'redirect-index.sentinel'
+        $redirectBareBefore = Get-SyntheticDirectoryState `
+            -DirectoryPath $externalBareRoot
+        $semanticStage = 'hermetic-powershell-resolve'
+        $powerShellPath = Resolve-SyntheticPowerShellExecutable
+        $semanticStage = 'hermetic-redirect-environment'
+        $redirectEnvironment = New-SyntheticProbeHarnessEnvironment `
+            -HarnessRoot (Join-Path $hostileRoot 'redirect-harness') `
+            -PowerShellPath $powerShellPath `
+            -GitPath $gitExecutable
+        $redirectEnvironment['GIT_DIR'] = $externalBareRoot
+        $redirectEnvironment['GIT_WORK_TREE'] = $hermeticRoot
+        $redirectEnvironment['GIT_INDEX_FILE'] = $hostileIndexPath
+        $semanticStage = 'hermetic-redirect-child'
+        $redirectPassed = Invoke-SyntheticHermeticChildProbe `
+            -Context $hermeticContext `
+            -HarnessEnvironment $redirectEnvironment
+        $semanticStage = 'hermetic-redirect-verify'
+        $redirectIndexAfter = Get-SyntheticArtifactState `
+            -RepositoryPath $hostileRoot `
+            -RelativePath 'redirect-index.sentinel'
+        $redirectBareAfter = Get-SyntheticDirectoryState `
+            -DirectoryPath $externalBareRoot
+        if (
+            -not $redirectPassed -or
+            (Test-SyntheticArtifactChanged `
+                -Initial $redirectIndexBefore `
+                -Final $redirectIndexAfter) -or
+            -not (
+                Test-SyntheticDirectoryStateEqual `
+                    -Left $redirectBareBefore `
+                    -Right $redirectBareAfter
+            )
+        ) {
+            Add-Failure (
+                'synthetic Git inherited redirect environment or changed sentinel'
+            )
+        }
+
+        $semanticStage = 'hermetic-filter'
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $hermeticRoot $artifactPath) `
+            -Content "hermetic filter probe`n"
+        $hostileConfig = Join-Path $hostileRoot 'hostile.config'
+        Write-SyntheticUtf8Text -Path $hostileConfig -Content ''
+        $gitForShell = $gitExecutable.Replace('\', '/')
+        $bareForShell = $externalBareRoot.Replace('\', '/')
+        $filterCommand = (
+            '"' + $gitForShell + '" --git-dir="' +
+            $bareForShell + '" hash-object -w --stdin'
+        )
+        foreach ($configEntry in @(
+            @('filter.sentinel.clean', $filterCommand),
+            @('filter.sentinel.required', 'true'),
+            @('commit.gpgsign', 'true')
+        )) {
+            Invoke-SyntheticGit `
+                -Context $hermeticContext `
+                -Arguments @(
+                    'config',
+                    '--file',
+                    $hostileConfig,
+                    $configEntry[0],
+                    $configEntry[1]
+                ) |
+                Out-Null
+        }
+        $filterBareBefore = Get-SyntheticDirectoryState `
+            -DirectoryPath $externalBareRoot
+        $hostileConfigBefore = Get-SyntheticArtifactState `
+            -RepositoryPath $hostileRoot `
+            -RelativePath 'hostile.config'
+        $filterEnvironment = New-SyntheticProbeHarnessEnvironment `
+            -HarnessRoot (Join-Path $hostileRoot 'filter-harness') `
+            -PowerShellPath $powerShellPath `
+            -GitPath $gitExecutable
+        $filterEnvironment['GIT_CONFIG_GLOBAL'] = $hostileConfig
+        $filterEnvironment['GIT_CONFIG_SYSTEM'] = $hostileConfig
+        $filterEnvironment['GIT_CONFIG_NOSYSTEM'] = '0'
+        $filterEnvironment['GIT_CONFIG_COUNT'] = '3'
+        $filterEnvironment['GIT_CONFIG_KEY_0'] = 'filter.sentinel.clean'
+        $filterEnvironment['GIT_CONFIG_VALUE_0'] = $filterCommand
+        $filterEnvironment['GIT_CONFIG_KEY_1'] = 'filter.sentinel.required'
+        $filterEnvironment['GIT_CONFIG_VALUE_1'] = 'true'
+        $filterEnvironment['GIT_CONFIG_KEY_2'] = 'commit.gpgsign'
+        $filterEnvironment['GIT_CONFIG_VALUE_2'] = 'true'
+        $filterPassed = Invoke-SyntheticHermeticChildProbe `
+            -Context $hermeticContext `
+            -HarnessEnvironment $filterEnvironment
+        $filterBareAfter = Get-SyntheticDirectoryState `
+            -DirectoryPath $externalBareRoot
+        $hostileConfigAfter = Get-SyntheticArtifactState `
+            -RepositoryPath $hostileRoot `
+            -RelativePath 'hostile.config'
+        if (
+            -not $filterPassed -or
+            -not (
+                Test-SyntheticDirectoryStateEqual `
+                    -Left $filterBareBefore `
+                    -Right $filterBareAfter
+            ) -or
+            (Test-SyntheticArtifactChanged `
+                -Initial $hostileConfigBefore `
+                -Final $hostileConfigAfter)
+        ) {
+            Add-Failure (
+                'synthetic Git inherited hostile config or executed filter'
+            )
+        }
+
+        $semanticStage = 'non-git'
+        # Git repository外のsiblingを使い、Git証拠に依存しない成果物へも
+        # 同じ存在・size・SHA-256契約を適用する。
+        [System.IO.Directory]::CreateDirectory($nonGitRoot) | Out-Null
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $nonGitRoot $artifactPath) `
+            -Content "non-git pre-existing`n"
+        $nonGitInitial = Get-SyntheticArtifactState `
+            -RepositoryPath $nonGitRoot `
+            -RelativePath $artifactPath
+        $nonGitNoOp = Get-SyntheticArtifactState `
+            -RepositoryPath $nonGitRoot `
+            -RelativePath $artifactPath
+        if (
+            Test-NonGitArtifactCompletionDecision `
+                -Initial $nonGitInitial `
+                -Final $nonGitNoOp `
+                -AcceptanceSatisfied $true
+        ) {
+            Add-Failure (
+                'baseline completion fixture accepts non-Git no-op'
+            )
+        }
+        Write-SyntheticUtf8Text `
+            -Path (Join-Path $nonGitRoot $artifactPath) `
+            -Content "non-git accepted`n"
+        $nonGitFinal = Get-SyntheticArtifactState `
+            -RepositoryPath $nonGitRoot `
+            -RelativePath $artifactPath
+        if (
+            -not (
+                Test-NonGitArtifactCompletionDecision `
+                    -Initial $nonGitInitial `
+                    -Final $nonGitFinal `
+                    -AcceptanceSatisfied $true
+            )
+        ) {
+            Add-Failure (
+                'baseline completion fixture rejects non-Git artifact delta'
+            )
+        }
+    }
+    catch {
+        # temp pathやnative stderrを公開validatorの診断へ流さない。
+        Add-Failure (
+            'baseline completion semantic fixture failed closed: ' +
+            $semanticStage
+        )
+    }
+    finally {
+        foreach ($syntheticRoot in @($fixtureRoot, $hostileRoot)) {
+            if ([System.IO.Directory]::Exists($syntheticRoot)) {
+                try {
+                    Remove-SyntheticFixtureDirectory `
+                        -DirectoryPath $syntheticRoot
+                }
+                catch {
+                    Add-Failure (
+                        'baseline completion semantic fixture cleanup failed'
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -1626,6 +3207,10 @@ function Test-SkillFrontmatter {
     }
 }
 
+if ($InternalDefinitionsOnly) {
+    return
+}
+
 $requiredFiles = @(
     '.editorconfig',
     '.gitattributes',
@@ -1641,6 +3226,7 @@ $requiredFiles = @(
     'README.md',
     'SECURITY.md',
     'SKILL.md',
+    'docs/completion-baseline-verification.md',
     'docs/delegation-contract-hardening.md',
     'docs/SKILL.ja.md',
     'docs/scanner-hardening-v2.md',
@@ -1659,6 +3245,8 @@ $requiredFiles = @(
 foreach ($requiredFile in $requiredFiles) {
     Assert-FileExists -RelativePath $requiredFile
 }
+
+Assert-BaselineAwareCompletionSemanticFixtures
 
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Install' -Description 'installation instructions'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Validation' -Description 'validation instructions'
@@ -1726,6 +3314,54 @@ Assert-FileContainsExactContract `
     -Expected $skillCompletionContract `
     -Description 'canonical ownership completion evidence'
 
+$skillBaselineClause = @'
+6. "Completion verification baseline: before editing, record the current
+   branch, the full OID from `git rev-parse --verify HEAD`, and all output from
+   `git --no-optional-locks status --porcelain=v1 --untracked-files=all`. For
+   non-Git artifacts and explicitly assigned dirty-resume artifacts, also
+   record existence, byte size, and SHA-256. Use read-only Git commands only;
+   never use `git write-tree` or another command that mutates the index,
+   working tree, or object database to create the baseline."
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillBaselineClause `
+    -Description 'canonical read-only completion baseline clause'
+
+$skillFinalMeasurementContract = @'
+- After the completion notice, the orchestrator independently re-measures the
+  final branch, full HEAD OID, `git diff --name-status
+  <baseline>..<final> --`, current `git --no-optional-locks status
+  --porcelain=v1 --untracked-files=all`, and the acceptance artifact's
+  existence, content, byte size, and SHA-256. For an existing baseline HEAD,
+  `git merge-base --is-ancestor <baseline> <final>` must exit 0; the same
+  branch name is not proof that history was preserved.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillFinalMeasurementContract `
+    -Description 'canonical independent final measurement'
+
+$skillVerificationEvidenceContract = @'
+- Combine the evidence. An unchanged HEAD plus unchanged initial-to-final
+  porcelain and assigned artifact state is a no-op even when the artifact
+  already exists. An empty final porcelain is valid when HEAD changed, the
+  baseline is an ancestor of final HEAD, the baseline-to-final diff contains
+  only assigned paths, and the artifact content passes acceptance. Rewritten or
+  divergent history is a scope violation even when its diff is assigned-only.
+  For an explicitly assigned dirty resume, compare the initial and final
+  artifact states because the same porcelain path may appear at both times.
+  Any unassigned path in the initial/final porcelain or committed diff is a
+  scope violation, not successful work.
+- For a non-Git file-changing task, compare the final artifact with its
+  pre-edit existence, byte size, and SHA-256, then inspect its content against
+  acceptance. Existence or modification time alone is not completion evidence.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillVerificationEvidenceContract `
+    -Description 'canonical baseline-to-final completion decision'
+
 $japaneseAbsolutePathsContract = @'
 2. 排他的 checkout / worktree の絶対パス、成果物の絶対パス、受け入れ条件
    （何が存在すれば完了か）
@@ -1776,6 +3412,47 @@ Assert-FileContainsExactContract `
     -Expected $japaneseCompletionContract `
     -Description 'Japanese ownership completion evidence'
 
+$japaneseBaselineClause = @'
+6. **「完了検証baseline: 編集前に現在branch、`git rev-parse --verify HEAD`の完全OID、
+   `git --no-optional-locks status --porcelain=v1 --untracked-files=all`の全出力を記録する。
+   non-Git成果物と明示的に割り当て済みのdirty resume成果物では、実在、byte size、
+   SHA-256も記録する。baseline取得にはread-only Git commandだけを使い、
+   `git write-tree`などindex、working tree、object databaseを変更するcommandを使わない」**
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseBaselineClause `
+    -Description 'Japanese read-only completion baseline clause'
+
+$japaneseFinalMeasurementContract = @'
+- 完了通知後、司令塔が最終branch、完全HEAD OID、`git diff --name-status
+  <baseline>..<final> --`、現在の`git --no-optional-locks status --porcelain=v1
+  --untracked-files=all`、受け入れ成果物の実在・内容・byte size・SHA-256を独立して
+  再測定する。baseline HEADが存在する場合は`git merge-base --is-ancestor
+  <baseline> <final>`のexit 0を必須とし、同じbranch名だけでhistory保持と判定しない。
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseFinalMeasurementContract `
+    -Description 'Japanese independent final measurement'
+
+$japaneseVerificationEvidenceContract = @'
+- 証拠を合成する。HEAD、porcelain、assigned artifact stateがinitial→finalで不変なら、
+  成果物が既に存在しても空振り。最終porcelainが空でも、HEADが変わり、
+  baselineがfinal HEADのancestorで、baseline→final diffが割当済みpathだけを含み、
+  成果物内容が受け入れ条件を満たせばcommit済みの成功とする。割当済みpathだけの
+  diffでも、rewrittenまたはdivergent historyはscope違反とする。
+  明示的に割り当て済みのdirty resumeは、porcelainに同じpathが出続け得るためartifact
+  stateをinitial→finalで比較する。initial/final porcelainまたはcommit差分に未割当pathが
+  あれば、成功ではなくscope違反とする。
+- non-Gitのfile-changing taskは、編集前後の実在・byte size・SHA-256を比較してから
+  内容を受け入れ条件と照合する。実在や更新時刻だけを完了証拠にしない。
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseVerificationEvidenceContract `
+    -Description 'Japanese baseline-to-final completion decision'
+
 $englishTemplateContract = @'
 Target checkout / worktree (absolute path): <exclusive-checkout-path>
 (assigned exclusively to you)
@@ -1792,6 +3469,16 @@ Checkout ownership [MANDATORY]:
 - Do not stash, reset, delete, or absorb unassigned pre-existing WIP. Continue
   only in the exclusive checkout or isolated worktree and task branch assigned
   to you.
+
+Completion verification baseline [MANDATORY]:
+- Before editing, record the current branch, the full OID from
+  `git rev-parse --verify HEAD`, and all output from
+  `git --no-optional-locks status --porcelain=v1 --untracked-files=all`.
+- For non-Git artifacts and explicitly assigned dirty-resume artifacts, also
+  record pre-edit existence, byte size, and SHA-256. Do not read or hash
+  unassigned WIP; stop on that ownership conflict.
+- Baseline collection is read-only. Do not use `git write-tree`, `update-index`,
+  stash, reset, checkout, or another command that changes Git or file state.
 
 Deliverables and acceptance criteria [MANDATORY] (use absolute artifact
 paths):
@@ -1815,6 +3502,14 @@ checkout の所有権【必須】:
 - 未割当の既存 WIP を stash、reset、削除、自分の commit へ混入しない。割り当て
   られた排他的 checkout または隔離 worktree と task branch でのみ続行する。
 
+完了検証baseline【必須】:
+- 編集前に現在branch、`git rev-parse --verify HEAD`の完全OID、
+  `git --no-optional-locks status --porcelain=v1 --untracked-files=all`の全出力を記録する。
+- non-Git成果物と明示的に割り当て済みのdirty resume成果物では、編集前の実在、
+  byte size、SHA-256も記録する。未割当WIPは開いたりhash化したりせず、競合として停止する。
+- baseline取得はread-onlyとし、`git write-tree`、`update-index`、stash、reset、
+  checkoutなどGit stateやfileを変更するcommandを使わない。
+
 成果物と受け入れ条件【必須】（成果物も絶対パスで指定）:
 '@
 Assert-FileContainsExactContract `
@@ -1822,11 +3517,43 @@ Assert-FileContainsExactContract `
     -Expected $japaneseTemplateContract `
     -Description 'Japanese synthetic checkout ownership template'
 
+$englishTemplateCompletionContract = @'
+- Include the final branch and full HEAD OID, baseline-to-final
+  `git diff --name-status`, current porcelain with all untracked files, and
+  artifact content/state evidence. For an existing baseline HEAD, include the
+  exit result of `git merge-base --is-ancestor <baseline> <final>`; exit 0 is
+  required. A clean committed task is not a no-op merely because final
+  porcelain is empty, but divergent history is never valid completion.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateCompletionContract `
+    -Description 'English synthetic final completion evidence'
+
+$japaneseTemplateCompletionContract = @'
+- 最終branchと完全HEAD OID、baseline→finalの`git diff --name-status`、untrackedを
+  全件含む現在porcelain、成果物の内容/state証拠を含めること。baseline HEADが存在する
+  場合は`git merge-base --is-ancestor <baseline> <final>`のexit結果も含め、exit 0を
+  必須とする。commit済みでcleanなtaskを最終porcelainが空という理由だけで空振りに
+  しないが、divergent historyを完了扱いしない。
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $japaneseTemplateCompletionContract `
+    -Description 'Japanese synthetic final completion evidence'
+
 $verificationChecklistContract = @'
 ## 0. Existing WIP and writer ownership
 
-- [ ] The agent recorded its initial branch and `git status --porcelain`
-      before editing.
+- [ ] Before editing, the agent recorded its initial branch, full
+      `git rev-parse --verify HEAD` OID (or explicit unborn state), and all
+      output from
+      `git --no-optional-locks status --porcelain=v1 --untracked-files=all`.
+- [ ] For non-Git artifacts and explicitly assigned dirty-resume artifacts,
+      the pre-edit baseline includes existence, byte size, and SHA-256.
+- [ ] Baseline collection used read-only commands only. It did not use
+      `git write-tree`, `update-index`, stash, reset, checkout, or another
+      state-changing shortcut.
 - [ ] The agent was the exclusive writer for its checkout, or used an
       orchestrator-assigned isolated worktree and task branch.
 - [ ] The agent did not stash, reset, delete, or absorb unassigned
@@ -1838,6 +3565,41 @@ Assert-FileContainsExactContract `
     -RelativePath 'examples/verification-checklist.md' `
     -Expected $verificationChecklistContract `
     -Description 'orchestrator ownership verification checklist'
+
+$verificationDeltaContract = @'
+- [ ] For an existing baseline HEAD, `merge-base --is-ancestor` exited 0.
+      Matching branch names or an assigned-only diff did not substitute for
+      ancestry; rewritten or divergent history is a scope violation.
+- [ ] Every acceptance artifact was opened and checked for required content;
+      final existence, byte size, and SHA-256 were independently measured.
+- [ ] Unchanged HEAD, porcelain, and initial-to-final assigned artifact state
+      are classified as a no-op even if the artifact already existed.
+- [ ] Empty final porcelain is accepted when HEAD changed, the
+      baseline is an ancestor of final HEAD, the baseline-to-final diff contains
+      only assigned paths, and artifact content passes acceptance.
+- [ ] For an explicitly assigned dirty resume, initial and final artifact
+      states were compared; identical porcelain path text alone was not treated
+      as proof of either a no-op or a change.
+- [ ] For a non-Git file-changing task, final existence, byte size, and SHA-256
+      differ from the pre-edit baseline and content passes acceptance.
+- [ ] Any unassigned path in initial/final porcelain or the committed diff is a
+      scope violation. The agent did not alter, stage, commit, delete, or absorb
+      unassigned WIP.
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationDeltaContract `
+    -Description 'orchestrator baseline-to-final decision checklist'
+
+$verificationAncestryCommandContract = @'
+  git -C <repo> --no-optional-locks merge-base --is-ancestor <baseline> <final>
+  git -C <repo> --no-optional-locks diff --name-status <baseline>..<final> --
+  git -C <repo> --no-optional-locks status --porcelain=v1 --untracked-files=all
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationAncestryCommandContract `
+    -Description 'orchestrator read-only ancestry measurement command'
 
 $readmeSafetyContract = @'
 - Every delegated editor must be the exclusive writer for its checkout.
@@ -1851,6 +3613,31 @@ Assert-FileContainsExactContract `
     -RelativePath 'README.md' `
     -Expected $readmeSafetyContract `
     -Description 'public shared-checkout safety summary'
+
+$readmeBaselineContract = @'
+- Completion verification is baseline-aware: a pre-existing artifact with no
+  initial-to-final delta is a no-op, while a clean committed task can be
+  successful when baseline HEAD is an ancestor of final HEAD and its
+  baseline-to-final diff and artifact content match the assignment. The
+  orchestrator independently re-measures final evidence and rejects divergent
+  history and unassigned paths. Baseline capture is read-only and never uses
+  `git write-tree`. See
+  [baseline-aware completion verification](docs/completion-baseline-verification.md).
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'README.md' `
+    -Expected $readmeBaselineContract `
+    -Description 'public baseline-aware completion summary'
+
+$readmeJapaneseBaselineContract = @'
+- 編集前のbranch・完全HEAD OID・porcelain全出力・必要なartifact stateをread-onlyで
+  baseline化し、完了後のHEAD/diff/current porcelain/内容と比較する。baseline HEADが
+  存在する場合は`merge-base --is-ancestor`のexit 0を必須とする
+'@
+Assert-FileContainsExactContract `
+    -RelativePath 'README.md' `
+    -Expected $readmeJapaneseBaselineContract `
+    -Description 'Japanese public baseline-aware completion summary'
 
 $readmeJapaneseContract = @'
 - 委譲プロンプトの必須文言（再委譲禁止・排他的 checkout または隔離 worktree の
@@ -1884,6 +3671,30 @@ Assert-FileContractMutationRejected `
     -Replacement 'A resumed agent must abandon its own' `
     -Description 'canonical assigned-WIP resume exception reversed'
 Assert-FileContractMutationRejected `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillBaselineClause `
+    -Needle 'Use read-only Git commands only; never use `git write-tree`' `
+    -Replacement 'Use state-changing Git commands such as `git write-tree`' `
+    -Description 'canonical read-only baseline reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillFinalMeasurementContract `
+    -Needle 'independently re-measures' `
+    -Replacement 'trusts the agent to measure' `
+    -Description 'canonical independent final measurement reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillFinalMeasurementContract `
+    -Needle 'must exit 0' `
+    -Replacement 'may exit 1' `
+    -Description 'canonical ancestry requirement reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'SKILL.md' `
+    -Expected $skillVerificationEvidenceContract `
+    -Needle 'is a no-op even when the artifact already exists' `
+    -Replacement 'is complete when the artifact already exists' `
+    -Description 'canonical pre-existing artifact no-op reversed'
+Assert-FileContractMutationRejected `
     -RelativePath 'docs/SKILL.ja.md' `
     -Expected $japaneseAbsolutePathsContract `
     -Needle '成果物の絶対パス' `
@@ -1901,6 +3712,30 @@ Assert-FileContractMutationRejected `
     -Needle '継続できる。' `
     -Replacement '継続できない。' `
     -Description 'Japanese assigned-WIP resume exception reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseBaselineClause `
+    -Needle 'read-only Git commandだけを使い' `
+    -Replacement 'state-changing Git commandを使い' `
+    -Description 'Japanese read-only baseline reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseFinalMeasurementContract `
+    -Needle '独立して' `
+    -Replacement '委譲先を信頼して' `
+    -Description 'Japanese independent final measurement reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseFinalMeasurementContract `
+    -Needle 'exit 0を必須とし' `
+    -Replacement 'exit 1も許容し' `
+    -Description 'Japanese ancestry requirement reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'docs/SKILL.ja.md' `
+    -Expected $japaneseVerificationEvidenceContract `
+    -Needle '既に存在しても空振り。' `
+    -Replacement '既に存在すれば成功。' `
+    -Description 'Japanese pre-existing artifact no-op reversed'
 Assert-FileContractMutationRejected `
     -RelativePath 'examples/delegation-prompt-template.md' `
     -Expected $englishTemplateContract `
@@ -1927,6 +3762,24 @@ Assert-FileContractMutationRejected `
     -Description 'English template absolute artifact path weakened'
 Assert-FileContractMutationRejected `
     -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateContract `
+    -Needle 'Do not use `git write-tree`' `
+    -Replacement 'Use `git write-tree`' `
+    -Description 'English template read-only baseline reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateCompletionContract `
+    -Needle 'is not a no-op merely' `
+    -Replacement 'is always a no-op' `
+    -Description 'English template clean commit result reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $englishTemplateCompletionContract `
+    -Needle 'exit 0 is required' `
+    -Replacement 'exit 1 is accepted' `
+    -Description 'English template ancestry requirement reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
     -Expected $japaneseTemplateContract `
     -Needle '排他的 writer' `
     -Replacement '共有 writer' `
@@ -1938,10 +3791,28 @@ Assert-FileContractMutationRejected `
     -Replacement '編集、commit、push、merge を続ける。' `
     -Description 'Japanese template conflict stop reversed'
 Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $japaneseTemplateContract `
+    -Needle 'baseline取得はread-onlyとし' `
+    -Replacement 'baseline取得はstate-changingとし' `
+    -Description 'Japanese template read-only baseline reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $japaneseTemplateCompletionContract `
+    -Needle '空振りに しないが' `
+    -Replacement '必ず空振りにする。' `
+    -Description 'Japanese template clean commit result reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/delegation-prompt-template.md' `
+    -Expected $japaneseTemplateCompletionContract `
+    -Needle 'exit 0を 必須とする。' `
+    -Replacement 'exit 1も許容する。' `
+    -Description 'Japanese template ancestry requirement reversed'
+Assert-FileContractMutationRejected `
     -RelativePath 'examples/verification-checklist.md' `
     -Expected $verificationChecklistContract `
-    -Needle 'The agent recorded its initial branch and' `
-    -Replacement 'The agent skipped its initial branch and' `
+    -Needle 'Before editing, the agent recorded its initial branch' `
+    -Replacement 'Before editing, the agent skipped its initial branch' `
     -Description 'initial branch and status evidence removed'
 Assert-FileContractMutationRejected `
     -RelativePath 'examples/verification-checklist.md' `
@@ -1949,6 +3820,36 @@ Assert-FileContractMutationRejected `
     -Needle 'stopped without editing, committing, pushing, or merging.' `
     -Replacement 'continued while editing, committing, pushing, and merging.' `
     -Description 'checklist conflict stop reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationChecklistContract `
+    -Needle 'Baseline collection used read-only commands only.' `
+    -Replacement 'Baseline collection used state-changing commands.' `
+    -Description 'checklist read-only baseline reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationAncestryCommandContract `
+    -Needle 'merge-base --is-ancestor' `
+    -Replacement 'merge-base' `
+    -Description 'checklist ancestry command weakened'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationDeltaContract `
+    -Needle '`merge-base --is-ancestor` exited 0.' `
+    -Replacement '`merge-base --is-ancestor` may exit 1.' `
+    -Description 'checklist ancestry requirement reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationDeltaContract `
+    -Needle 'are classified as a no-op' `
+    -Replacement 'are classified as complete' `
+    -Description 'checklist pre-existing artifact no-op reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'examples/verification-checklist.md' `
+    -Expected $verificationDeltaContract `
+    -Needle 'Empty final porcelain is accepted' `
+    -Replacement 'Empty final porcelain is rejected' `
+    -Description 'checklist clean commit result reversed'
 Assert-FileContractMutationRejected `
     -RelativePath 'README.md' `
     -Expected $readmeSafetyContract `
@@ -1961,6 +3862,36 @@ Assert-FileContractMutationRejected `
     -Needle 'A resumed agent may continue' `
     -Replacement 'A resumed agent must discard' `
     -Description 'public assigned-WIP resume exception reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'README.md' `
+    -Expected $readmeBaselineContract `
+    -Needle 'baseline HEAD is an ancestor of final HEAD' `
+    -Replacement 'the branch name matches at final HEAD' `
+    -Description 'public ancestry requirement reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'README.md' `
+    -Expected $readmeBaselineContract `
+    -Needle 'is a no-op' `
+    -Replacement 'is complete' `
+    -Description 'public pre-existing artifact no-op reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'README.md' `
+    -Expected $readmeBaselineContract `
+    -Needle 'never uses `git write-tree`' `
+    -Replacement 'always uses `git write-tree`' `
+    -Description 'public read-only baseline reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'README.md' `
+    -Expected $readmeJapaneseBaselineContract `
+    -Needle 'artifact stateをread-onlyで' `
+    -Replacement 'artifact stateをstate-changingで' `
+    -Description 'Japanese public read-only baseline reversed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'README.md' `
+    -Expected $readmeJapaneseBaselineContract `
+    -Needle 'exit 0を必須とする' `
+    -Replacement 'exit 1も許容する' `
+    -Description 'Japanese public ancestry requirement reversed'
 Assert-FileContractMutationRejected `
     -RelativePath 'README.md' `
     -Expected $readmeJapaneseContract `

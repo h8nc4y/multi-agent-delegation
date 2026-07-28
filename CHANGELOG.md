@@ -8,6 +8,20 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Made completion verification baseline-aware. Delegation prompts now record
+  the pre-edit branch, full HEAD OID, full porcelain output, and required
+  artifact state with read-only commands. Orchestrators independently compare
+  final HEAD/diff/current porcelain/content, so unchanged pre-existing
+  artifacts remain no-ops, clean commits count as completed work, assigned
+  dirty resumes use initial-to-final evidence, and unassigned WIP cannot be
+  absorbed. PowerShell 7 and Windows PowerShell 5.1 readiness run synthetic Git
+  semantic fixtures for these decisions. Fixture Git now uses the existing
+  byte-bounded process-tree runner with a fixed minimal environment, empty
+  config/hook/attribute inputs, and hostile redirect/filter sentinels. Initial
+  porcelain, final porcelain, and committed-diff scope rejection are exercised
+  in separate repositories. A bounded `merge-base --is-ancestor` measurement
+  and divergent same-branch history fixture prevent reset/rewrite from being
+  accepted as forward completion.
 - Added a mandatory pre-edit checkout-ownership gate to the canonical skill,
   Japanese translation, synthetic delegation template, and completion
   checklist. A delegated writer now fails closed on unassigned existing WIP,
