@@ -417,7 +417,9 @@ Because GitHub-hosted macOS does not provide either trusted `setsid` path, a
 separate macOS 15 job proves that the process runner rejects a synthetic
 target before launch and that the public scanner returns fixed redacted
 stdout, empty stderr, and exit code 2. It does not claim full scanner support
-on macOS.
+on macOS. OSS readiness still runs the process-independent baseline completion
+decision fixtures there, but capability-gates the process-backed synthetic Git
+fixtures and does not report them as executed.
 Each job has a 25-minute timeout.
 
 ## Contributing

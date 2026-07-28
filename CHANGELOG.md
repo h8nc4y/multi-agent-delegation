@@ -14,14 +14,17 @@ The format loosely follows Keep a Changelog conventions.
   final HEAD/diff/current porcelain/content, so unchanged pre-existing
   artifacts remain no-ops, clean commits count as completed work, assigned
   dirty resumes use initial-to-final evidence, and unassigned WIP cannot be
-  absorbed. PowerShell 7 and Windows PowerShell 5.1 readiness run synthetic Git
-  semantic fixtures for these decisions. Fixture Git now uses the existing
-  byte-bounded process-tree runner with a fixed minimal environment, empty
-  config/hook/attribute inputs, and hostile redirect/filter sentinels. Initial
-  porcelain, final porcelain, and committed-diff scope rejection are exercised
-  in separate repositories. A bounded `merge-base --is-ancestor` measurement
-  and divergent same-branch history fixture prevent reset/rewrite from being
-  accepted as forward completion.
+  absorbed. Pure decision fixtures run on every readiness host. Process-backed
+  synthetic Git fixtures run only where the production runner can close the
+  process tree through a Windows job object or a fixed trusted `setsid`; an
+  unsupported macOS host is not reported as having executed those fixtures.
+  Fixture Git uses the existing byte-bounded process-tree runner with a fixed
+  minimal environment, empty config/hook/attribute inputs, and hostile
+  redirect/filter sentinels. Initial porcelain, final porcelain, and
+  committed-diff scope rejection are exercised in separate repositories. A
+  bounded `merge-base --is-ancestor` measurement and divergent same-branch
+  history fixture prevent reset/rewrite from being accepted as forward
+  completion.
 - Added a mandatory pre-edit checkout-ownership gate to the canonical skill,
   Japanese translation, synthetic delegation template, and completion
   checklist. A delegated writer now fails closed on unassigned existing WIP,

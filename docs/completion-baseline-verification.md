@@ -74,6 +74,12 @@ porcelainに出ることがある。したがって、完了後の状態だけ�
   global/system configおよび`GIT_CONFIG_COUNT`経由のexternal clean filterを別
   PowerShell childへ注入する。fixed minimal environmentとbyte-bounded process-tree
   runnerを通るfixture Gitが外部index/object sentinelを変更しないことを検査する。
+- **host capability**: no-op、acceptance、commit / artifact delta、initial / final /
+  committed scope、ancestryのpure decision fixtureは全hostで常時実行する。
+  process-backed Git fixtureはWindows job objectまたはproduction sourceが返すfixed
+  trusted `setsid`の実在を確認できるhostだけで実行する。trusted `setsid`のない
+  macOSではこのfixtureを実行済みとせず、専用CI stepでunsupported fail-closed境界を
+  検証する。sourceのexact contractとin-memory mutationでgate消失とalways-skipを拒否する。
 - **ancestry**: H0からassigned C1を作った後、同名branchをH0の親へrewindし、
   assigned-only divergent C2をcommitする。branch名同一、final clean、acceptance true、
   diff path assigned-onlyでも`merge-base --is-ancestor H0 C2`がexit 1なら拒否し、
@@ -86,15 +92,21 @@ porcelainに出ることがある。したがって、完了後の状態だけ�
 ## Handoff
 
 - **状態**: docs-first要件、legacy 2判定のRED、baseline-aware semantic fixtureの
-  GREEN、英日契約同期を実装済み。P1/P2 review修正後のPowerShell 7 / Windows
-  PowerShell 5.1 readinessとrepository scanは通過した。full scanner self-test、
-  再review、PR、mergeは未実施。
+  GREEN、英日契約同期を実装済み。PowerShell 7 / Windows PowerShell 5.1の
+  readiness、repository scan、full scanner self-testは通過した。初回PR #12の
+  macOS readinessでprocess fixtureが`trusted-setsid-missing`へ到達するhost capability
+  不整合を検出し、pure fixtureの全host実行とprocess fixtureだけのcapability gateへ
+  分離した。修正版のPowerShell 7 / Windows PowerShell 5.1 readinessとrepository
+  scan、Gitleaks、`git diff --check`は通過した。修正版のfull scanner self-test、
+  再review、hosted CI、mergeは未実施。
 - **実装境界**: synthetic Git fixtureはH0 no-op、clean H0→C1 commit、acceptance failure、
   assigned dirty resume、未割当pathのinitial/final/committed 3経路を独立検査する。
   Git childは既存のbyte-bounded runner、full executable path、fixed minimal environment、
   empty config/hook/attribute inputsで隔離し、別processのhostile環境negativeで確認する。
   bounded ancestry測定とdivergent history negativeも実装する。
   Git repository外のsibling fixtureはnon-Git成果物の実在・size・SHA-256差分を検査する。
+  macOSではprocess-backed fixtureを実行せず、pure decision fixtureと既存の
+  unsupported fail-closed CI stepを別証拠として扱う。
 - **外部境界**: fixtureは合成一時repositoryと公開可能な固定文字列だけを使う。
   実credential、API、OAuth、secret、実データ、外部送信、production、deploy、費用は
   使用しない。

@@ -706,6 +706,242 @@ function Test-NonGitArtifactCompletionDecision {
     return Test-SyntheticArtifactChanged -Initial $Initial -Final $Final
 }
 
+function New-SyntheticPureDecisionSnapshot {
+    param(
+        [string]$Branch,
+        [string]$Head,
+        [string[]]$Porcelain,
+        [long]$ArtifactLength,
+        [string]$ArtifactSha256
+    )
+
+    # Git processを起動できないhostでもcompletion decision自体を常時検査する。
+    # 固定snapshotだけを組み立て、filesystemやambient Git状態へ依存させない。
+    $artifacts = @{}
+    $artifacts['evidence.txt'] = [pscustomobject]@{
+        Exists = $true
+        Length = $ArtifactLength
+        Sha256 = $ArtifactSha256
+    }
+    return [pscustomobject]@{
+        Branch = $Branch
+        Head = $Head
+        Porcelain = @($Porcelain)
+        Artifacts = $artifacts
+    }
+}
+
+function Assert-BaselineAwareCompletionPureDecisionFixtures {
+    $initial = New-SyntheticPureDecisionSnapshot `
+        -Branch 'main' `
+        -Head ('1' * 40) `
+        -Porcelain @() `
+        -ArtifactLength 4 `
+        -ArtifactSha256 ('a' * 64)
+    $unchangedFinal = New-SyntheticPureDecisionSnapshot `
+        -Branch 'main' `
+        -Head ('1' * 40) `
+        -Porcelain @() `
+        -ArtifactLength 4 `
+        -ArtifactSha256 ('a' * 64)
+    $committedFinal = New-SyntheticPureDecisionSnapshot `
+        -Branch 'main' `
+        -Head ('2' * 40) `
+        -Porcelain @() `
+        -ArtifactLength 8 `
+        -ArtifactSha256 ('b' * 64)
+    $dirtyInitial = New-SyntheticPureDecisionSnapshot `
+        -Branch 'main' `
+        -Head ('1' * 40) `
+        -Porcelain @(' M evidence.txt') `
+        -ArtifactLength 4 `
+        -ArtifactSha256 ('a' * 64)
+    $dirtyFinal = New-SyntheticPureDecisionSnapshot `
+        -Branch 'main' `
+        -Head ('1' * 40) `
+        -Porcelain @(' M evidence.txt') `
+        -ArtifactLength 8 `
+        -ArtifactSha256 ('b' * 64)
+
+    # no-op、acceptance、commit delta、dirty artifact deltaをprocess非依存で固定する。
+    if (
+        Test-BaselineAwareCompletionDecision `
+            -Initial $initial `
+            -Final $unchangedFinal `
+            -CommittedPaths @() `
+            -AssignedPaths @('evidence.txt') `
+            -BaselineIsAncestor $true `
+            -AcceptanceSatisfied $true
+    ) {
+        Add-Failure 'pure completion decision accepts no-op'
+    }
+    if (
+        Test-BaselineAwareCompletionDecision `
+            -Initial $initial `
+            -Final $committedFinal `
+            -CommittedPaths @('evidence.txt') `
+            -AssignedPaths @('evidence.txt') `
+            -BaselineIsAncestor $true `
+            -AcceptanceSatisfied $false
+    ) {
+        Add-Failure 'pure completion decision accepts failed acceptance'
+    }
+    if (
+        -not (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $initial `
+                -Final $committedFinal `
+                -CommittedPaths @('evidence.txt') `
+                -AssignedPaths @('evidence.txt') `
+                -BaselineIsAncestor $true `
+                -AcceptanceSatisfied $true
+        )
+    ) {
+        Add-Failure 'pure completion decision rejects committed delta'
+    }
+    if (
+        -not (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $dirtyInitial `
+                -Final $dirtyFinal `
+                -CommittedPaths @() `
+                -AssignedPaths @('evidence.txt') `
+                -BaselineIsAncestor $true `
+                -AcceptanceSatisfied $true
+        )
+    ) {
+        Add-Failure 'pure completion decision rejects artifact delta'
+    }
+
+    # initial、final、committedの3つのscope guardを独立してfail-closedへ固定する。
+    $initialScopeViolation = New-SyntheticPureDecisionSnapshot `
+        -Branch 'main' `
+        -Head ('1' * 40) `
+        -Porcelain @('?? owner-wip.txt') `
+        -ArtifactLength 4 `
+        -ArtifactSha256 ('a' * 64)
+    $finalScopeViolation = New-SyntheticPureDecisionSnapshot `
+        -Branch 'main' `
+        -Head ('2' * 40) `
+        -Porcelain @('?? owner-wip.txt') `
+        -ArtifactLength 8 `
+        -ArtifactSha256 ('b' * 64)
+    foreach ($scopeCase in @(
+        [pscustomobject]@{
+            Name = 'initial'
+            Initial = $initialScopeViolation
+            Final = $committedFinal
+            CommittedPaths = @('evidence.txt')
+        },
+        [pscustomobject]@{
+            Name = 'final'
+            Initial = $initial
+            Final = $finalScopeViolation
+            CommittedPaths = @('evidence.txt')
+        },
+        [pscustomobject]@{
+            Name = 'committed'
+            Initial = $initial
+            Final = $committedFinal
+            CommittedPaths = @('evidence.txt', 'owner-wip.txt')
+        }
+    )) {
+        if (
+            Test-BaselineAwareCompletionDecision `
+                -Initial $scopeCase.Initial `
+                -Final $scopeCase.Final `
+                -CommittedPaths @($scopeCase.CommittedPaths) `
+                -AssignedPaths @('evidence.txt') `
+                -BaselineIsAncestor $true `
+                -AcceptanceSatisfied $true
+        ) {
+            Add-Failure (
+                'pure completion decision accepts ' +
+                $scopeCase.Name +
+                ' scope violation'
+            )
+        }
+    }
+
+    # 他の成功条件が揃っていてもancestry evidence=falseなら必ず拒否する。
+    if (
+        Test-BaselineAwareCompletionDecision `
+            -Initial $initial `
+            -Final $committedFinal `
+            -CommittedPaths @('evidence.txt') `
+            -AssignedPaths @('evidence.txt') `
+            -BaselineIsAncestor $false `
+            -AcceptanceSatisfied $true
+    ) {
+        Add-Failure 'pure completion decision accepts divergent ancestry'
+    }
+}
+
+function Test-SyntheticGitProcessFixtureCapabilityDecision {
+    param(
+        [bool]$IsWindowsHost,
+        [bool]$HasTrustedSetsid
+    )
+
+    # production runnerと同じく、Windows job objectまたはfixed trusted setsidの
+    # どちらかでprocess treeを閉じられるhostだけを実行可能とする。
+    return ($IsWindowsHost -or $HasTrustedSetsid)
+}
+
+function Assert-SyntheticGitProcessFixtureCapabilityDecisions {
+    foreach ($capabilityCase in @(
+        [pscustomobject]@{
+            Name = 'windows-job-object'
+            IsWindowsHost = $true
+            HasTrustedSetsid = $false
+            Expected = $true
+        },
+        [pscustomobject]@{
+            Name = 'unix-trusted-setsid'
+            IsWindowsHost = $false
+            HasTrustedSetsid = $true
+            Expected = $true
+        },
+        [pscustomobject]@{
+            Name = 'unsupported-unix'
+            IsWindowsHost = $false
+            HasTrustedSetsid = $false
+            Expected = $false
+        }
+    )) {
+        $actual = Test-SyntheticGitProcessFixtureCapabilityDecision `
+            -IsWindowsHost $capabilityCase.IsWindowsHost `
+            -HasTrustedSetsid $capabilityCase.HasTrustedSetsid
+        if ($actual -ne $capabilityCase.Expected) {
+            Add-Failure (
+                'synthetic Git process capability decision failed: ' +
+                $capabilityCase.Name
+            )
+        }
+    }
+}
+
+function Test-SyntheticGitProcessFixtureSupported {
+    $isWindowsHost = (
+        [Environment]::OSVersion.Platform -eq
+            [System.PlatformID]::Win32NT
+    )
+    $hasTrustedSetsid = $false
+    if (-not $isWindowsHost) {
+        # resolverはproduction sourceのfixed pathだけを返す。readiness側でも
+        # rooted existing fileを再確認し、任意PATHやambient commandへfallbackしない。
+        $trustedSetsidPath = [string](Get-PrivateMarkerTrustedSetsidPath)
+        $hasTrustedSetsid = (
+            -not [string]::IsNullOrWhiteSpace($trustedSetsidPath) -and
+            [System.IO.Path]::IsPathRooted($trustedSetsidPath) -and
+            [System.IO.File]::Exists($trustedSetsidPath)
+        )
+    }
+    return Test-SyntheticGitProcessFixtureCapabilityDecision `
+        -IsWindowsHost $isWindowsHost `
+        -HasTrustedSetsid $hasTrustedSetsid
+}
+
 function Test-SyntheticByteArrayEqual {
     param(
         [byte[]]$Left,
@@ -3246,7 +3482,11 @@ foreach ($requiredFile in $requiredFiles) {
     Assert-FileExists -RelativePath $requiredFile
 }
 
-Assert-BaselineAwareCompletionSemanticFixtures
+Assert-BaselineAwareCompletionPureDecisionFixtures
+Assert-SyntheticGitProcessFixtureCapabilityDecisions
+if (Test-SyntheticGitProcessFixtureSupported) {
+    Assert-BaselineAwareCompletionSemanticFixtures
+}
 
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Install' -Description 'installation instructions'
 Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Validation' -Description 'validation instructions'
@@ -3898,6 +4138,33 @@ Assert-FileContractMutationRejected `
     -Needle '排他的 checkout または隔離 worktree の' `
     -Replacement '排他的 worktree の' `
     -Description 'Japanese summary over-restricted to worktree'
+$syntheticProcessFixtureGateContract = @(
+    'Assert-BaselineAwareCompletionPureDecisionFixtures',
+    'Assert-SyntheticGitProcessFixtureCapabilityDecisions',
+    'if (Test-SyntheticGitProcessFixtureSupported) {',
+    '    Assert-BaselineAwareCompletionSemanticFixtures',
+    '}'
+) -join "`n"
+Assert-FileContainsExactContract `
+    -RelativePath 'scripts/validate-oss-readiness.ps1' `
+    -Expected $syntheticProcessFixtureGateContract `
+    -Description 'pure completion fixtures and capability-gated process fixture'
+Assert-FileContractMutationRejected `
+    -RelativePath 'scripts/validate-oss-readiness.ps1' `
+    -Expected $syntheticProcessFixtureGateContract `
+    -Needle 'if (Test-SyntheticGitProcessFixtureSupported) {' `
+    -Replacement 'if ($true) {' `
+    -Description 'synthetic process fixture capability gate removed'
+Assert-FileContractMutationRejected `
+    -RelativePath 'scripts/validate-oss-readiness.ps1' `
+    -Expected $syntheticProcessFixtureGateContract `
+    -Needle 'if (Test-SyntheticGitProcessFixtureSupported) {' `
+    -Replacement 'if ($false) {' `
+    -Description 'synthetic process fixture forced to always skip'
+Assert-FileContains `
+    -RelativePath 'scripts/validate-oss-readiness.ps1' `
+    -Pattern '(?s)function\s+Test-SyntheticGitProcessFixtureSupported.*?\[System\.PlatformID\]::Win32NT.*?Get-PrivateMarkerTrustedSetsidPath.*?\[System\.IO\.Path\]::IsPathRooted.*?\[System\.IO\.File\]::Exists.*?Test-SyntheticGitProcessFixtureCapabilityDecision' `
+    -Description 'production-aligned Windows or fixed trusted setsid capability'
 Assert-FileContains -RelativePath '.gitignore' -Pattern '\.private-markers\.local' -Description 'ignore local private marker files'
 Assert-FileContains -RelativePath 'CONTRIBUTING.md' -Pattern '(?im)no token|never.*token|secret' -Description 'secret-safe contribution guidance'
 Assert-FileContains -RelativePath 'SECURITY.md' -Pattern '(?im)do not.*public|private|security' -Description 'private vulnerability reporting guidance'
