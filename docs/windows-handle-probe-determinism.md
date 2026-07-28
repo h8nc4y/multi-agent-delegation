@@ -70,7 +70,8 @@ calibration後にも同じ5-handle plateauが発生し得ることが分かっ�
   probe、validator、self-test evidence、公開文書へ4-window契約を実装した。
   PowerShell 7とWindows PowerShell 5.1のreadiness、専用handle probe、full
   self-testはすべてexit 0。再reviewはP0 / P1 / P2 / P3各0、clearance YES。
-  hosted CIとmergeは未実施。
+  PR head run `30349730514`はWindows、Ubuntu、macOSの3 jobsが成功し、PR #12を
+  merge commit `93c38924a676ef648ae373964df781033d93d4c7`で`main`へ統合した。
 - **独立review P1**：最初の4-window実装は`+5 / +0`だけでなく`+100 / +0`も
   通すため、single-window plateauが無制限だった。persistent limit 4に加え、
   startupと同じabsolute limit 16を各steady windowへ適用した。修正前に
@@ -81,6 +82,10 @@ calibration後にも同じ5-handle plateauが発生し得ることが分かっ�
   PowerShell 7が231.581秒、Windows PowerShell 5.1が197.387秒で、4本とも
   初回実行、exit 0、stderrなしだった。各full markerはhost名を含めてexact一致し、
   各終了後のscanner / handle-probe PIDは0、reviewed source freezeは不変だった。
+- **post-main**：merge SHAを対象にしたrun `30350234181`はWindows、Ubuntu、macOSの
+  3 jobsが成功した。local `main`でもPowerShell 7 / Windows PowerShell 5.1の
+  readinessがexit 0で、`HEAD == main == origin/main`、tracked tree clean、
+  task branchのlocal / remote削除を確認した。
 - **前回PR #10状態**：GREEN実装、final full regression、security / hygiene、独立review、PR CI、mergeを完了した。
   PR #10をmerge commit `7791a20`で`main`へ統合済み。
 - **RED**：calibration 40回を必須化するvalidatorをproduction変更前に実行し、現行probeの不足だけをexit 1で確認した。
