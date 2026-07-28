@@ -97,8 +97,9 @@ porcelainに出ることがある。したがって、完了後の状態だけ�
   macOS readinessでprocess fixtureが`trusted-setsid-missing`へ到達するhost capability
   不整合を検出し、pure fixtureの全host実行とprocess fixtureだけのcapability gateへ
   分離した。修正版のPowerShell 7 / Windows PowerShell 5.1 readinessとrepository
-  scan、Gitleaks、`git diff --check`は通過した。修正版のfull scanner self-test、
-  再review、hosted CI、mergeは未実施。
+  scan、Gitleaks、`git diff --check`は通過した。修正版はPR #12でWindows、Ubuntu、
+  macOSのhosted CIを通過し、merge commit `93c3892`としてmainへ統合済み。
+  再確認時点のmain `f23dbb2`でも3ジョブはすべて通過した。
 - **実装境界**: synthetic Git fixtureはH0 no-op、clean H0→C1 commit、acceptance failure、
   assigned dirty resume、未割当pathのinitial/final/committed 3経路を独立検査する。
   Git childは既存のbyte-bounded runner、full executable path、fixed minimal environment、
