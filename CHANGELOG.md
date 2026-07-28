@@ -114,18 +114,23 @@ The format loosely follows Keep a Changelog conventions.
   dedicated script in a fresh instance of the same PowerShell executable,
   after the main self-test has proved raw transport. It measures an
   80-invocation startup window, a 40-invocation runtime calibration window, and
-  a separate 40-run steady-state window. Each window uses the same bounded
-  10-by-50 ms no-GC quiescence sample. The startup limit remains 16 through
-  calibration, and the steady-state final limit remains 4. Window maxima remain
-  evidence, while only growth that survives quiescence is classified as a
-  leak. This separates delayed one-time Windows PowerShell runtime
-  initialization from sustained growth without weakening the runner's
-  individual native-handle close checks. The POSIX 40-run no-GC
-  file-descriptor regression remains unchanged.
+  consecutive 40-run measured and confirmation windows. The confirmation
+  window always runs once rather than acting as a conditional retry. Each
+  window uses the same bounded 10-by-50 ms no-GC quiescence sample. The startup
+  limit remains 16 through calibration and caps either single steady-window
+  plateau. Within that absolute bound, the persistent threshold remains 4:
+  growth above 4 in both consecutive windows is classified as a persistent
+  leak. A one-window plateau of at most 16 and all maxima remain evidence. This
+  separates
+  delayed one-time Windows PowerShell runtime initialization from sustained
+  growth without weakening immediate child failure or the runner's individual
+  native-handle close checks. The POSIX 40-run no-GC file-descriptor regression
+  remains unchanged.
 - Seal the dedicated Windows handle probe's canonical UTF-8 source with
   SHA-256, while retaining a separate AST contract and parse-valid negative
   fixtures for zero-run loops, runtime limit mutation, control-flow arguments,
-  provider command shadowing, and conditional loop bodies.
+  provider command shadowing, and conditional loop bodies across all four
+  execution windows and their quiescence windows.
   Exported runner numeric
   arguments, including fractional and overflow inputs, are body-validated into
   a fixed `process-limit-invalid` exception instead of coercion or

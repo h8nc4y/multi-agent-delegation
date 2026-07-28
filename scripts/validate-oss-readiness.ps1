@@ -2242,7 +2242,9 @@ function Test-WindowsHandleCalibratedWindowsWithinLimits {
         [int]$CalibrationObservedFinal,
         [int[]]$CalibrationQuiescenceSamples,
         [int]$MeasuredObservedFinal,
-        [int[]]$MeasuredQuiescenceSamples
+        [int[]]$MeasuredQuiescenceSamples,
+        [int]$ConfirmationObservedFinal,
+        [int[]]$ConfirmationQuiescenceSamples
     )
 
     # 各windowの一時peakではなく、同じbounded quiescenceで残った最小値を
@@ -2250,7 +2252,8 @@ function Test-WindowsHandleCalibratedWindowsWithinLimits {
     if (
         $WarmupQuiescenceSamples.Count -ne 10 -or
         $CalibrationQuiescenceSamples.Count -ne 10 -or
-        $MeasuredQuiescenceSamples.Count -ne 10
+        $MeasuredQuiescenceSamples.Count -ne 10 -or
+        $ConfirmationQuiescenceSamples.Count -ne 10
     ) {
         return $false
     }
@@ -2269,13 +2272,25 @@ function Test-WindowsHandleCalibratedWindowsWithinLimits {
     foreach ($sample in $MeasuredQuiescenceSamples) {
         $measuredSettled = [Math]::Min($measuredSettled, $sample)
     }
+    $confirmationSettled = $ConfirmationObservedFinal
+    foreach ($sample in $ConfirmationQuiescenceSamples) {
+        $confirmationSettled = [Math]::Min(
+            $confirmationSettled,
+            $sample
+        )
+    }
 
-    # startup limit 16とsteady limit 4は変更しない。calibration後もstartupの
-    # 累積増加を再確認し、最初の40回だけで持続する有限leakも見逃さない。
+    # startup limit 16を単独steady windowのabsolute capにも使う。その内側では
+    # limit 4を両windowが超えた場合だけ継続増加として拒否する。
     return (
         ($warmupSettled - $StartupBaseline) -le 16 -and
         ($calibrationSettled - $StartupBaseline) -le 16 -and
-        ($measuredSettled - $calibrationSettled) -le 4
+        ($measuredSettled - $calibrationSettled) -le 16 -and
+        ($confirmationSettled - $measuredSettled) -le 16 -and
+        -not (
+            ($measuredSettled - $calibrationSettled) -gt 4 -and
+            ($confirmationSettled - $measuredSettled) -gt 4
+        )
     )
 }
 
@@ -2286,7 +2301,7 @@ function Test-WindowsHandleProbeAstContract {
     )
 
     # loop headerだけの正規表現では、runner呼出しをbody外へ移動または削除した
-    # no-op実装を見抜けない。ASTで3つの実行windowと各quiescenceを特定し、
+    # no-op実装を見抜けない。ASTで4つの実行windowと各quiescenceを特定し、
     # 必要な処理を直下statementとして所有することを検査する。
     $tokens = $null
     $parseErrors = $null
@@ -2378,14 +2393,34 @@ function Test-WindowsHandleProbeAstContract {
                 )
             }
     )
+    $confirmationLoops = @(
+        $forStatements |
+            Where-Object {
+                $_.Condition.Extent.Text -match (
+                    '^\s*\$handleConfirmationAttempt\s*-lt\s*' +
+                    '\$handleConfirmationRuns\s*$'
+                )
+            }
+    )
+    $confirmationQuiescenceLoops = @(
+        $forStatements |
+            Where-Object {
+                $_.Condition.Extent.Text -match (
+                    '^\s*\$handleConfirmationQuiescenceAttempt\s*-lt\s*' +
+                    '\$handleQuiescenceSamples\s*$'
+                )
+            }
+    )
     if (
-        $forStatements.Count -ne 6 -or
+        $forStatements.Count -ne 8 -or
         $warmupLoops.Count -ne 1 -or
         $warmupQuiescenceLoops.Count -ne 1 -or
         $calibrationLoops.Count -ne 1 -or
         $calibrationQuiescenceLoops.Count -ne 1 -or
         $measuredLoops.Count -ne 1 -or
-        $measuredQuiescenceLoops.Count -ne 1
+        $measuredQuiescenceLoops.Count -ne 1 -or
+        $confirmationLoops.Count -ne 1 -or
+        $confirmationQuiescenceLoops.Count -ne 1
     ) {
         return $false
     }
@@ -2396,6 +2431,8 @@ function Test-WindowsHandleProbeAstContract {
     $calibrationQuiescenceLoop = $calibrationQuiescenceLoops[0]
     $measuredLoop = $measuredLoops[0]
     $measuredQuiescenceLoop = $measuredQuiescenceLoops[0]
+    $confirmationLoop = $confirmationLoops[0]
+    $confirmationQuiescenceLoop = $confirmationQuiescenceLoops[0]
     if (
         $warmupLoop.Extent.StartOffset -ge
             $warmupQuiescenceLoop.Extent.StartOffset -or
@@ -2406,7 +2443,11 @@ function Test-WindowsHandleProbeAstContract {
         $calibrationQuiescenceLoop.Extent.StartOffset -ge
             $measuredLoop.Extent.StartOffset -or
         $measuredLoop.Extent.StartOffset -ge
-            $measuredQuiescenceLoop.Extent.StartOffset
+            $measuredQuiescenceLoop.Extent.StartOffset -or
+        $measuredQuiescenceLoop.Extent.StartOffset -ge
+            $confirmationLoop.Extent.StartOffset -or
+        $confirmationLoop.Extent.StartOffset -ge
+            $confirmationQuiescenceLoop.Extent.StartOffset
     ) {
         return $false
     }
@@ -2431,6 +2472,14 @@ function Test-WindowsHandleProbeAstContract {
             $warmupLoop.Parent,
             $measuredQuiescenceLoop.Parent
         ) -or
+        -not [object]::ReferenceEquals(
+            $warmupLoop.Parent,
+            $confirmationLoop.Parent
+        ) -or
+        -not [object]::ReferenceEquals(
+            $warmupLoop.Parent,
+            $confirmationQuiescenceLoop.Parent
+        ) -or
         $warmupLoop.Parent -isnot
             [System.Management.Automation.Language.StatementBlockAst] -or
         $warmupLoop.Parent.Parent -isnot
@@ -2445,6 +2494,7 @@ function Test-WindowsHandleProbeAstContract {
         [pscustomobject]@{ Name = 'handleWarmupRuns'; Value = 80 },
         [pscustomobject]@{ Name = 'handleCalibrationRuns'; Value = 40 },
         [pscustomobject]@{ Name = 'handleMeasuredRuns'; Value = 40 },
+        [pscustomobject]@{ Name = 'handleConfirmationRuns'; Value = 40 },
         [pscustomobject]@{ Name = 'handleStartupGrowthLimit'; Value = 16 },
         [pscustomobject]@{
             Name = 'handleMeasuredFinalGrowthLimit'
@@ -2562,18 +2612,38 @@ function Test-WindowsHandleProbeAstContract {
                 -CounterName 'handleMeasuredQuiescenceAttempt' `
                 -SampleName 'handleMeasuredQuiescenceSample' `
                 -SettledName 'handleSettledFinal'
+        ) -or
+        -not (
+            Test-WindowsHandleProbeLoopContract `
+                -Loop $confirmationLoop `
+                -CounterName 'handleConfirmationAttempt' `
+                -LimitName 'handleConfirmationRuns' `
+                -ResultName 'handleConfirmationResult' `
+                -FinalName 'handleConfirmationFinal' `
+                -MaximumName 'handleConfirmationMaximum' `
+                -ChildFailureCode `
+                    'windows-handle-probe-confirmation-child-failed'
+        ) -or
+        -not (
+            Test-WindowsHandleQuiescenceLoopContract `
+                -Loop $confirmationQuiescenceLoop `
+                -CounterName 'handleConfirmationQuiescenceAttempt' `
+                -SampleName 'handleConfirmationQuiescenceSample' `
+                -SettledName 'handleConfirmationSettled'
         )
     ) {
         return $false
     }
 
-    # ASTで各loop bodyを固定したうえで、startup → calibration → measuredの
-    # baselineとpersistent判定が同じTry内で順番どおり接続されることも検査する。
+    # ASTで各loop bodyを固定したうえで、startup → calibration → measured →
+    # confirmationのbaselineとpersistent判定が同じTry内で順番どおり接続される
+    # ことも検査する。
     $orderedContract = (
         '(?s)' +
         '\$handleWarmupRuns\s*=\s*80.*?' +
         '\$handleCalibrationRuns\s*=\s*40.*?' +
         '\$handleMeasuredRuns\s*=\s*40.*?' +
+        '\$handleConfirmationRuns\s*=\s*40.*?' +
         '\$handleStartupGrowthLimit\s*=\s*16.*?' +
         '\$handleMeasuredFinalGrowthLimit\s*=\s*4.*?' +
         '\$handleQuiescenceSamples\s*=\s*10.*?' +
@@ -2596,11 +2666,27 @@ function Test-WindowsHandleProbeAstContract {
         '\$handleBaseline\s*=\s*\$handleCalibrationSettled.*?' +
         '\$handleObservedFinal\s*=\s*\$handleMeasuredFinal.*?' +
         '\$handleSettledFinal\s*=\s*\$handleMeasuredFinal.*?' +
+        '\$handleConfirmationFinal\s*=\s*\$handleSettledFinal.*?' +
+        '\$handleConfirmationObservedFinal\s*=\s*' +
+        '\$handleConfirmationFinal.*?' +
+        '\$handleConfirmationSettled\s*=\s*' +
+        '\$handleConfirmationFinal.*?' +
         '\(\$handleSettledFinal\s*-\s*\$handleBaseline\)\s*' +
+        '-gt\s*\$handleStartupGrowthLimit\s*\)\s*-or\s*\(\s*' +
+        '\(\$handleConfirmationSettled\s*-\s*' +
+        '\$handleSettledFinal\)\s*' +
+        '-gt\s*\$handleStartupGrowthLimit\s*\)\s*-or\s*\(\s*' +
+        '\(\$handleSettledFinal\s*-\s*\$handleBaseline\)\s*' +
+        '-gt\s*\$handleMeasuredFinalGrowthLimit\s*-and\s*' +
+        '\(\$handleConfirmationSettled\s*-\s*' +
+        '\$handleSettledFinal\)\s*' +
         '-gt\s*\$handleMeasuredFinalGrowthLimit.*?' +
         'windows-handle-probe-steady-persistent.*?' +
         'warmup-settled=\$handleWarmupSettled.*?' +
         'calibration-settled=\$handleCalibrationSettled.*?' +
+        'confirmation-settled=\$handleConfirmationSettled.*?' +
+        'confirmation=\$handleConfirmationRuns.*?' +
+        'plateau-limit=\$handleStartupGrowthLimit.*?' +
         'final-limit=\$handleMeasuredFinalGrowthLimit'
     )
     return $Source -match $orderedContract
@@ -2616,7 +2702,7 @@ function Test-WindowsHandleProbeContract {
     # source全体をSHA-256で封印する。Set-Variable、outer wrapper、偽evidence等の
     # AST上は合法な追記も、個別deny-listへ依存せず必ずreview対象に戻す。
     $expectedSourceSha256 = (
-        'd0b2c05d870aa842310499f2133da160529239012b16745b4384a9cc84211208'
+        '778ef2b532027e6c26bedf83eb8a15209fc22d9bd3558dcb98217e196a52750a'
     )
     $sourceBytes = [System.Text.Encoding]::UTF8.GetBytes($Source)
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -4313,7 +4399,7 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
     ) {
         Add-Failure (
             'scripts/test-private-marker-handle-stability.ps1 is missing: ' +
-            'bounded startup, calibration, and steady-state Windows handle regressions without GC'
+            'bounded startup, calibration, measured, and confirmation Windows handle regressions without GC'
         )
     }
 
@@ -4359,6 +4445,22 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             Before = '$handleMeasuredQuiescenceAttempt = 0;'
             After = (
                 '$handleMeasuredQuiescenceAttempt = ' +
+                '$handleQuiescenceSamples;'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'confirmation'
+            Before = '$handleConfirmationAttempt = 0;'
+            After = (
+                '$handleConfirmationAttempt = ' +
+                '$handleConfirmationRuns;'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'confirmation quiescence'
+            Before = '$handleConfirmationQuiescenceAttempt = 0;'
+            After = (
+                '$handleConfirmationQuiescenceAttempt = ' +
                 '$handleQuiescenceSamples;'
             )
         }
@@ -4408,7 +4510,7 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
             After = '$handleWarmupRuns = 40'
         },
         [pscustomobject]@{
-            Name = 'startup growth relaxed'
+            Name = 'startup / plateau growth relaxed'
             Before = '$handleStartupGrowthLimit = 16'
             After = '$handleStartupGrowthLimit = 17'
         },
@@ -4428,6 +4530,15 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
                 '$handleMeasuredRuns = 40' +
                 "`n    " +
                 '$handleMeasuredRuns = 0'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'confirmation'
+            Before = '$handleConfirmationRuns = 40'
+            After = (
+                '$handleConfirmationRuns = 40' +
+                "`n    " +
+                '$handleConfirmationRuns = 0'
             )
         },
         [pscustomobject]@{
@@ -4522,6 +4633,18 @@ if (-not (Test-Path -LiteralPath $windowsHandleProbePath -PathType Leaf)) {
                 'Invoke-PrivateMarkerBoundedProcess'
             )
             After = '$handleProbeResult = New-PrivateMarkerDummyResult'
+        },
+        [pscustomobject]@{
+            Name = 'confirmation'
+            Before = (
+                '$handleConfirmationResult = ' +
+                'private-marker-process-runner\' +
+                'Invoke-PrivateMarkerBoundedProcess'
+            )
+            After = (
+                '$handleConfirmationResult = ' +
+                'New-PrivateMarkerDummyResult'
+            )
         }
     )
     foreach (
@@ -4779,6 +4902,30 @@ function Invoke-PrivateMarkerBoundedProcess {
                         )
                     }
             )
+        },
+        [pscustomobject]@{
+            Name = 'confirmation'
+            Loops = @(
+                $fixtureForStatements |
+                    Where-Object {
+                        $_.Condition.Extent.Text -match (
+                            '^\s*\$handleConfirmationAttempt\s*-lt\s*' +
+                            '\$handleConfirmationRuns\s*$'
+                        )
+                    }
+            )
+        },
+        [pscustomobject]@{
+            Name = 'confirmation quiescence'
+            Loops = @(
+                $fixtureForStatements |
+                    Where-Object {
+                        $_.Condition.Extent.Text -match (
+                            '^\s*\$handleConfirmationQuiescenceAttempt\s*' +
+                            '-lt\s*\$handleQuiescenceSamples\s*$'
+                        )
+                    }
+            )
         }
     )
     foreach ($conditionalBodyCase in $conditionalBodyCases) {
@@ -4829,8 +4976,8 @@ function Invoke-PrivateMarkerBoundedProcess {
     }
 }
 
-# 実測した一時増加はcalibration後のmeasured windowで再発しない限りpassし、
-# startupまたはmeasuredに残る増加は既存limitのままfailすることを先に固定する。
+# 実測した単発+5 plateauは、次windowで増え続けない限りpassする。
+# startup累積超過または2つのsteady windowに連続する+5はlimit 16/4のままfailする。
 $runtimeStartupTransientSeries = @(
     600, 598, 590, 587, 587, 587, 587, 587, 587, 587
 )
@@ -4840,11 +4987,20 @@ $runtimeCalibrationPlateauSeries = @(
 $runtimeMeasuredPlateauSeries = @(
     597, 597, 597, 597, 597, 597, 597, 597, 597, 597
 )
+$runtimeCalibration592Series = @(
+    592, 592, 592, 592, 592, 592, 592, 592, 592, 592
+)
 $persistentStartupSeries = @(
     117, 117, 117, 117, 117, 117, 117, 117, 117, 117
 )
 $persistentMeasuredSeries = @(
     115, 115, 115, 115, 115, 115, 115, 115, 115, 115
+)
+$persistentConfirmationSeries = @(
+    120, 120, 120, 120, 120, 120, 120, 120, 120, 120
+)
+$absolutePlateauExcessSeries = @(
+    127, 127, 127, 127, 127, 127, 127, 127, 127, 127
 )
 $transientMeasuredSeries = @(
     125, 119, 114, 110, 110, 110, 110, 110, 110, 110
@@ -4859,7 +5015,9 @@ if (
             -CalibrationQuiescenceSamples `
                 $runtimeCalibrationPlateauSeries `
             -MeasuredObservedFinal 597 `
-            -MeasuredQuiescenceSamples $runtimeMeasuredPlateauSeries
+            -MeasuredQuiescenceSamples $runtimeMeasuredPlateauSeries `
+            -ConfirmationObservedFinal 597 `
+            -ConfirmationQuiescenceSamples $runtimeMeasuredPlateauSeries
     ) -or
     -not (
         Test-WindowsHandleCalibratedWindowsWithinLimits `
@@ -4869,7 +5027,35 @@ if (
             -CalibrationObservedFinal 110 `
             -CalibrationQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110) `
             -MeasuredObservedFinal 125 `
-            -MeasuredQuiescenceSamples $transientMeasuredSeries
+            -MeasuredQuiescenceSamples $transientMeasuredSeries `
+            -ConfirmationObservedFinal 110 `
+            -ConfirmationQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110)
+    ) -or
+    # PR #9 / #12の実測値。最初のsteady windowだけ+5、次は+0なら受理する。
+    -not (
+        Test-WindowsHandleCalibratedWindowsWithinLimits `
+            -StartupBaseline 581 `
+            -WarmupObservedFinal 587 `
+            -WarmupQuiescenceSamples $runtimeStartupTransientSeries `
+            -CalibrationObservedFinal 592 `
+            -CalibrationQuiescenceSamples $runtimeCalibration592Series `
+            -MeasuredObservedFinal 597 `
+            -MeasuredQuiescenceSamples $runtimeMeasuredPlateauSeries `
+            -ConfirmationObservedFinal 597 `
+            -ConfirmationQuiescenceSamples $runtimeMeasuredPlateauSeries
+    ) -or
+    # one-time initializationがconfirmation側で起きても連続増加でなければ受理する。
+    -not (
+        Test-WindowsHandleCalibratedWindowsWithinLimits `
+            -StartupBaseline 581 `
+            -WarmupObservedFinal 587 `
+            -WarmupQuiescenceSamples $runtimeStartupTransientSeries `
+            -CalibrationObservedFinal 592 `
+            -CalibrationQuiescenceSamples $runtimeCalibration592Series `
+            -MeasuredObservedFinal 592 `
+            -MeasuredQuiescenceSamples $runtimeCalibration592Series `
+            -ConfirmationObservedFinal 597 `
+            -ConfirmationQuiescenceSamples $runtimeMeasuredPlateauSeries
     ) -or
     (
         Test-WindowsHandleCalibratedWindowsWithinLimits `
@@ -4879,8 +5065,11 @@ if (
             -CalibrationObservedFinal 117 `
             -CalibrationQuiescenceSamples $persistentStartupSeries `
             -MeasuredObservedFinal 117 `
-            -MeasuredQuiescenceSamples $persistentStartupSeries
+            -MeasuredQuiescenceSamples $persistentStartupSeries `
+            -ConfirmationObservedFinal 117 `
+            -ConfirmationQuiescenceSamples $persistentStartupSeries
     ) -or
+    # limit 4を超える+5が2つのsteady windowで続けばpersistent leakとして拒否する。
     (
         Test-WindowsHandleCalibratedWindowsWithinLimits `
             -StartupBaseline 100 `
@@ -4889,7 +5078,34 @@ if (
             -CalibrationObservedFinal 110 `
             -CalibrationQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110) `
             -MeasuredObservedFinal 115 `
-            -MeasuredQuiescenceSamples $persistentMeasuredSeries
+            -MeasuredQuiescenceSamples $persistentMeasuredSeries `
+            -ConfirmationObservedFinal 120 `
+            -ConfirmationQuiescenceSamples $persistentConfirmationSeries
+    ) -or
+    # 単独windowでも+17はbounded plateauのabsolute limit 16を超えるため拒否する。
+    (
+        Test-WindowsHandleCalibratedWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupObservedFinal 105 `
+            -WarmupQuiescenceSamples @(105, 105, 105, 105, 105, 105, 105, 105, 105, 105) `
+            -CalibrationObservedFinal 110 `
+            -CalibrationQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110) `
+            -MeasuredObservedFinal 127 `
+            -MeasuredQuiescenceSamples $absolutePlateauExcessSeries `
+            -ConfirmationObservedFinal 127 `
+            -ConfirmationQuiescenceSamples $absolutePlateauExcessSeries
+    ) -or
+    (
+        Test-WindowsHandleCalibratedWindowsWithinLimits `
+            -StartupBaseline 100 `
+            -WarmupObservedFinal 105 `
+            -WarmupQuiescenceSamples @(105, 105, 105, 105, 105, 105, 105, 105, 105, 105) `
+            -CalibrationObservedFinal 110 `
+            -CalibrationQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110) `
+            -MeasuredObservedFinal 110 `
+            -MeasuredQuiescenceSamples @(110, 110, 110, 110, 110, 110, 110, 110, 110, 110) `
+            -ConfirmationObservedFinal 127 `
+            -ConfirmationQuiescenceSamples $absolutePlateauExcessSeries
     )
 ) {
     Add-Failure (
@@ -4898,12 +5114,20 @@ if (
     )
 }
 
-# RED契約。production probeがstartup 80回とmeasured 40回の間に、同じ
-# runnerを40回動かすcalibration windowを持つまでreadinessをfailさせる。
+# 構造契約。startup 80回とmeasured 40回の間で、同じrunnerを40回動かす
+# calibration windowを必須化する。
 Assert-FileContains `
     -RelativePath 'scripts/test-private-marker-handle-stability.ps1' `
     -Pattern '(?s)\$handleCalibrationRuns\s*=\s*40.*?\$handleCalibrationAttempt\s*=\s*0.*?\$handleCalibrationAttempt\s*-lt\s*\$handleCalibrationRuns.*?Invoke-PrivateMarkerBoundedProcess' `
     -Description 'forty-run Windows handle runtime calibration window'
+
+# 構造契約。固定calibration後にも発生した単発+5 plateauと継続leakを分けるため、
+# measured結果に依存せず実行する40回confirmation、single-window absolute cap、
+# 連続2-window判定を必須化する。
+Assert-FileContains `
+    -RelativePath 'scripts/test-private-marker-handle-stability.ps1' `
+    -Pattern '(?s)\$handleConfirmationRuns\s*=\s*40.*?\$handleConfirmationAttempt\s*=\s*0.*?\$handleConfirmationAttempt\s*-lt\s*\$handleConfirmationRuns.*?Invoke-PrivateMarkerBoundedProcess.*?\$handleConfirmationSettled.*?\(\$handleSettledFinal\s*-\s*\$handleBaseline\)\s*-gt\s*\$handleStartupGrowthLimit.*?-or.*?\(\$handleConfirmationSettled\s*-\s*\$handleSettledFinal\)\s*-gt\s*\$handleStartupGrowthLimit.*?-or.*?\(\$handleSettledFinal\s*-\s*\$handleBaseline\)\s*-gt\s*\$handleMeasuredFinalGrowthLimit\s*-and\s*\(\$handleConfirmationSettled\s*-\s*\$handleSettledFinal\)\s*-gt\s*\$handleMeasuredFinalGrowthLimit.*?windows-handle-probe-steady-persistent' `
+    -Description 'unconditional forty-run Windows handle confirmation window with bounded plateau'
 
 # 変数名とloop headerだけを残したno-op実装をpositiveにしないことも固定する。
 # validator自身のAST契約が弱体化すると、production runnerを一度も呼ばない検査が
@@ -4912,6 +5136,7 @@ $windowsHandleProbeNoOpFixture = @'
 $handleWarmupRuns = 80
 $handleCalibrationRuns = 40
 $handleMeasuredRuns = 40
+$handleConfirmationRuns = 40
 $handleStartupGrowthLimit = 16
 $handleMeasuredFinalGrowthLimit = 4
 $handleQuiescenceSamples = 10
@@ -4942,7 +5167,21 @@ $handleObservedFinal = $handleMeasuredFinal
 $handleSettledFinal = $handleMeasuredFinal
 for ($handleMeasuredQuiescenceAttempt = 0; $handleMeasuredQuiescenceAttempt -lt $handleQuiescenceSamples; $handleMeasuredQuiescenceAttempt++) {
 }
-if (($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit) {
+$handleConfirmationFinal = $handleSettledFinal
+for ($handleConfirmationAttempt = 0; $handleConfirmationAttempt -lt $handleConfirmationRuns; $handleConfirmationAttempt++) {
+}
+$handleConfirmationObservedFinal = $handleConfirmationFinal
+$handleConfirmationSettled = $handleConfirmationFinal
+for ($handleConfirmationQuiescenceAttempt = 0; $handleConfirmationQuiescenceAttempt -lt $handleQuiescenceSamples; $handleConfirmationQuiescenceAttempt++) {
+}
+if (
+    ($handleSettledFinal - $handleBaseline) -gt $handleStartupGrowthLimit -or
+    ($handleConfirmationSettled - $handleSettledFinal) -gt $handleStartupGrowthLimit -or
+    (
+        ($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -and
+        ($handleConfirmationSettled - $handleSettledFinal) -gt $handleMeasuredFinalGrowthLimit
+    )
+) {
 }
 '@
 if (
@@ -4958,6 +5197,7 @@ $windowsHandleProbeScopeEscapeFixture = @'
 $handleWarmupRuns = 80
 $handleCalibrationRuns = 40
 $handleMeasuredRuns = 40
+$handleConfirmationRuns = 40
 $handleStartupGrowthLimit = 16
 $handleMeasuredFinalGrowthLimit = 4
 $handleQuiescenceSamples = 10
@@ -5007,7 +5247,27 @@ for ($handleMeasuredQuiescenceAttempt = 0; $handleMeasuredQuiescenceAttempt -lt 
 }
 $handleMeasuredQuiescenceSample = $handleProbeProcess.HandleCount
 $handleSettledFinal = [Math]::Min($handleSettledFinal, $handleMeasuredQuiescenceSample)
-if (($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit) {
+$handleConfirmationFinal = $handleSettledFinal
+for ($handleConfirmationAttempt = 0; $handleConfirmationAttempt -lt $handleConfirmationRuns; $handleConfirmationAttempt++) {
+}
+$handleConfirmationResult = Invoke-PrivateMarkerBoundedProcess
+$handleProbeProcess.Refresh()
+$handleConfirmationFinal = $handleProbeProcess.HandleCount
+$handleConfirmationMaximum = [Math]::Max($handleConfirmationMaximum, $handleConfirmationFinal)
+$handleConfirmationObservedFinal = $handleConfirmationFinal
+$handleConfirmationSettled = $handleConfirmationFinal
+for ($handleConfirmationQuiescenceAttempt = 0; $handleConfirmationQuiescenceAttempt -lt $handleQuiescenceSamples; $handleConfirmationQuiescenceAttempt++) {
+}
+$handleConfirmationQuiescenceSample = $handleProbeProcess.HandleCount
+$handleConfirmationSettled = [Math]::Min($handleConfirmationSettled, $handleConfirmationQuiescenceSample)
+if (
+    ($handleSettledFinal - $handleBaseline) -gt $handleStartupGrowthLimit -or
+    ($handleConfirmationSettled - $handleSettledFinal) -gt $handleStartupGrowthLimit -or
+    (
+        ($handleSettledFinal - $handleBaseline) -gt $handleMeasuredFinalGrowthLimit -and
+        ($handleConfirmationSettled - $handleSettledFinal) -gt $handleMeasuredFinalGrowthLimit
+    )
+) {
 }
 '@
 if (
@@ -5024,7 +5284,7 @@ Assert-FileContains `
     -Description 'fresh handle probe uses the reviewed runner and fixed minimal child environment'
 Assert-FileContains `
     -RelativePath 'scripts/test-scan-private-markers.ps1' `
-    -Pattern '(?s)\$handleProbeScript\s*=\s*Join-Path.*?''test-private-marker-handle-stability\.ps1''.*?\$handleProbeArguments\s*=\s*Get-PowerShellArguments.*?\$handleProbeHostResult\s*=\s*Invoke-BoundedProcess.*?-FilePath\s+\$powerShellPath.*?-TimeoutMilliseconds\s+120000.*?\$handleEvidenceMatch' `
+    -Pattern '(?s)\$handleProbeScript\s*=\s*Join-Path.*?''test-private-marker-handle-stability\.ps1''.*?\$handleProbeArguments\s*=\s*Get-PowerShellArguments.*?\$handleProbeHostResult\s*=\s*Invoke-BoundedProcess.*?-FilePath\s+\$powerShellPath.*?-TimeoutMilliseconds\s+120000.*?confirmation-observed-final=\[0-9\]\+.*?confirmation-settled=\[0-9\]\+.*?confirmation-max=\[0-9\]\+.*?confirmation=40.*?plateau-limit=16.*?\$handleEvidenceMatch' `
     -Description 'bounded same-host Windows handle probe isolation'
 Assert-FileContains `
     -RelativePath 'scripts/test-private-marker-handle-stability.ps1' `

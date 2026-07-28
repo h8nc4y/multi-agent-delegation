@@ -370,17 +370,20 @@ Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
 buffers. After the main self-test proves raw byte transport, Windows launches
 a dedicated handle-probe script in a fresh instance of the same PowerShell
 executable. That host measures an eighty-invocation startup window with a bounded
-aggregate handle-growth allowance, then runs a forty-invocation calibration
-window before the separate forty-run steady-state window. Each window ends with
-a bounded 10-by-50 ms quiescence sample that records the minimum settled value
-without starting another child or forcing GC. The startup limit remains 16
-through calibration, and the steady-state final limit remains 4. Window maxima
-remain evidence, but a transient peak that closes during quiescence is not
-classified as a leak. The aggregate includes short-lived PowerShell runtime
-handles, while every runner-owned native handle close is checked separately.
-Calibration absorbs one-time delayed runtime initialization; the final measured
-window still fails sustained growth. POSIX keeps its forty-run no-GC
-file-descriptor regression.
+aggregate handle-growth allowance, then runs forty-invocation calibration and
+measured windows followed unconditionally by one forty-invocation confirmation
+window. Each window ends with a bounded 10-by-50 ms quiescence sample that
+records the minimum settled value without starting another child or forcing GC.
+The startup limit remains 16 through calibration and also caps the absolute
+growth accepted in either single steady window. Within that bound, the
+persistent-growth limit for both measured and confirmation remains 4, and
+growth above 4 in both consecutive windows is classified as a persistent leak.
+A one-window plateau of at most 16 and all window maxima remain evidence. The
+aggregate includes short-lived
+PowerShell runtime handles, while every runner-owned native handle close is
+checked separately and every child failure still fails immediately. The
+confirmation window is neither a conditional retry nor skippable. POSIX keeps
+its forty-run no-GC file-descriptor regression.
 OSS readiness seals the dedicated Windows probe's canonical UTF-8 source with
 SHA-256 and separately checks its loop headers, direct child-runner statements,
 result guards, handle updates, and thresholds through the PowerShell AST.
