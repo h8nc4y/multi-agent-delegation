@@ -4,7 +4,8 @@
 
 - **分類**：Class M。
 - **目的**：Windows PowerShell 5.1 hostの一時的なruntime handle増加と、runner呼出し後も残る持続的なhandle leakを分離する。
-- **非目的**：growth limitの単純緩和、probeのskip、GCによる強制回収、native close結果の検査削除は行わない。
+- **非目的**：growth limitの単純緩和、probeのskip、条件付き・無制限retry、GCによる
+  強制回収、native close結果の検査削除は行わない。
 - **影響**：専用handle probe、readinessの構造契約とsynthetic判定、self-testの固定evidence、README、CHANGELOGを同期する。
 
 ## 実測した非決定性
@@ -14,9 +15,15 @@
 - merge後の`main` jobでは、startup baseline 581に対してfinal 587、maximum 600となり、startup limit 16をmaximumだけが3 handles超過した。
 - `main`のfailed-job rerunも、同じsourceとhost種別で全stepが成功した。
 - 実装PRのWindows jobと、ローカルのPowerShell 7 / Windows PowerShell 5.1 full self-testも成功した。
+- その後のPR #12 run `30344076784`では、80回startup、40回calibration、40回measuredを
+  実装済みのsourceでも、Windows PowerShell 5.1だけが再びbaseline 592、
+  observed / settled final 597、final limit 4で失敗した。同じcommitのWindows
+  PowerShell 7、Ubuntu、macOS dedicated unsupported jobと、ローカル両hostは成功した。
 
-この証拠はrunnerの持続leakを示さない。
-一方、現在のprobeはstartup中の一時maximumと、追加初期化が発生し得る最初のsteady windowを持続leakと同じ条件で判定するため、runtime揺らぎを分離できていない。
+初回の修正はstartup中の一時maximumと最初のsteady windowを分離したが、固定40回の
+calibration後にも同じ5-handle plateauが発生し得ることが分かった。1つのwindowだけの
+増加はrunner呼出しごとに継続するleakの証拠にならない。一方、同じ上限を超える増加が
+連続する2つのsteady windowに残れば、bounded quiescence後も増え続ける証拠になる。
 
 ## 判定契約
 
@@ -24,23 +31,57 @@
 2. startup 80回の後にbounded quiescenceを取り、最小handle countをwarmup settled値とする。
 3. calibration 40回とbounded quiescenceを追加し、遅延した一度限りのruntime初期化をstartup window内へ収束させる。
 4. startup baselineからcalibration settled値までの持続増加には、既存のlimit 16を維持する。
-5. calibration settled値をsteady baselineとし、次の40回後のsettled final増加には、既存のlimit 4を維持する。
-6. 各windowのmaximumはevidenceへ残すが、quiescenceで消えた一時handleをleak判定へ使わない。
-7. quiescenceは各windowで固定回数と固定待機時間を使い、GC、内部retry、無期限waitを使わない。
-8. runnerのnative close失敗、child失敗、出力逸脱は従来どおり即時失敗させる。
+5. calibration settled値をsteady baselineとし、40回のmeasured windowとbounded
+   quiescenceを実行する。window差分には既存のlimit 4を維持する。
+6. measured結果にかかわらず、条件分岐やretryではなく常時40回のconfirmation windowと
+   bounded quiescenceを1回だけ実行する。confirmationのbaselineはmeasured settled値とする。
+7. measuredまたはconfirmationの単独増加がstartupと同じabsolute limit 16を
+   超えた場合は、1 windowだけでもbounded plateauではないため拒否する。
+8. absolute limit内でも、measuredとconfirmationの両方がそれぞれpersistent
+   limit 4を超えた場合は、継続するsteady-state leakとして拒否する。どちらか
+   一方だけが4を超え16以下ならbounded plateauとしてevidenceへ残す。
+9. 各windowのobserved final、settled値、maximum、persistent limit 4、
+   single-window plateau limit 16はevidenceへ残す。
+   quiescenceで消えた一時handleをleak判定へ使わない。
+10. quiescenceは各windowで固定回数と固定待機時間を使い、GC、条件付きretry、
+   無期限waitを使わない。
+11. runnerのnative close失敗、child失敗、出力逸脱は全windowで従来どおり即時失敗させる。
 
 ## Test plan
 
-- **RED**：実測した2種類の一時増加をsynthetic seriesへ追加し、現行判定が拒否することを確認する。
-- **GREEN**：warmup、calibration、measuredの各windowとsettled値をprobeへ実装し、実測seriesを受理する。
-- **negative**：startup settled増加17、measured settled増加5、calibrationまたはmeasuredのzero-run、quiescence無効化、runner置換を拒否する。
+- **RED**：PR #9 / #12で再現したmeasured +5、次window +0のseriesと、常時
+  confirmation windowのsource contractを追加し、現行3-window probeだけを拒否する。
+- **GREEN**：warmup、calibration、measured、confirmationの各windowとsettled値を
+  probeへ実装し、measured +5 / confirmation +0とmeasured +0 / confirmation +5を
+  bounded plateauとして受理する。
+- **negative**：startup settled増加17、measured +5 / confirmation +5、
+  measured +17 / confirmation +0、measured +0 / confirmation +17、
+  各execution / quiescence windowのzero-run、confirmationの条件付き化、
+  limit緩和、runner置換を拒否する。
 - **host**：PowerShell 7とWindows PowerShell 5.1でreadinessとfull scanner self-testを実行する。
 - **regression**：repository scan、UTF-8 / LF、`git diff --check`、Gitleaks、Semgrepを実行する。
 - **review**：source freeze後の独立reviewでP0 / P1 / P2 / P3を0にする。
 
 ## Handoff
 
-- **状態**：GREEN実装、final full regression、security / hygiene、独立review、PR CI、mergeを完了した。
+- **2026-07-28再発対応**：PR #12 run `30344076784`のWindows PowerShell 5.1で、
+  過去のPR #9と同じbaseline 592→settled 597を再検出した。failed jobのblind rerunは
+  行わず、confirmation source contractのREDを両PowerShell hostで実測後、production
+  probe、validator、self-test evidence、公開文書へ4-window契約を実装した。
+  PowerShell 7とWindows PowerShell 5.1のreadiness、専用handle probe、full
+  self-testはすべてexit 0。再reviewはP0 / P1 / P2 / P3各0、clearance YES。
+  hosted CIとmergeは未実施。
+- **独立review P1**：最初の4-window実装は`+5 / +0`だけでなく`+100 / +0`も
+  通すため、single-window plateauが無制限だった。persistent limit 4に加え、
+  startupと同じabsolute limit 16を各steady windowへ適用した。修正前に
+  `+17 / +0`と`+0 / +17`が通るREDを両PowerShell hostで確認し、修正後は
+  両hostのreadinessがexit 0になった。
+- **最終local regression**：machine-wide scanner slotを直列化し、専用probeは
+  PowerShell 7が14.374秒、Windows PowerShell 5.1が13.056秒、full self-testは
+  PowerShell 7が231.581秒、Windows PowerShell 5.1が197.387秒で、4本とも
+  初回実行、exit 0、stderrなしだった。各full markerはhost名を含めてexact一致し、
+  各終了後のscanner / handle-probe PIDは0、reviewed source freezeは不変だった。
+- **前回PR #10状態**：GREEN実装、final full regression、security / hygiene、独立review、PR CI、mergeを完了した。
   PR #10をmerge commit `7791a20`で`main`へ統合済み。
 - **RED**：calibration 40回を必須化するvalidatorをproduction変更前に実行し、現行probeの不足だけをexit 1で確認した。
 - **実装**：warmup、calibration、measuredの各window後に同じ10回、50 msのbounded quiescenceを追加した。

@@ -1,7 +1,7 @@
 # Delegation Prompt Template
 
 Copy this template when delegating a task to a subagent. Replace every
-`<placeholder>`. The five mandatory clauses from SKILL.md section 1 are
+`<placeholder>`. The six mandatory clauses from SKILL.md section 1 are
 marked `[MANDATORY]` — do not remove them.
 
 All values below are synthetic placeholders. Never paste secrets, tokens, or
@@ -32,6 +32,16 @@ Checkout ownership [MANDATORY]:
   only in the exclusive checkout or isolated worktree and task branch assigned
   to you.
 
+Completion verification baseline [MANDATORY]:
+- Before editing, record the current branch, the full OID from
+  `git rev-parse --verify HEAD`, and all output from
+  `git --no-optional-locks status --porcelain=v1 --untracked-files=all`.
+- For non-Git artifacts and explicitly assigned dirty-resume artifacts, also
+  record pre-edit existence, byte size, and SHA-256. Do not read or hash
+  unassigned WIP; stop on that ownership conflict.
+- Baseline collection is read-only. Do not use `git write-tree`, `update-index`,
+  stash, reset, checkout, or another command that changes Git or file state.
+
 Deliverables and acceptance criteria [MANDATORY] (use absolute artifact
 paths):
 - <artifact-path-1> — exists and contains <required-content-summary>
@@ -45,6 +55,12 @@ Format constraints [MANDATORY]:
 Completion report [MANDATORY]:
 - Include the list of changed files (paths).
 - Include the actual output of <verify-command> (measured, not assumed).
+- Include the final branch and full HEAD OID, baseline-to-final
+  `git diff --name-status`, current porcelain with all untracked files, and
+  artifact content/state evidence. For an existing baseline HEAD, include the
+  exit result of `git merge-base --is-ancestor <baseline> <final>`; exit 0 is
+  required. A clean committed task is not a no-op merely because final
+  porcelain is empty, but divergent history is never valid completion.
 - Anything you could not verify must be labeled "unverified".
 
 Scope guard:
@@ -75,6 +91,14 @@ checkout の所有権【必須】:
 - 未割当の既存 WIP を stash、reset、削除、自分の commit へ混入しない。割り当て
   られた排他的 checkout または隔離 worktree と task branch でのみ続行する。
 
+完了検証baseline【必須】:
+- 編集前に現在branch、`git rev-parse --verify HEAD`の完全OID、
+  `git --no-optional-locks status --porcelain=v1 --untracked-files=all`の全出力を記録する。
+- non-Git成果物と明示的に割り当て済みのdirty resume成果物では、編集前の実在、
+  byte size、SHA-256も記録する。未割当WIPは開いたりhash化したりせず、競合として停止する。
+- baseline取得はread-onlyとし、`git write-tree`、`update-index`、stash、reset、
+  checkoutなどGit stateやfileを変更するcommandを使わない。
+
 成果物と受け入れ条件【必須】（成果物も絶対パスで指定）:
 - <artifact-path-1> — 存在し、<required-content-summary> を含む
 - <artifact-path-2> — <acceptance-condition> を満たすよう更新されている
@@ -87,6 +111,11 @@ checkout の所有権【必須】:
 完了報告【必須】:
 - 変更ファイル一覧（パス）を含めること。
 - <verify-command> の実際の出力を含めること（実測のみ。推測は書かない）。
+- 最終branchと完全HEAD OID、baseline→finalの`git diff --name-status`、untrackedを
+  全件含む現在porcelain、成果物の内容/state証拠を含めること。baseline HEADが存在する
+  場合は`git merge-base --is-ancestor <baseline> <final>`のexit結果も含め、exit 0を
+  必須とする。commit済みでcleanなtaskを最終porcelainが空という理由だけで空振りに
+  しないが、divergent historyを完了扱いしない。
 - 検証できなかった項目は「未検証」と明記すること。
 
 スコープ制約:
@@ -105,3 +134,4 @@ checkout の所有権【必須】:
 | Format constraints | Silent corruption (BOM, CRLF, overwritten files) that passes casual review. |
 | Measured output only | Success-sounding reports written from assumptions instead of executed commands. |
 | Exclusive checkout ownership | Concurrent writers overwriting or absorbing pre-existing WIP into the wrong task. |
+| Baseline-aware completion evidence | Pre-existing artifacts faking success, or clean committed work being mislabeled a no-op. |

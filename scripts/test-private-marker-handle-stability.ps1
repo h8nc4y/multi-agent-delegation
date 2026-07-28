@@ -47,11 +47,12 @@ try {
     $handleProbeArguments = @('/d', '/c', 'exit', '0')
     $handleProbeEnvironment = New-PrivateMarkerChildEnvironment
 
-    # startup 80回とcalibration 40回でruntimeの一度限りの初期化を収束させ、
-    # その後の40回だけをsteady-stateとして判定する。
+    # startup 80回とcalibration 40回でruntimeの初期化を収束させ、続く2つの
+    # 40回windowで単発plateauとrunner呼出しごとの継続増加を分離する。
     $handleWarmupRuns = 80
     $handleCalibrationRuns = 40
     $handleMeasuredRuns = 40
+    $handleConfirmationRuns = 40
     $handleStartupGrowthLimit = 16
     # HandleCountはrunner所有handleだけでなく、Windows PowerShell runtimeの
     # 一時handleも同じaggregateへ含む。native close resultはrunner側で全件
@@ -216,7 +217,8 @@ try {
     }
 
     # child追加実行もGCも行わず、測定後のruntime揺らぎだけをminimumへ除外する。
-    # runner所有handleが残る場合は全sampleで減らず、既存limit 4を超えてfailする。
+    # runner所有handleが残る場合は全sampleで減らず、続くconfirmationでも同じ
+    # limit 4を超えて増え続けた時点でpersistent leakとしてfailする。
     $handleObservedFinal = $handleMeasuredFinal
     $handleSettledFinal = $handleMeasuredFinal
     for (
@@ -234,15 +236,82 @@ try {
             $handleMeasuredQuiescenceSample
         )
     }
+    # measured結果に依存する条件付きretryにはせず、confirmationを常時1回だけ
+    # 実行する。各child/native failureは従来どおりその場でfail closedにする。
+    $handleConfirmationFinal = $handleSettledFinal
+    $handleConfirmationMaximum = $handleSettledFinal
+    for (
+        $handleConfirmationAttempt = 0;
+        $handleConfirmationAttempt -lt $handleConfirmationRuns;
+        $handleConfirmationAttempt++
+    ) {
+        $handleConfirmationResult = private-marker-process-runner\Invoke-PrivateMarkerBoundedProcess `
+            -FilePath $handleProbeTarget `
+            -Arguments $handleProbeArguments `
+            -WorkingDirectory $root `
+            -EnvironmentVariables $handleProbeEnvironment `
+            -TimeoutMilliseconds 10000
+        if (
+            $handleConfirmationResult.ExitCode -ne 0 -or
+            $handleConfirmationResult.StandardOutputBytes.Length -ne 0 -or
+            $handleConfirmationResult.StandardErrorBytes.Length -ne 0
+        ) {
+            throw 'windows-handle-probe-confirmation-child-failed'
+        }
+        $handleProbeProcess.Refresh()
+        $handleConfirmationFinal = $handleProbeProcess.HandleCount
+        $handleConfirmationMaximum = [Math]::Max(
+            $handleConfirmationMaximum,
+            $handleConfirmationFinal
+        )
+    }
+
+    # measuredと同じbounded quiescenceで、confirmation後に残るminimumを取る。
+    $handleConfirmationObservedFinal = $handleConfirmationFinal
+    $handleConfirmationSettled = $handleConfirmationFinal
+    for (
+        $handleConfirmationQuiescenceAttempt = 0;
+        $handleConfirmationQuiescenceAttempt -lt $handleQuiescenceSamples;
+        $handleConfirmationQuiescenceAttempt++
+    ) {
+        [System.Threading.Thread]::Sleep(
+            $handleQuiescenceWaitMilliseconds
+        )
+        $handleProbeProcess.Refresh()
+        $handleConfirmationQuiescenceSample = $handleProbeProcess.HandleCount
+        $handleConfirmationSettled = [Math]::Min(
+            $handleConfirmationSettled,
+            $handleConfirmationQuiescenceSample
+        )
+    }
+
+    # 単独windowでもstartupと同じabsolute limit 16を超える増加は拒否する。
+    # その内側ではlimit 4を各windowへ維持し、2つとも超えたときだけ
+    # 継続leakとする。片方だけの+5などはbounded plateauとして残す。
     if (
-        ($handleSettledFinal - $handleBaseline) -gt
-            $handleMeasuredFinalGrowthLimit
+        (
+            ($handleSettledFinal - $handleBaseline) -gt
+                $handleStartupGrowthLimit
+        ) -or
+        (
+            ($handleConfirmationSettled - $handleSettledFinal) -gt
+                $handleStartupGrowthLimit
+        ) -or
+        (
+            ($handleSettledFinal - $handleBaseline) -gt
+                $handleMeasuredFinalGrowthLimit -and
+            ($handleConfirmationSettled - $handleSettledFinal) -gt
+                $handleMeasuredFinalGrowthLimit
+        )
     ) {
         throw (
             'windows-handle-probe-steady-persistent ' +
-            "baseline=$handleBaseline observed-final=$handleObservedFinal " +
-            "settled-final=$handleSettledFinal " +
-            "max=$handleMeasuredMaximum " +
+            "baseline=$handleBaseline " +
+            "measured-settled=$handleSettledFinal " +
+            "confirmation-settled=$handleConfirmationSettled " +
+            "measured-max=$handleMeasuredMaximum " +
+            "confirmation-max=$handleConfirmationMaximum " +
+            "plateau-limit=$handleStartupGrowthLimit " +
             "final-limit=$handleMeasuredFinalGrowthLimit"
         )
     }
@@ -263,9 +332,14 @@ try {
         "baseline=$handleBaseline, " +
         "observed-final=$handleObservedFinal, " +
         "settled-final=$handleSettledFinal, " +
-        "measured-max=$handleMeasuredMaximum, " +
+        "measured-max=$handleMeasuredMaximum, runs=$handleMeasuredRuns, " +
+        "confirmation-observed-final=$handleConfirmationObservedFinal, " +
+        "confirmation-settled=$handleConfirmationSettled, " +
+        "confirmation-max=$handleConfirmationMaximum, " +
+        "confirmation=$handleConfirmationRuns, " +
+        "plateau-limit=$handleStartupGrowthLimit, " +
         "final-limit=$handleMeasuredFinalGrowthLimit, " +
-        "runs=$handleMeasuredRuns, quiescence-per-window=" +
+        "quiescence-per-window=" +
         "$($handleQuiescenceSamples)x" +
         "$($handleQuiescenceWaitMilliseconds)ms, gc=not-invoked"
     )

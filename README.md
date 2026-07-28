@@ -126,7 +126,8 @@ Reach for the skill when you see one of these symptoms:
   parallel subagents without losing control of merges.
 
 Follow the procedure in [SKILL.md](SKILL.md): put the mandatory clauses in
-the delegation prompt, verify the completion notice against artifacts,
+the delegation prompt, capture a read-only pre-edit baseline, verify the
+completion notice against baseline-to-final Git and artifact evidence,
 resume the same agent once on a no-op, isolate environment differences, and
 use the ledger-as-spec pattern for large fan-outs.
 
@@ -149,7 +150,9 @@ repository paths you cannot publish, or customer data in public issues.
   絶対パス・成果物の絶対パス・受け入れ条件・変更ファイル一覧の報告・書式制約）
 - 編集前に checkout の排他的所有と未割当 WIP の不在を確認し、競合時は変更せず
   排他的 checkout または隔離 worktree を割り当てる
-- 完了通知の実在検証（`git status --porcelain` / ファイル実在確認）
+- 編集前のbranch・完全HEAD OID・porcelain全出力・必要なartifact stateをread-onlyで
+  baseline化し、完了後のHEAD/diff/current porcelain/内容と比較する。baseline HEADが
+  存在する場合は`merge-base --is-ancestor`のexit 0を必須とする
 - 同一エージェント resume によるリカバリ（新規起動より安くて速い）
 - 実行環境差（WSL / Git Bash / PowerShell / sandbox）の切り分け
 - 台帳（file:line＋最小修正案＋confidence）をそのまま委譲 spec にする並列委譲
@@ -172,6 +175,14 @@ repository paths you cannot publish, or customer data in public issues.
   [delegation contract hardening](docs/delegation-contract-hardening.md).
 - A completion notice is a claim, not evidence. Report unverified items as
   unverified.
+- Completion verification is baseline-aware: a pre-existing artifact with no
+  initial-to-final delta is a no-op, while a clean committed task can be
+  successful when baseline HEAD is an ancestor of final HEAD and its
+  baseline-to-final diff and artifact content match the assignment. The
+  orchestrator independently re-measures final evidence and rejects divergent
+  history and unassigned paths. Baseline capture is read-only and never uses
+  `git write-tree`. See
+  [baseline-aware completion verification](docs/completion-baseline-verification.md).
 
 ## Limitations
 
@@ -230,6 +241,17 @@ repository-root/probe failures, snapshot mutation, a hostile Git environment,
 present-empty removal and preservation, redaction, exact byte transport,
 native Git batch bytes without a BOM, caller input-encoding preservation,
 outside-artifact prevention, and bounded child-tree/output-pipe termination.
+Readiness also creates a synthetic temporary Git repository to prove that
+unchanged pre-existing artifacts remain no-ops, clean H0-to-C1 commits count as
+work, assigned dirty resumes use initial-to-final artifact state, and
+unassigned WIP absorption is rejected. Initial porcelain, final porcelain, and
+committed-diff scope violations use independent repositories. Synthetic Git
+runs through the existing byte-bounded process-tree runner with a fixed minimal
+environment; hostile `GIT_DIR`, index, global-config, and filter inputs cannot
+change external sentinels. A same-branch divergent-history fixture requires
+`merge-base --is-ancestor` exit 0 and keeps its external sentinel unchanged.
+A sibling directory outside the repositories proves the non-Git existence,
+byte-size, and SHA-256 decision.
 On POSIX it also injects direct-delay and fork-delay `setsid` launchers to
 prove that no target runs before a verified process-group release and that a
 late group is removed without leaving its private gate directory.
@@ -348,17 +370,20 @@ Both OS paths explicitly dispose completed stream-pump tasks, pipe streams, and
 buffers. After the main self-test proves raw byte transport, Windows launches
 a dedicated handle-probe script in a fresh instance of the same PowerShell
 executable. That host measures an eighty-invocation startup window with a bounded
-aggregate handle-growth allowance, then runs a forty-invocation calibration
-window before the separate forty-run steady-state window. Each window ends with
-a bounded 10-by-50 ms quiescence sample that records the minimum settled value
-without starting another child or forcing GC. The startup limit remains 16
-through calibration, and the steady-state final limit remains 4. Window maxima
-remain evidence, but a transient peak that closes during quiescence is not
-classified as a leak. The aggregate includes short-lived PowerShell runtime
-handles, while every runner-owned native handle close is checked separately.
-Calibration absorbs one-time delayed runtime initialization; the final measured
-window still fails sustained growth. POSIX keeps its forty-run no-GC
-file-descriptor regression.
+aggregate handle-growth allowance, then runs forty-invocation calibration and
+measured windows followed unconditionally by one forty-invocation confirmation
+window. Each window ends with a bounded 10-by-50 ms quiescence sample that
+records the minimum settled value without starting another child or forcing GC.
+The startup limit remains 16 through calibration and also caps the absolute
+growth accepted in either single steady window. Within that bound, the
+persistent-growth limit for both measured and confirmation remains 4, and
+growth above 4 in both consecutive windows is classified as a persistent leak.
+A one-window plateau of at most 16 and all window maxima remain evidence. The
+aggregate includes short-lived
+PowerShell runtime handles, while every runner-owned native handle close is
+checked separately and every child failure still fails immediately. The
+confirmation window is neither a conditional retry nor skippable. POSIX keeps
+its forty-run no-GC file-descriptor regression.
 OSS readiness seals the dedicated Windows probe's canonical UTF-8 source with
 SHA-256 and separately checks its loop headers, direct child-runner statements,
 result guards, handle updates, and thresholds through the PowerShell AST.
@@ -395,7 +420,9 @@ Because GitHub-hosted macOS does not provide either trusted `setsid` path, a
 separate macOS 15 job proves that the process runner rejects a synthetic
 target before launch and that the public scanner returns fixed redacted
 stdout, empty stderr, and exit code 2. It does not claim full scanner support
-on macOS.
+on macOS. OSS readiness still runs the process-independent baseline completion
+decision fixtures there, but capability-gates the process-backed synthetic Git
+fixtures and does not report them as executed.
 Each job has a 25-minute timeout.
 
 ## Contributing

@@ -8,6 +8,23 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Made completion verification baseline-aware. Delegation prompts now record
+  the pre-edit branch, full HEAD OID, full porcelain output, and required
+  artifact state with read-only commands. Orchestrators independently compare
+  final HEAD/diff/current porcelain/content, so unchanged pre-existing
+  artifacts remain no-ops, clean commits count as completed work, assigned
+  dirty resumes use initial-to-final evidence, and unassigned WIP cannot be
+  absorbed. Pure decision fixtures run on every readiness host. Process-backed
+  synthetic Git fixtures run only where the production runner can close the
+  process tree through a Windows job object or a fixed trusted `setsid`; an
+  unsupported macOS host is not reported as having executed those fixtures.
+  Fixture Git uses the existing byte-bounded process-tree runner with a fixed
+  minimal environment, empty config/hook/attribute inputs, and hostile
+  redirect/filter sentinels. Initial porcelain, final porcelain, and
+  committed-diff scope rejection are exercised in separate repositories. A
+  bounded `merge-base --is-ancestor` measurement and divergent same-branch
+  history fixture prevent reset/rewrite from being accepted as forward
+  completion.
 - Added a mandatory pre-edit checkout-ownership gate to the canonical skill,
   Japanese translation, synthetic delegation template, and completion
   checklist. A delegated writer now fails closed on unassigned existing WIP,
@@ -97,18 +114,23 @@ The format loosely follows Keep a Changelog conventions.
   dedicated script in a fresh instance of the same PowerShell executable,
   after the main self-test has proved raw transport. It measures an
   80-invocation startup window, a 40-invocation runtime calibration window, and
-  a separate 40-run steady-state window. Each window uses the same bounded
-  10-by-50 ms no-GC quiescence sample. The startup limit remains 16 through
-  calibration, and the steady-state final limit remains 4. Window maxima remain
-  evidence, while only growth that survives quiescence is classified as a
-  leak. This separates delayed one-time Windows PowerShell runtime
-  initialization from sustained growth without weakening the runner's
-  individual native-handle close checks. The POSIX 40-run no-GC
-  file-descriptor regression remains unchanged.
+  consecutive 40-run measured and confirmation windows. The confirmation
+  window always runs once rather than acting as a conditional retry. Each
+  window uses the same bounded 10-by-50 ms no-GC quiescence sample. The startup
+  limit remains 16 through calibration and caps either single steady-window
+  plateau. Within that absolute bound, the persistent threshold remains 4:
+  growth above 4 in both consecutive windows is classified as a persistent
+  leak. A one-window plateau of at most 16 and all maxima remain evidence. This
+  separates
+  delayed one-time Windows PowerShell runtime initialization from sustained
+  growth without weakening immediate child failure or the runner's individual
+  native-handle close checks. The POSIX 40-run no-GC file-descriptor regression
+  remains unchanged.
 - Seal the dedicated Windows handle probe's canonical UTF-8 source with
   SHA-256, while retaining a separate AST contract and parse-valid negative
   fixtures for zero-run loops, runtime limit mutation, control-flow arguments,
-  provider command shadowing, and conditional loop bodies.
+  provider command shadowing, and conditional loop bodies across all four
+  execution windows and their quiescence windows.
   Exported runner numeric
   arguments, including fractional and overflow inputs, are body-validated into
   a fixed `process-limit-invalid` exception instead of coercion or

@@ -49,6 +49,11 @@
    所有権不明を検出した場合は、編集、commit、push、merge を行わず司令塔へ競合を
    報告する。続行前に排他的な checkout または隔離 worktree と task branch を
    割り当てること」**
+6. **「完了検証baseline: 編集前に現在branch、`git rev-parse --verify HEAD`の完全OID、
+   `git --no-optional-locks status --porcelain=v1 --untracked-files=all`の全出力を記録する。
+   non-Git成果物と明示的に割り当て済みのdirty resume成果物では、実在、byte size、
+   SHA-256も記録する。baseline取得にはread-only Git commandだけを使い、
+   `git write-tree`などindex、working tree、object databaseを変更するcommandを使わない」**
 
 これが防ぐ実測済みの失敗: 大きめのタスクを渡された background サブエージェントが、
 自分で作業せずさらに子エージェントを起動し、「委譲したので完了を待ちます」とだけ
@@ -61,8 +66,24 @@
 
 ### 2. 完了通知の検証（毎回・鵜呑み禁止）
 
-- ファイル変更を伴うタスク: `git -C <repo> --no-optional-locks status --porcelain`
-  または成果物パスの実在・更新時刻を確認する。
+- 編集開始前に§1の検証baselineを保持する。`HEAD`がまだ存在しないrepositoryは、OIDを
+  捏造せずunbornと記録する。未割当WIPは開いたりhash化したりせず、所有権競合として
+  委譲を停止する。
+- 完了通知後、司令塔が最終branch、完全HEAD OID、`git diff --name-status
+  <baseline>..<final> --`、現在の`git --no-optional-locks status --porcelain=v1
+  --untracked-files=all`、受け入れ成果物の実在・内容・byte size・SHA-256を独立して
+  再測定する。baseline HEADが存在する場合は`git merge-base --is-ancestor
+  <baseline> <final>`のexit 0を必須とし、同じbranch名だけでhistory保持と判定しない。
+- 証拠を合成する。HEAD、porcelain、assigned artifact stateがinitial→finalで不変なら、
+  成果物が既に存在しても空振り。最終porcelainが空でも、HEADが変わり、
+  baselineがfinal HEADのancestorで、baseline→final diffが割当済みpathだけを含み、
+  成果物内容が受け入れ条件を満たせばcommit済みの成功とする。割当済みpathだけの
+  diffでも、rewrittenまたはdivergent historyはscope違反とする。
+  明示的に割り当て済みのdirty resumeは、porcelainに同じpathが出続け得るためartifact
+  stateをinitial→finalで比較する。initial/final porcelainまたはcommit差分に未割当pathが
+  あれば、成功ではなくscope違反とする。
+- non-Gitのfile-changing taskは、編集前後の実在・byte size・SHA-256を比較してから
+  内容を受け入れ条件と照合する。実在や更新時刻だけを完了証拠にしない。
 - 通知文面だけで「完了」と報告しない。検証できない項目は「未検証」と明記する。
 
 ### 3. 空振りだったときのリカバリ
@@ -149,7 +170,11 @@
 - 成果物が受け入れ条件どおり実在する(パス・内容・エンコーディング)。
 - 編集前の branch/status と checkout の排他的所有を記録済みで、未割当の既存 WIP を
   変更も混入もしていない。
-- `git status --porcelain` の差分が期待どおり（余計な変更が無い）。
+- 編集前baselineに完全HEAD OID、porcelain全出力、必要なartifact stateがあり、
+  read-only commandだけで取得した。
+- 最終HEAD/diff/current porcelainと成果物内容を司令塔が独立再測定し、assigned scopeの
+  baseline HEADがfinal HEADのancestorであること、initial→final deltaが少なくとも1件
+  あること、未割当pathを変更も混入もしていないことを確認した。
 - 委譲先の報告と実測が一致している。不一致があれば原因を特定済み。
 - 台帳モードでは、[x] 化されたエントリと「実際に検証してマージされた変更」が一致
   している。

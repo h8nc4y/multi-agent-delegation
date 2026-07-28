@@ -5357,7 +5357,12 @@ exit 0
                 'calibration-max=[0-9]+, calibration=40, ' +
                 'baseline=[0-9]+, ' +
                 'observed-final=[0-9]+, settled-final=[0-9]+, ' +
-                'measured-max=[0-9]+, final-limit=4, runs=40, ' +
+                'measured-max=[0-9]+, runs=40, ' +
+                'confirmation-observed-final=[0-9]+, ' +
+                'confirmation-settled=[0-9]+, ' +
+                'confirmation-max=[0-9]+, confirmation=40, ' +
+                'plateau-limit=16, ' +
+                'final-limit=4, ' +
                 'quiescence-per-window=10x50ms, ' +
                 'gc=not-invoked)$'
             ),
