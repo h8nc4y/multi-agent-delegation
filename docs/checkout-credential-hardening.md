@@ -55,3 +55,8 @@
 - **外部境界**：secret、OAuth、実データ、production、deploy、費用は使用しない。
 - **残作業**：本handoff同期を`main`へ統合後、local/remote branch cleanupと
   `main == origin/main`、clean treeを確認する。
+- **closeout（2026-07-29）**：PR #16統合後の`main`は
+  `ca24dc70258a7a8f76a36fcc595ab0b64c4c33fe`で`origin/main`と一致し、
+  tracked treeはclean、`fix/checkout-persist-credentials`はlocal / remoteとも
+  削除済みだった。
+  最新のmain run `30428993743`もsuccessを確認した。
