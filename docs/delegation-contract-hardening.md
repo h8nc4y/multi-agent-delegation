@@ -52,4 +52,4 @@ ledger mode では「1 repository = 1 agent」と隔離 worktree を要求する
 - **closeout（2026-07-29）**：現在の`main`は
   `ca24dc70258a7a8f76a36fcc595ab0b64c4c33fe`で`origin/main`と一致し、
   tracked treeはclean、最新のmain run `30428993743`はsuccessだった。
-  このdocs-only closeoutではlocal readinessを再実行していない。
+  PowerShell 7 / Windows PowerShell 5.1のlocal readinessもexit 0だった。
