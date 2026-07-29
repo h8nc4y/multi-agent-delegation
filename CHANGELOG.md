@@ -8,6 +8,10 @@ The format loosely follows Keep a Changelog conventions.
 
 ### Changed
 
+- Disabled persisted GitHub credentials in all three immutable
+  `actions/checkout` steps. OSS readiness now requires
+  `with.persist-credentials: false` on the exact checkout step and rejects a
+  missing, enabled, or misnested scalar through in-memory mutations.
 - Made completion verification baseline-aware. Delegation prompts now record
   the pre-edit branch, full HEAD OID, full porcelain output, and required
   artifact state with read-only commands. Orchestrators independently compare
