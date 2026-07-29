@@ -30,9 +30,11 @@
 
 ## Handoff
 
-- **状態**：実装とlocal検証を完了。source freeze後の独立review、commit、push、
-  PR、mergeは未実行。
-- **作業branch**：`fix/checkout-persist-credentials`。
+- **状態**：実装、local検証、独立review、commit、push、PR CI、mergeを完了。
+  PR #15はmerge commit `4b44b538a335de629a4282f12dbfc48f7a2ffe30`で
+  `main`へ統合済み。
+- **実装**：branch `fix/checkout-persist-credentials`、commit
+  `476644ad8a25aa2915cdf69068912b069189382e`。
 - **readiness**：PowerShell 7は16.8秒、Windows PowerShell 5.1は14.0秒で
   exit 0。両hostで欠落、`true`、誤ネストを含むin-memory mutationを拒否した。
   handoff同期後の再実行も両hostでexit 0だった。
@@ -44,6 +46,12 @@
   exit 0、results 0、errors 0だったが、対応言語fileがないためscanned targetsは0。
 - **workflow shape**：immutable checkout SHAは3件、mutable checkoutは0件、
   `persist-credentials: false`は3件、workflow fileは1件を確認した。
+- **独立review**：freezeしたstaged diffを別agentが確認し、P1 / P2 / P3は
+  すべて0、clearance YES。review前後でstaged patch hash一致、unstaged 0を確認した。
+- **commit security**：staged Gitleaksは9.38 KBで0 findings。global
+  pre-commit Gitleaksもpassし、Semgrepは対応fileなしでskipした。
+- **CI**：GitHub Actions run `30428038383`のWindows、Ubuntu、macOS
+  3 jobはすべてsuccess。
 - **外部境界**：secret、OAuth、実データ、production、deploy、費用は使用しない。
-- **残作業**：独立review、staged security scan、commit、PR/CI、merge、
-  post-merge同期。
+- **残作業**：本handoff同期を`main`へ統合後、local/remote branch cleanupと
+  `main == origin/main`、clean treeを確認する。
