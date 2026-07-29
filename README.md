@@ -416,6 +416,8 @@ git diff --check
 The GitHub Actions workflow runs validation, the private-marker self-test and
 repository scan, and whitespace checks on Windows and Ubuntu 24.04. Windows
 tests both PowerShell 7 and Windows PowerShell 5.1; Ubuntu tests PowerShell 7.
+All three immutable checkout steps disable credential persistence, and readiness
+rejects a missing, enabled, or misnested `persist-credentials` setting.
 Because GitHub-hosted macOS does not provide either trusted `setsid` path, a
 separate macOS 15 job proves that the process runner rejects a synthetic
 target before launch and that the public scanner returns fixed redacted

@@ -2878,6 +2878,55 @@ function Test-WorkflowBoundaryContract {
             return $false
         }
     }
+
+    # checkout の資格情報は step.with 直下で明示的に非永続化する。
+    # 同名scalarが別階層にあるだけでは合格させず、各checkout stepのactive tailを
+    # exact sequenceとして確認する。
+    $checkoutUsesPattern = (
+        '^        uses:[ \t]*' +
+        [regex]::Escape($expectedCheckout) +
+        '[ \t]*(?:#.*)?$'
+    )
+    $checkoutUsesIndexes = @()
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -match $checkoutUsesPattern) {
+            $checkoutUsesIndexes += $index
+        }
+    }
+    if ($checkoutUsesIndexes.Count -ne 3) {
+        return $false
+    }
+    foreach ($usesIndex in $checkoutUsesIndexes) {
+        $stepEnd = $lines.Count
+        for ($index = $usesIndex + 1; $index -lt $lines.Count; $index++) {
+            if (
+                $lines[$index] -match
+                    '^(?:      -[ \t]+|  [A-Za-z0-9_-]+:\s*$)'
+            ) {
+                $stepEnd = $index
+                break
+            }
+        }
+        $checkoutTail = @()
+        if ($usesIndex + 1 -lt $stepEnd) {
+            $checkoutTail = @(
+                $lines[($usesIndex + 1)..($stepEnd - 1)] |
+                    Where-Object { $_ -notmatch '^[ \t]*(?:#.*)?$' }
+            )
+        }
+        if (
+            -not (
+                Test-StringSequenceEqual `
+                    -Left $checkoutTail `
+                    -Right @(
+                        '        with:',
+                        '          persist-credentials: false'
+                    )
+            )
+        ) {
+            return $false
+        }
+    }
     return $true
 }
 
@@ -2946,9 +2995,46 @@ function Assert-WorkflowBoundaryContract {
                 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd',
                 'actions/checkout@v5'
             )
+        },
+        [pscustomobject]@{
+            Name = 'missing-persist-credentials'
+            Source = [regex]::Replace(
+                $source,
+                '(?m)^          persist-credentials:[ \t]*false[ \t]*(?:\r?\n)?',
+                ''
+            )
+        },
+        [pscustomobject]@{
+            Name = 'persist-credentials-true'
+            Source = [regex]::Replace(
+                $source,
+                '(?m)^          persist-credentials:[ \t]*false[ \t]*$',
+                '          persist-credentials: true'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'misnested-persist-credentials'
+            Source = [regex]::Replace(
+                $source,
+                '(?m)^          persist-credentials:[ \t]*false[ \t]*$',
+                '        persist-credentials: false'
+            )
         }
     )
     foreach ($mutation in $mutations) {
+        if (
+            [string]::Equals(
+                $mutation.Source,
+                $source,
+                [System.StringComparison]::Ordinal
+            )
+        ) {
+            Add-Failure (
+                "$RelativePath workflow mutation setup made no change: " +
+                $mutation.Name
+            )
+            continue
+        }
         if (Test-WorkflowBoundaryContract -Source $mutation.Source) {
             Add-Failure (
                 "$RelativePath workflow validator accepted mutation: " +
@@ -3201,6 +3287,7 @@ function Get-WorkflowSteps {
 
     $steps = New-Object System.Collections.Generic.List[object]
     $currentStep = $null
+    $currentNestedParent = ''
     if ($stepsStart -ge $stepsEnd) {
         Add-Failure "Workflow jobs.$JobName.steps must not be empty"
         return @()
@@ -3224,6 +3311,7 @@ function Get-WorkflowSteps {
         if ($isStepStart -and $null -ne $currentStep) {
             $steps.Add($currentStep) | Out-Null
             $currentStep = $null
+            $currentNestedParent = ''
         }
         $nameMatch = [regex]::Match(
             $line,
@@ -3235,10 +3323,14 @@ function Get-WorkflowSteps {
                 Shell = ''
                 Run = ''
                 Uses = ''
+                PersistCredentials = ''
                 ShellCount = 0
                 RunCount = 0
                 UsesCount = 0
+                WithCount = 0
+                PersistCredentialsCount = 0
             }
+            $currentNestedParent = ''
             continue
         }
         if ($isStepStart) {
@@ -3247,6 +3339,36 @@ function Get-WorkflowSteps {
 
         if ($null -eq $currentStep) {
             continue
+        }
+        $withMatch = [regex]::Match(
+            $line,
+            '^        with:[ \t]*$'
+        )
+        if ($withMatch.Success) {
+            $currentStep.WithCount++
+            $currentNestedParent = 'with'
+            continue
+        }
+        $persistCredentialsMatch = [regex]::Match(
+            $line,
+            '^          persist-credentials:[ \t]*(?<value>[^#\r\n]+?)[ \t]*$'
+        )
+        if (
+            $persistCredentialsMatch.Success -and
+            [string]::Equals(
+                $currentNestedParent,
+                'with',
+                [System.StringComparison]::Ordinal
+            )
+        ) {
+            $currentStep.PersistCredentials = (
+                $persistCredentialsMatch.Groups['value'].Value.Trim("'`"")
+            )
+            $currentStep.PersistCredentialsCount++
+            continue
+        }
+        if ($line -match '^        (?![ #\r\n]).+$') {
+            $currentNestedParent = ''
         }
         $shellMatch = [regex]::Match(
             $line,
@@ -3303,7 +3425,9 @@ function Assert-WorkflowJobShape {
         [string]$JobName,
         [int]$ExpectedStepCount,
         [int]$ExpectedShellCount,
-        [int]$ExpectedRunCount
+        [int]$ExpectedRunCount,
+        [int]$ExpectedWithCount,
+        [int]$ExpectedNestedEntryCount
     )
 
     # expected keyを残したまま if / env / continue-on-error / extra actionを
@@ -3338,6 +3462,9 @@ function Assert-WorkflowJobShape {
     $usesKeyCount = @(
         $Lines | Where-Object { $_ -match '^        uses:[ \t]*' }
     ).Count
+    $withKeyCount = @(
+        $Lines | Where-Object { $_ -match '^        with:[ \t]*' }
+    ).Count
     $deepActiveEntryCount = @(
         $Lines | Where-Object {
             $_ -match '^ {10,}(?![ #\r\n]).+$'
@@ -3346,7 +3473,8 @@ function Assert-WorkflowJobShape {
     $expectedStepPropertyCount = (
         1 +
         $ExpectedShellCount +
-        $ExpectedRunCount
+        $ExpectedRunCount +
+        $ExpectedWithCount
     )
 
     if ($jobEntryCount -ne 4 -or
@@ -3369,7 +3497,8 @@ function Assert-WorkflowJobShape {
         $shellKeyCount -ne $ExpectedShellCount -or
         $runKeyCount -ne $ExpectedRunCount -or
         $usesKeyCount -ne 1 -or
-        $deepActiveEntryCount -ne 0) {
+        $withKeyCount -ne $ExpectedWithCount -or
+        $deepActiveEntryCount -ne $ExpectedNestedEntryCount) {
         Add-Failure (
             "Workflow jobs.$JobName contains an unexpected, " +
             'missing, duplicate, or nested step-level key'
@@ -3381,7 +3510,8 @@ function Assert-WorkflowUsesStep {
     param(
         [object[]]$Steps,
         [string]$Name,
-        [string]$Uses
+        [string]$Uses,
+        [string]$PersistCredentials
     )
 
     $matches = @(
@@ -3409,10 +3539,24 @@ function Assert-WorkflowUsesStep {
     }
     if ($matches[0].UsesCount -ne 1 -or
         $matches[0].ShellCount -ne 0 -or
-        $matches[0].RunCount -ne 0) {
+        $matches[0].RunCount -ne 0 -or
+        $matches[0].WithCount -ne 1 -or
+        $matches[0].PersistCredentialsCount -ne 1) {
         Add-Failure (
             "Workflow step '$Name' must contain exactly one uses " +
-            'and no shell/run key'
+            'and one with.persist-credentials scalar, with no shell/run key'
+        )
+    }
+    if (
+        -not [string]::Equals(
+            $matches[0].PersistCredentials,
+            $PersistCredentials,
+            [System.StringComparison]::Ordinal
+        )
+    ) {
+        Add-Failure (
+            "Workflow step '$Name' persist-credentials must be " +
+            "'$PersistCredentials' (found '$($matches[0].PersistCredentials)')"
         )
     }
 }
@@ -5467,9 +5611,12 @@ Assert-WorkflowJobShape `
     -JobName 'validate' `
     -ExpectedStepCount 7 `
     -ExpectedShellCount 6 `
-    -ExpectedRunCount 6
+    -ExpectedRunCount 6 `
+    -ExpectedWithCount 1 `
+    -ExpectedNestedEntryCount 1
 Assert-WorkflowUsesStep -Steps $workflowSteps -Name 'Check out repository' `
-    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd' `
+    -PersistCredentials 'false'
 Assert-WorkflowStep -Steps $workflowSteps -Name 'Validate OSS readiness' `
     -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
 Assert-WorkflowStep `
@@ -5505,9 +5652,12 @@ Assert-WorkflowJobShape `
     -JobName 'validate_ubuntu' `
     -ExpectedStepCount 5 `
     -ExpectedShellCount 4 `
-    -ExpectedRunCount 4
+    -ExpectedRunCount 4 `
+    -ExpectedWithCount 1 `
+    -ExpectedNestedEntryCount 1
 Assert-WorkflowUsesStep -Steps $ubuntuWorkflowSteps -Name 'Check out repository' `
-    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd' `
+    -PersistCredentials 'false'
 Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Validate OSS readiness' `
     -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
 Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Test private marker scan (PowerShell 7)' `
@@ -5532,9 +5682,12 @@ Assert-WorkflowJobShape `
     -JobName 'validate_macos' `
     -ExpectedStepCount 4 `
     -ExpectedShellCount 3 `
-    -ExpectedRunCount 3
+    -ExpectedRunCount 3 `
+    -ExpectedWithCount 1 `
+    -ExpectedNestedEntryCount 1
 Assert-WorkflowUsesStep -Steps $macosWorkflowSteps -Name 'Check out repository' `
-    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd' `
+    -PersistCredentials 'false'
 Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Validate OSS readiness' `
     -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
 Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Test unsupported macOS fail-closed contract' `

@@ -152,7 +152,9 @@ disposed on Windows and POSIX; 40-run no-GC handle and file-descriptor
 regressions prevent deferred resource collection from masking leaks. CI
 workflow validation also rejects expanded triggers, writable or
 job-local permission overrides, duplicate/extra jobs, extra step keys, and
-mutable third-party action references.
+mutable third-party action references. Every immutable `actions/checkout` step
+must set `with.persist-credentials: false`; a missing, enabled, or misnested
+value fails readiness.
 
 ## Response Expectations
 
