@@ -39,8 +39,18 @@ validation手順は、候補のexact commitに対するlocal checksとWindows、
 
 ## Handoff
 
-- **状態**：release candidate文書の初回freezeと独立reviewを完了。
-- **実施済み**：release関連正本のscope確認、stale handoffの修正、候補文面のfocused静的整合、P2 1件の修正と再review CLEAR。
-- **未確認**：full local validation、scanner、Gitleaks、Semgrep、commit、push、PR、CI。
+- **状態**：release candidate文書の初回freeze、独立review、local validation、PR CI、mergeを完了。
+  PR #18はcommit `d660855e17455778e888742611c50eee19a2ecfb`を
+  merge commit `a9e6038350cc30122abd62e26be4023107b2d74a`として`main`へ統合した。
+- **実施済み**：release関連正本のscope確認、stale handoffの修正、候補文面のfocused静的整合、
+  P2 1件の修正と再review CLEAR。PowerShell 7とWindows PowerShell 5.1のreadinessおよび
+  scanner self-test、PowerShell 7のrepository scanはexit 0だった。
+  Gitleaksはdirectory、履歴33 commits、staged差分で0 findings、
+  Semgrepは32 targets、82 rulesで0 findingsだった。global pre-commit hookも成功した。
+- **CI**：PR run `30530337700`はWindows、Ubuntu、macOSの3 jobがsuccess。
+  exact merge commitに対するmain run `30530788471`も3 jobがsuccess。
 - **Owner gate**：version、target commit、公開日時、final notesはすべて`未確認`。
-- **公開操作**：tag、GitHub Release、公開Release操作は未実施。
+- **公開操作**：merge後もremote tagは`v0.1.0`だけで、GitHub Releaseは0件。
+  `v0.2.0` tag、GitHub Release、公開Release操作は未実施。
+- **次の一手**：ownerが4項目を決定した後、選定したexact commitでlocal validationと
+  Windows、Ubuntu、macOSのCIを再確認し、tagとGitHub Releaseを別の公開操作として実施する。
