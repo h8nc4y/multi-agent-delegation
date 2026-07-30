@@ -53,8 +53,8 @@
 - **CI**：GitHub Actions run `30428038383`のWindows、Ubuntu、macOS
   3 jobはすべてsuccess。
 - **外部境界**：secret、OAuth、実データ、production、deploy、費用は使用しない。
-- **残作業**：本handoff同期を`main`へ統合後、local/remote branch cleanupと
-  `main == origin/main`、clean treeを確認する。
+- **残作業**：なし。
+  local / remote branch cleanup、`main == origin/main`、clean treeは後続のcloseoutで確認済み。
 - **closeout（2026-07-29）**：PR #16統合後の`main`は
   `ca24dc70258a7a8f76a36fcc595ab0b64c4c33fe`で`origin/main`と一致し、
   tracked treeはclean、`fix/checkout-persist-credentials`はlocal / remoteとも

@@ -42,6 +42,23 @@ git clone https://github.com/h8nc4y/multi-agent-delegation.git
 cd multi-agent-delegation
 ```
 
+### Choose a version
+
+The `main` branch is the supported current version and may advance as safety
+guidance changes. For a reproducible install, first confirm that the desired
+tag exists on the remote, then check out that published tag:
+
+```bash
+git tag --list
+git ls-remote --exit-code --tags origin "refs/tags/<published-tag>"
+git checkout --detach <published-tag>
+```
+
+The `0.2.0` entry in [CHANGELOG.md](CHANGELOG.md) is an unpublished release
+candidate. It is not an install target until the corresponding remote tag
+exists. A changelog heading alone is not evidence that a release was
+published.
+
 ### Claude Code
 
 Claude Code auto-invokes the skill when a task matches the `description`
@@ -426,6 +443,17 @@ on macOS. OSS readiness still runs the process-independent baseline completion
 decision fixtures there, but capability-gates the process-backed synthetic Git
 fixtures and does not report them as executed.
 Each job has a 25-minute timeout.
+
+### Release candidate gate
+
+Merging release-candidate documentation does not publish a tag or GitHub
+Release. Before publication, the maintainer confirms the version, exact target
+commit, timing, and final release notes, reruns the validation above, and
+checks the three GitHub Actions jobs at that exact commit. Until those separate
+publication steps occur, report the `v0.2.0` tag and its GitHub Release as
+unpublished.
+The measured candidate state and unresolved publication decisions are tracked
+in [v0.2.0 release preparation](docs/release-v0.2.0-preparation.md).
 
 ## Contributing
 
