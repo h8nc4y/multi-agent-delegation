@@ -75,8 +75,8 @@ PowerShell text stdin and explicitly disposes completed pump/stream resources.
 Do not expand workflow triggers or permissions, add
 jobs/steps, or replace full commit SHA action pins without updating the exact
 workflow contract and its mutation tests. Keep
-`with.persist-credentials: false` directly under every checkout step. Windows
-and Ubuntu CI jobs are both limited to 25 minutes.
+`with.persist-credentials: false` directly under every checkout step. Windows,
+Ubuntu, and macOS CI jobs are each limited to 25 minutes.
 
 ## Pull Request Expectations
 
