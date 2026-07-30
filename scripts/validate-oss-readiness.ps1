@@ -207,6 +207,192 @@ function Assert-FileContractMutationRejected {
     }
 }
 
+function Get-CiTimeoutDocumentationContract {
+    param([int]$Minutes)
+
+    if ($Minutes -lt 1) {
+        throw 'ci-timeout-minutes-invalid'
+    }
+    return (
+        'Windows, Ubuntu, and macOS CI jobs are each limited to ' +
+        "$Minutes minutes."
+    )
+}
+
+function Test-CiTimeoutDocumentationContract {
+    param(
+        [string]$Source,
+        [int]$Minutes
+    )
+
+    $expected = Get-CiTimeoutDocumentationContract -Minutes $Minutes
+    if (-not (Test-ContainsExactContract -Content $Source -Expected $expected)) {
+        return $false
+    }
+
+    $normalizedSource = [regex]::Replace($Source, '\s+', ' ').Trim()
+    $contractCandidates = @(
+        [regex]::Split($normalizedSource, '(?<=[.!?])\s+') |
+            Where-Object {
+                $_ -match
+                    '(?i)\b(?:CI|jobs?|Windows|Ubuntu|macOS)\b' -and
+                $_ -match '(?i)\b(?:timeout|minutes?|mins?)\b'
+            }
+    )
+
+    # CI/job/対象OSとtimeout分数を同じ文で扱う候補をexact肯定文1件に限定する。
+    # 否定前置、例外句、別の語順で矛盾を併記するdriftも拒否する。
+    return (
+        $contractCandidates.Count -eq 1 -and
+        [string]::Equals(
+            $contractCandidates[0],
+            $expected,
+            [System.StringComparison]::Ordinal
+        )
+    )
+}
+
+function Assert-CiTimeoutDocumentationContract {
+    param(
+        [string]$RelativePath,
+        [int]$Minutes
+    )
+
+    $filePath = Get-RepoFilePath -RelativePath $RelativePath
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        Add-Failure (
+            "Cannot inspect missing file: $RelativePath " +
+            '(CI timeout contract)'
+        )
+        return
+    }
+    try {
+        $source = [System.IO.File]::ReadAllText(
+            $filePath,
+            (New-Object System.Text.UTF8Encoding($false, $true))
+        )
+    }
+    catch {
+        Add-Failure "$RelativePath CI timeout contract must use strict UTF-8"
+        return
+    }
+
+    if (
+        -not (
+            Test-CiTimeoutDocumentationContract `
+                -Source $source `
+                -Minutes $Minutes
+        )
+    ) {
+        Add-Failure (
+            "$RelativePath must state one unambiguous Windows/Ubuntu/macOS " +
+            "$Minutes-minute CI job timeout contract"
+        )
+    }
+
+    $expected = Get-CiTimeoutDocumentationContract -Minutes $Minutes
+    if (-not (Test-ContainsExactContract -Content $source -Expected $expected)) {
+        return
+    }
+    $normalizedSource = [regex]::Replace($source, '\s+', ' ').Trim()
+
+    # 実fileを変更せず、必須3 mutationと語順を変えた曖昧化を個別に作る。
+    # 全ケースを本番matcherで拒否し、部分一致や限定regexへの退行を防ぐ。
+    $mutations = @(
+        [pscustomobject]@{
+            Name = '25-to-20'
+            Source = $normalizedSource.Replace(
+                $expected,
+                (Get-CiTimeoutDocumentationContract -Minutes 20)
+            )
+        },
+        [pscustomobject]@{
+            Name = 'macos-omitted'
+            Source = $normalizedSource.Replace(
+                $expected,
+                $expected.Replace(
+                    'Windows, Ubuntu, and macOS',
+                    'Windows and Ubuntu'
+                )
+            )
+        },
+        [pscustomobject]@{
+            Name = 'duplicate-ambiguous-contract'
+            Source = $normalizedSource.Replace(
+                $expected,
+                "$expected Each CI job has a 20-minute timeout."
+            )
+        },
+        [pscustomobject]@{
+            Name = 'times-out-after'
+            Source = $normalizedSource.Replace(
+                $expected,
+                "$expected The macOS CI job times out after 20 minutes."
+            )
+        },
+        [pscustomobject]@{
+            Name = 'finish-within'
+            Source = $normalizedSource.Replace(
+                $expected,
+                "$expected Every CI job must finish within 20 minutes."
+            )
+        },
+        [pscustomobject]@{
+            Name = 'timeout-for-each'
+            Source = $normalizedSource.Replace(
+                $expected,
+                "$expected The timeout for each CI job is 20 minutes."
+            )
+        },
+        [pscustomobject]@{
+            Name = 'capped-at-min'
+            Source = $normalizedSource.Replace(
+                $expected,
+                "$expected Each CI job is capped at 20 min."
+            )
+        },
+        [pscustomobject]@{
+            Name = 'macos-exception'
+            Source = $normalizedSource.Replace(
+                $expected,
+                "$expected Except macOS, whose timeout is 20 minutes."
+            )
+        },
+        [pscustomobject]@{
+            Name = 'false-prefix'
+            Source = $normalizedSource.Replace(
+                $expected,
+                "It is false that $expected"
+            )
+        }
+    )
+    foreach ($mutation in $mutations) {
+        if (
+            [string]::Equals(
+                $mutation.Source,
+                $normalizedSource,
+                [System.StringComparison]::Ordinal
+            )
+        ) {
+            Add-Failure (
+                "$RelativePath CI timeout mutation setup made no change: " +
+                $mutation.Name
+            )
+            continue
+        }
+        if (
+            Test-CiTimeoutDocumentationContract `
+                -Source $mutation.Source `
+                -Minutes $Minutes
+        ) {
+            Add-Failure (
+                "$RelativePath CI timeout validator accepted mutation: " +
+                $mutation.Name
+            )
+        }
+    }
+}
+
 function Resolve-SyntheticGitExecutable {
     param([string]$CandidatePath = '')
 
@@ -3692,6 +3878,7 @@ $requiredFiles = @(
     'README.md',
     'SECURITY.md',
     'SKILL.md',
+    'docs/ci-timeout-documentation-contract.md',
     'docs/completion-baseline-verification.md',
     'docs/delegation-contract-hardening.md',
     'docs/SKILL.ja.md',
@@ -3702,6 +3889,7 @@ $requiredFiles = @(
     'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
     'scripts/scan-private-markers-v2.ps1',
+    'scripts/test-ci-timeout-documentation.ps1',
     'scripts/test-macos-fail-closed.ps1',
     'scripts/test-private-marker-handle-stability.ps1',
     'scripts/test-scan-private-markers.ps1',
@@ -3725,6 +3913,12 @@ Assert-FileContains -RelativePath 'README.md' -Pattern '(?im)^##\s+Security' -De
 Assert-FileContains -RelativePath 'README.md' -Pattern 'CONTRIBUTING\.md' -Description 'link to CONTRIBUTING.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'SECURITY\.md' -Description 'link to SECURITY.md'
 Assert-FileContains -RelativePath 'README.md' -Pattern 'docs/SKILL\.ja\.md' -Description 'link to the Japanese skill version'
+$ciJobTimeoutMinutes = 25
+foreach ($ciTimeoutDocumentationPath in @('README.md', 'CONTRIBUTING.md')) {
+    Assert-CiTimeoutDocumentationContract `
+        -RelativePath $ciTimeoutDocumentationPath `
+        -Minutes $ciJobTimeoutMinutes
+}
 # 単独委譲でもshared checkoutへ複数writerが入らないよう、正本・翻訳・利用者向け
 # fixtureのすべてに編集前のownership gateを必須化する。
 $skillAbsolutePathsContract = @'
@@ -5571,15 +5765,15 @@ Assert-WorkflowJobSet `
 Assert-WorkflowJobTimeout `
     -RelativePath $workflowPath `
     -JobName 'validate' `
-    -Minutes 25
+    -Minutes $ciJobTimeoutMinutes
 Assert-WorkflowJobTimeout `
     -RelativePath $workflowPath `
     -JobName 'validate_ubuntu' `
-    -Minutes 25
+    -Minutes $ciJobTimeoutMinutes
 Assert-WorkflowJobTimeout `
     -RelativePath $workflowPath `
     -JobName 'validate_macos' `
-    -Minutes 25
+    -Minutes $ciJobTimeoutMinutes
 Assert-WorkflowJobDirectValue `
     -RelativePath $workflowPath `
     -JobName 'validate' `
@@ -5699,6 +5893,7 @@ foreach ($powerShellScript in @(
     'scripts/private-marker-process-runner.psm1',
     'scripts/scan-private-markers.ps1',
     'scripts/scan-private-markers-v2.ps1',
+    'scripts/test-ci-timeout-documentation.ps1',
     'scripts/test-macos-fail-closed.ps1',
     'scripts/test-private-marker-handle-stability.ps1',
     'scripts/test-scan-private-markers.ps1',

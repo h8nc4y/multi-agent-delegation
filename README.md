@@ -442,7 +442,7 @@ stdout, empty stderr, and exit code 2. It does not claim full scanner support
 on macOS. OSS readiness still runs the process-independent baseline completion
 decision fixtures there, but capability-gates the process-backed synthetic Git
 fixtures and does not report them as executed.
-Each job has a 25-minute timeout.
+Windows, Ubuntu, and macOS CI jobs are each limited to 25 minutes.
 
 ### Release candidate gate
 
