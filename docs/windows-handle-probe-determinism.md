@@ -110,4 +110,5 @@ calibration後にも同じ5-handle plateauが発生し得ることが分かっ�
 - **CI**：PR #10のGitHub Actions run `30240567525`はWindows、Ubuntu、macOSの3 jobsが初回ですべて成功した。
   Windows jobでは両PowerShellのreadinessとfull self-test、repository scan、whitespaceが成功した。
 - **外部境界**：公開GitHub repositoryのPR #10作成とmerge以外に、外部 agent送信、secret、OAuth、credential、実データ、production、deploy、費用操作は使用していない。
-- **残作業**：handoff同期後に`main`のpost-merge CI、一致、clean tree、readiness、branch cleanupを確認する。
+- **残作業**：なし。
+  post-main CI、一致、clean tree、readiness、branch cleanupは上記の`post-main`で確認済み。

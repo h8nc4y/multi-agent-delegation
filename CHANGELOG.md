@@ -6,7 +6,41 @@ The format loosely follows Keep a Changelog conventions.
 
 ## Unreleased
 
-### Changed
+No changes are assigned beyond the 0.2.0 release candidate yet.
+
+## 0.2.0 - Release candidate (unpublished)
+
+This section describes a release candidate, not a published tag or GitHub
+Release. Publication remains a separate maintainer decision covering the
+version, exact target commit, timing, and final release notes.
+
+### Highlights
+
+- Added baseline-aware completion verification. Orchestrators now compare the
+  pre-edit branch, full HEAD OID, porcelain output, and artifact state with
+  independently measured final Git and content evidence.
+- Added a mandatory checkout-ownership gate. Delegated writers fail closed
+  when a checkout contains unassigned work, has another writer, or lacks a
+  clear exclusive assignment.
+- Rebuilt the private-marker scanner around a bounded index/worktree union,
+  hermetic child environments, byte-exact process I/O, and fail-closed
+  repository-root and file-integrity checks.
+- Added bounded process-tree termination for Windows and supported Linux hosts,
+  deterministic Windows handle-leak evidence, and an explicit unsupported
+  macOS fail-closed contract.
+- Disabled persisted GitHub credentials in every CI checkout step and fixed the
+  workflow shape, permissions, timeouts, and checkout action revision through
+  readiness validation.
+
+### Platform support
+
+- Windows runs readiness and private-marker self-tests under PowerShell 7 and
+  Windows PowerShell 5.1, plus the repository scan under PowerShell 7.
+- Ubuntu 24.04 runs the full PowerShell 7 suite. macOS 15 runs OSS readiness,
+  whitespace checks, and the unsupported-platform fail-closed scanner
+  contract; it does not run the full process-backed scanner suite.
+
+### Detailed changes
 
 - Disabled persisted GitHub credentials in all three immutable
   `actions/checkout` steps. OSS readiness now requires

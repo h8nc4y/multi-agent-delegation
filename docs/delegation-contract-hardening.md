@@ -48,7 +48,8 @@ ledger mode では「1 repository = 1 agent」と隔離 worktree を要求する
 - **Semgrep**：local 5 rulesはexit 0だったが、対象言語fileがないためtargets 0であり、PowerShellとMarkdownのcoverageには数えない。
 - **hygiene**：変更fileのUTF-8 / LF / NUL不在と `git diff --check` は成功した。
 - **外部境界**：公開GitHub repositoryのPR #8作成とmerge以外に、外部 agent 送信、secret / OAuth / credential、実データ、production、deploy、費用は使用していない。
-- **残作業**：機能実装、独立review、PR CI、mergeは完了。handoff同期後に`main`の一致、clean tree、readinessを再確認する。
+- **残作業**：なし。
+  `main`の一致、clean tree、readinessは後続のcloseoutで確認済み。
 - **closeout（2026-07-29）**：現在の`main`は
   `ca24dc70258a7a8f76a36fcc595ab0b64c4c33fe`で`origin/main`と一致し、
   tracked treeはclean、最新のmain run `30428993743`はsuccessだった。

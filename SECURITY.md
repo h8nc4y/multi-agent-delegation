@@ -9,6 +9,11 @@ reports, so unsafe guidance is treated as a security problem too.
 The `main` branch is the supported version. Tagged releases receive fixes
 through new tags on `main`.
 
+A release-candidate heading in the changelog is not a tagged release. A remote
+tag and a GitHub Release are separate public actions, and merging preparation
+documents performs neither action. Before publication, the maintainer confirms
+the version, exact target commit, timing, and final release notes.
+
 ## Reporting A Vulnerability
 
 Use GitHub private vulnerability reporting for:
