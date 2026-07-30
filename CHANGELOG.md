@@ -6,7 +6,10 @@ The format loosely follows Keep a Changelog conventions.
 
 ## Unreleased
 
-No changes are assigned beyond the 0.2.0 release candidate yet.
+- OSS readiness now requires README and CONTRIBUTING to state the same
+  Windows, Ubuntu, and macOS 25-minute CI job timeout contract as the workflow.
+  In-memory mutations reject a 20-minute drift, a missing macOS mention, and a
+  duplicate contradictory timeout statement.
 
 ## 0.2.0 - Release candidate (unpublished)
 
