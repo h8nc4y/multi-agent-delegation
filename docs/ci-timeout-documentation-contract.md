@@ -34,8 +34,8 @@
 
 ## Handoff
 
-- **状態**：branch `test/validate-ci-timeout-doc-contract`で実装、focused
-  local検証、独立reviewを完了。
+- **状態**：pull request #21をhead `ce36ead8a15295d985a09a70fec139588ab9a8bc`、
+  merge commit `f7588b2769a809179b6def2712f2d6a24c03128e`で統合済み。
 - **RED**：focused testは旧READMEの3 OS明記不足を1件検出し、exit 1を返した。
 - **実装**：job timeoutを扱う文をcanonical exact句1件だけに限定するpure
   matcherを追加した。
@@ -58,4 +58,8 @@
   counterexampleへ追加して解消し、`min` / `mins`を両PowerShellで拒否した。
 - **外部境界**：secret、OAuth、実データ、production、deploy、費用、
   tag、Releaseは使用しない。
-- **残作業**：scanner self-test、commit、push、PR、CI、mergeは未確認。
+- **統合証拠**：pull request head run `30586873953`とpost-main run
+  `30587286612`は、Windows、Ubuntu、macOSの3 jobすべてがsuccess。
+  両runで対象のOSS readinessとprivate-marker検証もsuccess。
+- **残作業**：この契約に残作業なし。`v0.2.0`のversion、target commit、
+  公開日時、final release notesはrelease owner gateとして引き続き未確認。
