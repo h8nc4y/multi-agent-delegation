@@ -43,14 +43,17 @@
 
 ## Handoff
 
-- **状態**：doing。公式tag / release / action runtime、baseline main / origin、
-  open PR / issue 0、現行mainの3 job成功をread-onlyで確認した。validator先行更新では
-  旧v5.0.1 workflowを拒否し、実装後はstale version commentも拒否するTDD REDを確認した。
+- **状態**：done。feature commit `e75541c20eaeeb557bc5519ea58c6b1cf0e88989`を
+  PR #23でmerge commit `34cf1239ae616785c140e95c8c9ce977b7b4ae1b`へ統合した。
+  feature / merge treeは `84b3482e1e38005d9ddba819eef2725e6ca1e58e`で一致した。
+- **CI evidence**：PR run `30738127679`とpost-main run `30738332079`は、
+  Windows、Ubuntu、macOSの3 jobがすべてsuccessだった。
 - **local evidence**：最終候補のreadinessはPowerShell 7 / 5.1で成功した。
   scanner self-testは両hostで成功し、handle growthはともに0。baseline / 候補のrepository
   scan、Gitleaks staged、Semgrep 82 rules / 4 files、`git diff --check`、UTF-8 / LF / NUL
-  検査も成功した。validatorの既存UTF-8 BOMはbaselineと同じprofileを維持した。
+  検査も成功した。post-mainでもreadiness両host、repository scan、`git diff --check`が
+  成功した。validatorの既存UTF-8 BOMはbaselineと同じprofileを維持した。
 - **review**：独立した2 reviewはいずれもP0-P3 finding 0だった。
 - **外部境界**：public repositoryの通常CI以外に、secret、OAuth、実データ、
   production、deploy、tag / Release、paid operationを使用しない。
-- **未確認**：v7.0.1を使うPR / main CIはpush前のため未確認。
+- **未実行**：production、deploy、tag、GitHub Release。v0.2.0 Releaseのowner gateを維持する。
