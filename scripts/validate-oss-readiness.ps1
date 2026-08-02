@@ -3034,8 +3034,24 @@ function Test-WorkflowBoundaryContract {
     # third-party action は immutable full commit SHA だけを許可する。
     # 現 workflow は Windows/Ubuntu/macOS 各 1 回の checkout 以外を持たない。
     $expectedCheckout = (
-        'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+        'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'
     )
+    # 人間向けversion注記もexact pinと同時に更新し、古い版表示を残さない。
+    $expectedCheckoutLine = "        uses: $expectedCheckout # v7.0.1"
+    if (
+        @(
+            $lines |
+                Where-Object {
+                    [string]::Equals(
+                        $_,
+                        $expectedCheckoutLine,
+                        [System.StringComparison]::Ordinal
+                    )
+                }
+        ).Count -ne 3
+    ) {
+        return $false
+    }
     $usesValues = New-Object System.Collections.Generic.List[string]
     foreach ($line in $lines) {
         $usesMatch = [regex]::Match(
@@ -3178,9 +3194,20 @@ function Assert-WorkflowBoundaryContract {
         [pscustomobject]@{
             Name = 'mutable-action-ref'
             Source = $source.Replace(
-                'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd',
-                'actions/checkout@v5'
+                'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                'actions/checkout@v7'
             )
+        },
+        [pscustomobject]@{
+            Name = 'legacy-checkout-v5.0.1'
+            Source = $source.Replace(
+                'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1',
+                'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd'
+            )
+        },
+        [pscustomobject]@{
+            Name = 'stale-checkout-version-comment'
+            Source = $source.Replace('# v7.0.1', '# v5.0.1')
         },
         [pscustomobject]@{
             Name = 'missing-persist-credentials'
@@ -5809,7 +5836,7 @@ Assert-WorkflowJobShape `
     -ExpectedWithCount 1 `
     -ExpectedNestedEntryCount 1
 Assert-WorkflowUsesStep -Steps $workflowSteps -Name 'Check out repository' `
-    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd' `
+    -Uses 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' `
     -PersistCredentials 'false'
 Assert-WorkflowStep -Steps $workflowSteps -Name 'Validate OSS readiness' `
     -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
@@ -5850,7 +5877,7 @@ Assert-WorkflowJobShape `
     -ExpectedWithCount 1 `
     -ExpectedNestedEntryCount 1
 Assert-WorkflowUsesStep -Steps $ubuntuWorkflowSteps -Name 'Check out repository' `
-    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd' `
+    -Uses 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' `
     -PersistCredentials 'false'
 Assert-WorkflowStep -Steps $ubuntuWorkflowSteps -Name 'Validate OSS readiness' `
     -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'
@@ -5880,7 +5907,7 @@ Assert-WorkflowJobShape `
     -ExpectedWithCount 1 `
     -ExpectedNestedEntryCount 1
 Assert-WorkflowUsesStep -Steps $macosWorkflowSteps -Name 'Check out repository' `
-    -Uses 'actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd' `
+    -Uses 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' `
     -PersistCredentials 'false'
 Assert-WorkflowStep -Steps $macosWorkflowSteps -Name 'Validate OSS readiness' `
     -Shell 'pwsh' -Run './scripts/validate-oss-readiness.ps1'

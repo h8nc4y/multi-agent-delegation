@@ -6,6 +6,10 @@ The format loosely follows Keep a Changelog conventions.
 
 ## Unreleased
 
+- Upgraded all three immutable `actions/checkout` pins from v5.0.1 to
+  v7.0.1. Readiness rejects the old pinned commit, a mutable `@v7` reference,
+  and stale version comments while preserving read-only permissions and
+  `persist-credentials: false` on each checkout step.
 - OSS readiness now requires README and CONTRIBUTING to state the same
   Windows, Ubuntu, and macOS 25-minute CI job timeout contract as the workflow.
   In-memory mutations reject a 20-minute drift, a missing macOS mention, and a
